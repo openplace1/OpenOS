@@ -120,6 +120,20 @@ void Lockscreen::drawSwipeHint() {
 
 
 
+void Lockscreen::redrawPasscodeDots() {
+    // Clears y=55..94 — covers error(65) and dots(73..83), stops before buttons top(96)
+    uint16_t bg = tft->color565(28, 28, 32);
+    tft->fillRect(0, 55, 240, 40, bg);
+    drawPasscodeDots();
+    if (statusMessage.length() > 0 && millis() < statusUntil) {
+        tft->setTextFont(2);
+        tft->setTextSize(1);
+        tft->setTextDatum(MC_DATUM);
+        tft->setTextColor(tft->color565(255, 120, 120));
+        tft->drawString(statusMessage, 120, 65);
+    }
+}
+
 void Lockscreen::drawPasscodeDots() {
     int dotY = 78;
     int count = systemPassword.length();
@@ -240,7 +254,7 @@ void Lockscreen::drawPasswordScreen() {
         tft->setTextSize(1);
         tft->setTextDatum(MC_DATUM);
         tft->setTextColor(tft->color565(255, 120, 120));
-        tft->drawString(statusMessage, 120, numericMode ? 96 : 132);
+        tft->drawString(statusMessage, 120, numericMode ? 65 : 132);
     }
 }
 
@@ -290,7 +304,7 @@ void Lockscreen::showWrongPassword() {
     enteredPassword = "";
     statusMessage = "Wrong passcode";
     statusUntil = millis() + 900;
-    drawPasswordScreen();
+    redrawPasscodeDots();
     delay(250);
 }
 
@@ -314,7 +328,7 @@ bool Lockscreen::handleNumericTouch(int touchX, int touchY) {
             if (abs(touchX - cx) <= BW / 2 && abs(touchY - cy) <= BH / 2) {
                 if (enteredPassword.length() < 24) {
                     enteredPassword += digits[row * 3 + col];
-                    drawPasswordScreen();
+                    redrawPasscodeDots();
                     if (enteredPassword.length() == systemPassword.length()) {
                         submitPassword();
                     }
@@ -328,7 +342,7 @@ bool Lockscreen::handleNumericTouch(int touchX, int touchY) {
     if (abs(touchX - COLS[1]) <= BW / 2 && abs(touchY - ROWS[3]) <= BH / 2) {
         if (enteredPassword.length() < 24) {
             enteredPassword += "0";
-            drawPasswordScreen();
+            redrawPasscodeDots();
             if (enteredPassword.length() == systemPassword.length()) {
                 submitPassword();
             }
@@ -340,7 +354,7 @@ bool Lockscreen::handleNumericTouch(int touchX, int touchY) {
     if (abs(touchX - COLS[2]) <= BW / 2 && abs(touchY - ROWS[3]) <= BH / 2) {
         if (enteredPassword.length() > 0) {
             enteredPassword.remove(enteredPassword.length() - 1);
-            drawPasswordScreen();
+            redrawPasscodeDots();
         }
         return true;
     }
@@ -375,7 +389,10 @@ bool Lockscreen::update() {
 
     if (statusMessage.length() > 0 && millis() > statusUntil) {
         statusMessage = "";
-        if (enteringPassword) drawPasswordScreen();
+        if (enteringPassword) {
+            if (numericMode) redrawPasscodeDots();
+            else drawPasswordScreen();
+        }
     }
 
     if (!enteringPassword) {

@@ -32,6 +32,7 @@ private:
     void drawNumericPad();
     void drawNumericButton(int x, int y, int r, const String& label, const String& sublabel = "");
     void drawPasscodeDots();
+    void redrawPasscodeDots();
     void drawKeyboardPasswordScreen();
     void redrawPasswordInput();
     void getMappedTouch(int &x, int &y);

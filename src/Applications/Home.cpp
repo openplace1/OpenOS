@@ -1,6 +1,8 @@
 #include "Home.h"
 #include "Wallpaper.h"
-#include <time.h> 
+#include <time.h>
+
+extern int sysTheme;
 
 Home::Home(TFT_eSPI* tftInstance, XPT2046_Touchscreen* tsInstance) {
     tft = tftInstance;
@@ -66,29 +68,35 @@ void Home::drawApps(bool renderingDrag) {
 }
 
 void Home::drawStatusBar() {
+    bool dark = (sysTheme == 1);
+    uint16_t barBg   = dark ? tft->color565(20, 20, 22)  : tft->color565(245, 245, 247);
+    uint16_t barText = dark ? TFT_WHITE                   : TFT_BLACK;
+    uint16_t barIcon = dark ? TFT_WHITE                   : TFT_BLACK;
+
+    tft->fillRect(0, 0, 240, 18, barBg);
+
     tft->setTextFont(2);
     tft->setTextSize(1);
-    tft->setTextColor(TFT_WHITE);
-    
-    tft->setTextDatum(TL_DATUM); 
-    tft->drawString("CYD", 5, 2); 
-    
-    
-    tft->setTextDatum(TC_DATUM); 
+    tft->setTextColor(barText);
+
+    tft->setTextDatum(TL_DATUM);
+    tft->drawString("CYD", 5, 2);
+
+    tft->setTextDatum(TC_DATUM);
     time_t now;
     time(&now);
     struct tm timeinfo;
     localtime_r(&now, &timeinfo);
-    
+
     char timeStr[6];
     sprintf(timeStr, "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
     tft->drawString(timeStr, 120, 2);
-    
-    tft->setTextDatum(TR_DATUM); 
+
+    tft->setTextDatum(TR_DATUM);
     tft->drawString("97%", 210, 2);
-    tft->drawRect(215, 4, 16, 10, TFT_WHITE); 
-    tft->fillRect(217, 6, 12, 6, TFT_WHITE);  
-    tft->fillRect(231, 7, 2, 4, TFT_WHITE);   
+    tft->drawRect(215, 4, 16, 10, barIcon);
+    tft->fillRect(217, 6, 12, 6, barIcon);
+    tft->fillRect(231, 7, 2, 4, barIcon);
 }
 
 int Home::getAppIndexAt(int x, int y) {
@@ -118,7 +126,7 @@ App* Home::update() {
         lastMinute = timeinfo.tm_min;
     } else if (lastMinute != timeinfo.tm_min) {
         lastMinute = timeinfo.tm_min;
-        show(false); 
+        drawStatusBar();
     }
     
 
@@ -137,13 +145,31 @@ App* Home::update() {
                 
                 if (!isDragging && (millis() - touchStartTime > 400)) {
                     isDragging = true;
+                    dragPositionSet = false;
                 }
 
                 if (isDragging) {
                     if (abs(dragX - touchX) > 3 || abs(dragY - touchY) > 3) {
+                        int eraseX, eraseY;
+                        if (!dragPositionSet) {
+                            int col = draggedIndex % 4;
+                            int row = draggedIndex / 4;
+                            eraseX = 12 + col * 55 + 23;
+                            eraseY = 30 + row * 80 + 23;
+                        } else {
+                            eraseX = dragX;
+                            eraseY = dragY;
+                        }
                         dragX = touchX;
                         dragY = touchY;
-                        show(true); 
+                        dragPositionSet = true;
+
+                        if (Wallpaper::drawRegion(tft, eraseX - 28, eraseY - 28, 62, 76)) {
+                            drawStatusBar();
+                            drawApps(true);
+                        } else {
+                            show(true);
+                        }
                     }
                 }
             }
@@ -154,6 +180,7 @@ App* Home::update() {
             
             if (isDragging) {
                 isDragging = false;
+                dragPositionSet = false;
                 int dropIndex = getAppIndexAt(dragX, dragY);
                 
                 

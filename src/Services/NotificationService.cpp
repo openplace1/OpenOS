@@ -75,7 +75,7 @@ void NotificationService::drawBanner(const String& message) {
     tft->drawString(shown, bannerX + 12, bannerY + 31);
 }
 
-bool NotificationService::update() {
+int NotificationService::update() {
     if (!isVisible && queueCount > 0) {
         currentMessage = queue[0];
         for (int i = 1; i < queueCount; i++) {
@@ -86,15 +86,14 @@ bool NotificationService::update() {
         drawBanner(currentMessage);
         isVisible = true;
         visibleSince = millis();
-        return true;
+        return 1; // banner appeared — drew itself, no full redraw needed
     }
 
     if (isVisible && millis() - visibleSince > 2200) {
-        clearBannerArea();
         isVisible = false;
         currentMessage = "";
-        return true;
+        return 2; // banner dismissed — caller must restore the area
     }
 
-    return false;
+    return 0;
 }

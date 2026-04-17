@@ -18,6 +18,7 @@ private:
 
     bool wasTouched = false;
     bool isDragging = false;
+    bool dragPositionSet = false;
     int draggedIndex = -1;
     int dragX = 0;
     int dragY = 0;

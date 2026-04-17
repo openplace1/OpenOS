@@ -1,10 +1,13 @@
 #include "Settings.h"
+#include "Wallpaper.h"
 #include <time.h>
 
 extern bool isSdReady;
 extern bool sysWiFiEnabled;
 extern bool sysBTEnabled;
 extern int sysBrightness;
+extern bool sysWallpaperEnabled;
+extern int  sysTheme;
 extern BluetoothSerial SerialBT;
 
 #include "../Services/NotificationService.h"
@@ -39,7 +42,7 @@ SettingsApp::SettingsApp(TFT_eSPI* tftInstance, XPT2046_Touchscreen* tsInstance)
     kbd = new OSKeyboard(tft, ts);
     currentState = STATE_MENU;
 
-    sliderW = 160; sliderH = 4; sliderX = 40; sliderY = 120;
+    sliderW = 160; sliderH = 4; sliderX = 40; sliderY = 185;
     brightness = sysBrightness; thumbX = sliderX + map(brightness, 10, 255, 0, sliderW);
 
     wifiEnabled = sysWiFiEnabled;
@@ -47,7 +50,7 @@ SettingsApp::SettingsApp(TFT_eSPI* tftInstance, XPT2046_Touchscreen* tsInstance)
     networkCount = 0; showPassword = false; connectionStartTime = 0;
 
     setHour = 12; setMin = 0; setDay = 1; setMonth = 1; setYear = 2024;
-    wallpaperCount = 0; wallpaperPage = 0;
+    wallpaperCount = 0; wallpaperPage = 0; wallpaperEnabled = true;
 
     scrollOffset = 0; lastTouchY = -1; touchStartY = -1;
     isScrollingList = false; isDragging = false; wasTouched = false;
@@ -121,7 +124,7 @@ void SettingsApp::show() {
     brightness = sysBrightness;
     thumbX = sliderX + map(brightness, 10, 255, 0, sliderW);
 
-    if (currentState == STATE_MENU) loadSystemPassword();
+    if (currentState == STATE_MENU) { loadSystemPassword(); loadWallpaperEnabled(); }
 
     tft->fillScreen(tft->color565(240, 240, 245));
 
@@ -132,6 +135,8 @@ void SettingsApp::show() {
     else if (currentState == STATE_WIFI_CONNECTING) drawWiFiConnectingScreen();
     else if (currentState == STATE_TIME) drawTimeSettings();
     else if (currentState == STATE_SDCARD) drawSDCardSettings();
+    else if (currentState == STATE_SDCARD_CONFIRM) { drawSDCardSettings(); drawSDCardConfirm(); }
+    else if (currentState == STATE_WALLPAPER_CONFIRM) { drawWallpapers(); drawWallpaperConfirm(); }
     else if (currentState == STATE_BLUETOOTH) drawBluetoothSettings();
     else if (currentState == STATE_WALLPAPERS) drawWallpapers();
     else if (currentState == STATE_ABOUT) drawAboutScreen();
@@ -218,19 +223,48 @@ void SettingsApp::drawAboutScreen() {
 }
 
 void SettingsApp::drawDisplaySettings() {
-    
     tft->fillRect(0, 0, 240, 50, tft->color565(248, 248, 248));
     tft->drawFastHLine(0, 50, 240, tft->color565(200, 200, 200));
     tft->setTextFont(2); tft->setTextSize(1);
     tft->setTextColor(tft->color565(0, 122, 255)); tft->setTextDatum(ML_DATUM); tft->drawString("< Back", 10, 25);
     tft->setTextColor(TFT_BLACK); tft->setTextDatum(MC_DATUM); tft->drawString("Display", 120, 25);
 
-    tft->setTextColor(tft->color565(100, 100, 100)); tft->setTextDatum(BL_DATUM); tft->drawString("BRIGHTNESS", 15, 80);
-    tft->fillRect(0, 85, 240, 70, TFT_WHITE);
-    tft->drawFastHLine(0, 85, 240, tft->color565(200, 200, 200));
-    tft->drawFastHLine(0, 155, 240, tft->color565(200, 200, 200));
-    tft->fillCircle(20, 120, 4, tft->color565(150, 150, 150));
-    tft->fillCircle(220, 120, 8, tft->color565(150, 150, 150));
+    // ── Appearance ──────────────────────────────────────────────────────────
+    tft->setTextColor(tft->color565(100, 100, 100)); tft->setTextDatum(BL_DATUM);
+    tft->drawString("APPEARANCE", 15, 62);
+    tft->fillRect(0, 65, 240, 55, TFT_WHITE);
+    tft->drawFastHLine(0, 65, 240, tft->color565(200, 200, 200));
+    tft->drawFastHLine(0, 120, 240, tft->color565(200, 200, 200));
+
+    // Segmented control background
+    tft->fillRoundRect(20, 72, 200, 36, 10, tft->color565(228, 228, 228));
+
+    // Light button
+    if (sysTheme == 0) {
+        tft->fillRoundRect(22, 74, 96, 32, 9, TFT_WHITE);
+        tft->setTextColor(TFT_BLACK);
+    } else {
+        tft->setTextColor(tft->color565(140, 140, 140));
+    }
+    tft->setTextDatum(MC_DATUM); tft->drawString("Light", 70, 90);
+
+    // Dark button
+    if (sysTheme == 1) {
+        tft->fillRoundRect(122, 74, 96, 32, 9, TFT_WHITE);
+        tft->setTextColor(TFT_BLACK);
+    } else {
+        tft->setTextColor(tft->color565(140, 140, 140));
+    }
+    tft->drawString("Dark", 170, 90);
+
+    // ── Brightness ──────────────────────────────────────────────────────────
+    tft->setTextColor(tft->color565(100, 100, 100)); tft->setTextDatum(BL_DATUM);
+    tft->drawString("BRIGHTNESS", 15, 132);
+    tft->fillRect(0, 135, 240, 80, TFT_WHITE);
+    tft->drawFastHLine(0, 135, 240, tft->color565(200, 200, 200));
+    tft->drawFastHLine(0, 215, 240, tft->color565(200, 200, 200));
+    tft->fillCircle(20, 185, 4, tft->color565(150, 150, 150));
+    tft->fillCircle(220, 185, 8, tft->color565(150, 150, 150));
     drawSlider();
 }
 
@@ -451,6 +485,38 @@ void SettingsApp::drawSDCardSettings() {
     }
 }
 
+void SettingsApp::loadWallpaperEnabled() {
+    wallpaperEnabled = true;
+    if (!isSdReady) return;
+    File f = SD.open("/user/wp_enabled.txt", FILE_READ);
+    if (!f) return;
+    String val = f.readStringUntil('\n');
+    f.close();
+    val.trim();
+    wallpaperEnabled = (val != "0");
+    sysWallpaperEnabled = wallpaperEnabled;
+}
+
+void SettingsApp::saveWallpaperEnabled() {
+    if (!isSdReady) return;
+    ensureUserFolder();
+    SD.remove("/user/wp_enabled.txt");
+    File f = SD.open("/user/wp_enabled.txt", FILE_WRITE);
+    if (!f) return;
+    f.println(wallpaperEnabled ? "1" : "0");
+    f.close();
+}
+
+void SettingsApp::saveTheme() {
+    if (!isSdReady) return;
+    ensureUserFolder();
+    SD.remove("/user/theme.txt");
+    File f = SD.open("/user/theme.txt", FILE_WRITE);
+    if (!f) return;
+    f.println(sysTheme);
+    f.close();
+}
+
 void SettingsApp::loadWallpapers() {
     wallpaperCount = 0; if (!isSdReady) return;
     File dir = SD.open("/system/assets/wallpapers"); if (!dir) return;
@@ -497,27 +563,106 @@ void SettingsApp::drawBmpThumbnail(String path, int x, int y, int w, int h) {
 }
 
 void SettingsApp::drawWallpapers() {
-    tft->fillScreen(tft->color565(240, 240, 245)); tft->fillRect(0, 0, 240, 50, tft->color565(248, 248, 248)); tft->drawFastHLine(0, 50, 240, tft->color565(200, 200, 200));
-    tft->setTextFont(2); tft->setTextSize(1); tft->setTextColor(tft->color565(0, 122, 255)); tft->setTextDatum(ML_DATUM); tft->drawString("< Back", 10, 25);
-    tft->setTextColor(TFT_BLACK); tft->setTextDatum(MC_DATUM); tft->drawString("Select Wallpaper", 120, 25);
+    tft->fillScreen(tft->color565(240, 240, 245));
+    tft->fillRect(0, 0, 240, 50, tft->color565(248, 248, 248));
+    tft->drawFastHLine(0, 50, 240, tft->color565(200, 200, 200));
+    tft->setTextFont(2); tft->setTextSize(1);
+    tft->setTextColor(tft->color565(0, 122, 255)); tft->setTextDatum(ML_DATUM); tft->drawString("< Back", 10, 25);
+    tft->setTextColor(TFT_BLACK); tft->setTextDatum(MC_DATUM); tft->drawString("Wallpapers", 120, 25);
+
+    // Toggle row
+    tft->fillRect(0, 55, 240, 45, TFT_WHITE);
+    tft->drawFastHLine(0, 55, 240, tft->color565(200, 200, 200));
+    tft->drawFastHLine(0, 100, 240, tft->color565(200, 200, 200));
+    tft->setTextColor(TFT_BLACK); tft->setTextDatum(ML_DATUM); tft->drawString("Wallpaper", 15, 77);
+    drawToggle(175, 62, wallpaperEnabled);
+
+    if (!wallpaperEnabled) {
+        tft->setTextColor(tft->color565(150, 150, 150)); tft->setTextDatum(MC_DATUM);
+        tft->drawString("Wallpaper is disabled", 120, 200);
+        return;
+    }
 
     if (wallpaperCount == 0) {
-        tft->setTextColor(tft->color565(150, 150, 150)); tft->drawString("No .bmp files found in", 120, 150); tft->drawString("/system/assets/wallpapers/", 120, 170); return;
+        tft->setTextColor(tft->color565(150, 150, 150)); tft->setTextDatum(MC_DATUM);
+        tft->drawString("No .bmp files found in", 120, 175);
+        tft->drawString("/system/assets/wallpapers/", 120, 195);
+        return;
     }
 
     int startIdx = wallpaperPage * 4; int endIdx = startIdx + 4; if (endIdx > wallpaperCount) endIdx = wallpaperCount;
     for (int i = startIdx; i < endIdx; i++) {
         int localIdx = i - startIdx; int col = localIdx % 2; int row = localIdx / 2;
-        int x = 26 + col * 107; int y = 65 + row * 126;
-        tft->fillRoundRect(x - 2, y - 2, 84, 110, 4, tft->color565(200, 200, 200));
-        drawBmpThumbnail("/system/assets/wallpapers/" + wallpapers[i], x, y, 80, 106);
+        int x = 26 + col * 107; int y = 108 + row * 105;
+        tft->fillRoundRect(x - 2, y - 2, 84, 94, 4, tft->color565(200, 200, 200));
+        drawBmpThumbnail("/system/assets/wallpapers/" + wallpapers[i], x, y, 80, 90);
         tft->setTextColor(TFT_BLACK); tft->setTextDatum(MC_DATUM);
         String dName = wallpapers[i]; if (dName.length() > 10) dName = dName.substring(0, 8) + "..";
-        tft->drawString(dName, x + 40, y + 115);
+        tft->drawString(dName, x + 40, y + 99);
     }
     tft->setTextColor(tft->color565(0, 122, 255));
-    if (wallpaperPage > 0) tft->drawString("< Previous", 50, 305);
-    if (endIdx < wallpaperCount) tft->drawString("Next >", 190, 305);
+    if (wallpaperPage > 0) tft->drawString("< Previous", 50, 310);
+    if (endIdx < wallpaperCount) tft->drawString("Next >", 190, 310);
+}
+
+void SettingsApp::drawWallpaperConfirm() {
+    for (int row = 0; row < 320; row += 2)
+        tft->drawFastHLine(0, row, 240, tft->color565(0, 0, 0));
+
+    int cx = 20, cy = 90, cw = 200, ch = 140;
+    tft->fillRoundRect(cx, cy, cw, ch, 14, TFT_WHITE);
+    tft->drawRoundRect(cx, cy, cw, ch, 14, tft->color565(200, 200, 200));
+
+    tft->setTextFont(2); tft->setTextSize(1); tft->setTextDatum(MC_DATUM);
+    tft->setTextColor(TFT_BLACK);
+    tft->drawString("Experimental Feature", 120, cy + 22);
+
+    tft->setTextColor(tft->color565(120, 120, 120));
+    tft->drawString("Wallpaper may slow down", 120, cy + 46);
+    tft->drawString("the device significantly.", 120, cy + 62);
+    tft->drawString("Not recommended for", 120, cy + 78);
+    tft->drawString("daily use.", 120, cy + 94);
+
+    tft->drawFastHLine(cx, cy + 110, cw, tft->color565(220, 220, 220));
+    tft->drawFastVLine(cx + cw / 2, cy + 110, ch - 110, tft->color565(220, 220, 220));
+
+    tft->setTextColor(tft->color565(150, 150, 150));
+    tft->drawString("Cancel", cx + cw / 4, cy + 125);
+    tft->setTextColor(tft->color565(255, 149, 0));
+    tft->drawString("Enable anyway", cx + cw * 3 / 4, cy + 125);
+}
+
+void SettingsApp::drawSDCardConfirm() {
+    // Dim overlay
+    for (int row = 0; row < 320; row += 2)
+        tft->drawFastHLine(0, row, 240, tft->color565(0, 0, 0));
+
+    // Card
+    int cx = 20, cy = 100, cw = 200, ch = 120;
+    tft->fillRoundRect(cx, cy, cw, ch, 14, TFT_WHITE);
+    tft->drawRoundRect(cx, cy, cw, ch, 14, tft->color565(200, 200, 200));
+
+    tft->setTextFont(2); tft->setTextSize(1); tft->setTextDatum(MC_DATUM);
+    tft->setTextColor(TFT_BLACK);
+    tft->drawString("Erase SD Card?", 120, cy + 22);
+
+    tft->setTextColor(tft->color565(120, 120, 120));
+    tft->drawString("This will delete all files.", 120, cy + 46);
+    tft->drawString("This cannot be undone.", 120, cy + 62);
+
+    // Divider
+    tft->drawFastHLine(cx, cy + 78, cw, tft->color565(220, 220, 220));
+
+    // Cancel button (left half)
+    tft->setTextColor(tft->color565(0, 122, 255));
+    tft->drawString("Cancel", cx + cw / 4, cy + 99);
+
+    // Vertical divider
+    tft->drawFastVLine(cx + cw / 2, cy + 78, ch - 78, tft->color565(220, 220, 220));
+
+    // Erase button (right half)
+    tft->setTextColor(tft->color565(255, 59, 48));
+    tft->drawString("Erase", cx + cw * 3 / 4, cy + 99);
 }
 
 void SettingsApp::drawPasscodeInputScreen(const String& title, const String& subtitle, const String& rightAction) {
@@ -652,7 +797,7 @@ void SettingsApp::update() {
                     currentState = passcodeEnabled ? STATE_PASSCODE_GATE : STATE_PASSCODE_SET;
                     show();
                 }
-                else if (touchY > 40 + rowH * 4 && touchY < 40 + rowH * 5) { loadWallpapers(); wallpaperPage = 0; currentState = STATE_WALLPAPERS; show(); }
+                else if (touchY > 40 + rowH * 4 && touchY < 40 + rowH * 5) { loadWallpaperEnabled(); loadWallpapers(); wallpaperPage = 0; currentState = STATE_WALLPAPERS; show(); }
                 else if (touchY > 40 + rowH * 5 && touchY < 40 + rowH * 6) {
                     struct tm timeinfo;
                     if (getLocalTime(&timeinfo, 10)) {
@@ -669,18 +814,32 @@ void SettingsApp::update() {
             }
             else if (currentState == STATE_WALLPAPERS) {
                 if (touchY < 50 && touchX < 80) { currentState = STATE_MENU; show(); }
-                else if (touchY > 290) {
+                else if (touchY > 55 && touchY < 100) {
+                    if (!wallpaperEnabled) {
+                        // Enabling — show warning first
+                        currentState = STATE_WALLPAPER_CONFIRM; show();
+                    } else {
+                        // Disabling — instant
+                        wallpaperEnabled = false;
+                        sysWallpaperEnabled = false;
+                        saveWallpaperEnabled();
+                        Wallpaper::invalidate();
+                        show();
+                    }
+                }
+                else if (wallpaperEnabled && touchY > 295) {
                     if (touchX < 120 && wallpaperPage > 0) { wallpaperPage--; show(); }
                     else if (touchX > 120 && (wallpaperPage + 1) * 4 < wallpaperCount) { wallpaperPage++; show(); }
                 }
-                else if (touchY > 60 && touchY < 290) {
+                else if (wallpaperEnabled && touchY > 100 && touchY < 295) {
                     int startIdx = wallpaperPage * 4; int endIdx = startIdx + 4; if (endIdx > wallpaperCount) endIdx = wallpaperCount;
                     for (int i = startIdx; i < endIdx; i++) {
                         int localIdx = i - startIdx; int col = localIdx % 2; int row = localIdx / 2;
-                        int x = 26 + col * 107; int y = 65 + row * 126;
-                        if (touchX > x && touchX < x + 80 && touchY > y && touchY < y + 106) {
+                        int x = 26 + col * 107; int y = 108 + row * 105;
+                        if (touchX > x && touchX < x + 80 && touchY > y && touchY < y + 90) {
                             File cfg = SD.open("/system/wp.txt", FILE_WRITE);
                             if (cfg) { cfg.println("/system/assets/wallpapers/" + wallpapers[i]); cfg.close(); notifyService.push("Wallpaper updated!"); }
+                            Wallpaper::invalidate();
                             currentState = STATE_MENU; show();
                         }
                     }
@@ -688,6 +847,15 @@ void SettingsApp::update() {
             }
             else if (currentState == STATE_DISPLAY) {
                 if (touchY > 10 && touchY < 45 && touchX < 80) { currentState = STATE_MENU; show(); }
+                else if (touchY > 65 && touchY < 120) {
+                    int newTheme = (touchX < 120) ? 0 : 1;
+                    if (newTheme != sysTheme) {
+                        sysTheme = newTheme;
+                        saveTheme();
+                        Wallpaper::invalidate();
+                        drawDisplaySettings();
+                    }
+                }
                 else if (touchY > sliderY - 25 && touchY < sliderY + 25) { isDragging = true; }
             }
             else if (currentState == STATE_BLUETOOTH) {
@@ -703,11 +871,37 @@ void SettingsApp::update() {
             else if (currentState == STATE_SDCARD) {
                 if (touchY < 50 && touchX < 80) { currentState = STATE_MENU; show(); }
                 else if (isSdReady && touchY > 170 && touchY < 220) {
-                    tft->fillRoundRect(10, 170, 220, 50, 10, tft->color565(200, 30, 25));
-                    tft->setTextColor(TFT_WHITE); tft->setTextDatum(MC_DATUM); tft->drawString("WAIT...", 120, 195);
-                    delay(100); wipeSDCard("/");
-                    SD.mkdir("/system"); SD.mkdir("/system/assets"); SD.mkdir("/system/assets/wallpapers"); SD.mkdir("/user"); SD.mkdir("/apps");
-                    notifyService.push("SD Card wiped!"); currentState = STATE_MENU; show();
+                    currentState = STATE_SDCARD_CONFIRM; show();
+                }
+            }
+            else if (currentState == STATE_WALLPAPER_CONFIRM) {
+                // Card: x=20-220, y=90-230; buttons y=200-230
+                if (touchY > 200 && touchY < 230) {
+                    if (touchX > 20 && touchX < 120) {
+                        currentState = STATE_WALLPAPERS; show();
+                    } else if (touchX > 120 && touchX < 220) {
+                        wallpaperEnabled = true;
+                        sysWallpaperEnabled = true;
+                        saveWallpaperEnabled();
+                        Wallpaper::invalidate();
+                        currentState = STATE_WALLPAPERS; show();
+                    }
+                }
+            }
+            else if (currentState == STATE_SDCARD_CONFIRM) {
+                // Card occupies x=20-220, y=100-220; buttons in bottom row y=178-220
+                if (touchY > 178 && touchY < 220) {
+                    if (touchX > 20 && touchX < 120) {
+                        // Cancel
+                        currentState = STATE_SDCARD; show();
+                    } else if (touchX > 120 && touchX < 220) {
+                        // Erase
+                        tft->fillRoundRect(10, 170, 220, 50, 10, tft->color565(200, 30, 25));
+                        tft->setTextColor(TFT_WHITE); tft->setTextDatum(MC_DATUM); tft->drawString("WAIT...", 120, 195);
+                        delay(100); wipeSDCard("/");
+                        SD.mkdir("/system"); SD.mkdir("/system/assets"); SD.mkdir("/system/assets/wallpapers"); SD.mkdir("/user"); SD.mkdir("/apps");
+                        notifyService.push("SD Card wiped!"); currentState = STATE_MENU; show();
+                    }
                 }
             }
             else if (currentState == STATE_TIME) {

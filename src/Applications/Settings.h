@@ -30,7 +30,9 @@ private:
         STATE_PASSCODE_SET,
         STATE_PASSCODE_CONFIRM,
         STATE_PASSCODE_DISABLE_VERIFY,
-        STATE_PASSCODE_RESET_VERIFY
+        STATE_PASSCODE_RESET_VERIFY,
+        STATE_SDCARD_CONFIRM,
+        STATE_WALLPAPER_CONFIRM
     };
 
     static const int MAX_NETWORKS = 20;
@@ -61,6 +63,7 @@ private:
     String wallpapers[MAX_WALLPAPERS];
     int wallpaperCount;
     int wallpaperPage;
+    bool wallpaperEnabled;
 
     int scrollOffset;
     int lastTouchY;
@@ -103,10 +106,15 @@ private:
     void redrawPasscodeNumericScreen();
     bool handlePasscodePadTouch(int touchX, int touchY);
 
+    void drawSDCardConfirm();
+    void drawWallpaperConfirm();
     void loadSystemPassword();
     bool saveSystemPassword(const String& newPassword);
     bool ensureUserFolder();
     void resetPasscodeEntry(bool keepShow = false);
+    void loadWallpaperEnabled();
+    void saveWallpaperEnabled();
+    void saveTheme();
 
 public:
     SettingsApp(TFT_eSPI* tftInstance, XPT2046_Touchscreen* tsInstance);

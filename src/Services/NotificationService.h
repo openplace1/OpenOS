@@ -28,7 +28,7 @@ public:
     NotificationService(TFT_eSPI* tftInstance);
 
     void push(const String& message);
-    bool update();
+    int update(); // 0=nothing, 1=banner appeared, 2=banner dismissed
     bool hasActiveNotification() const;
 };
 

@@ -72,6 +72,8 @@ bool isSwipeDown = false;
 int startSwipeDownY = 0;
 
 bool isSdReady = false;
+bool sysWallpaperEnabled = true;
+int  sysTheme = 0; // 0 = light, 1 = dark
 
 static void applySystemState() {
     pinMode(TFT_BL, OUTPUT);
@@ -113,6 +115,7 @@ static void closeControlCenter() {
 }
 
 void setup() {
+    setCpuFrequencyMhz(240);
     Serial.begin(115200);
     delay(1000);
 
@@ -155,6 +158,18 @@ void setup() {
     if (SD.begin(SD_CS, sdSPI, 20000000)) {
         Serial.println("SD Card mounted perfectly!");
         isSdReady = true;
+        File wpf = SD.open("/user/wp_enabled.txt", FILE_READ);
+        if (wpf) {
+            String val = wpf.readStringUntil('\n');
+            wpf.close(); val.trim();
+            if (val == "0") sysWallpaperEnabled = false;
+        }
+        File thf = SD.open("/user/theme.txt", FILE_READ);
+        if (thf) {
+            String val = thf.readStringUntil('\n');
+            thf.close(); val.trim();
+            if (val == "1") sysTheme = 1;
+        }
     } else {
         Serial.println("No SD Card found at startup!");
     }
@@ -187,7 +202,8 @@ void loop() {
     
 
     
-    if (notifyService.update()) {
+    int notifChange = notifyService.update();
+    if (notifChange == 2) { // banner dismissed — restore covered area
         if (currentState == STATE_HOMESCREEN) {
             home.show(false);
         } else if (currentState == STATE_IN_APP && activeApp != nullptr) {
@@ -198,6 +214,7 @@ void loop() {
             controlCenter.show();
         }
     }
+    // notifChange == 1: banner drew itself on top, no redraw needed
 
     if (currentState == STATE_LOCKSCREEN) {
         if (lockscreen.update()) {
