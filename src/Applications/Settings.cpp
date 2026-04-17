@@ -484,7 +484,10 @@ void SettingsApp::drawBmpThumbnail(String path, int x, int y, int w, int h) {
                         uint8_t b = sdbuffer[srcX * 3]; uint8_t g = sdbuffer[srcX * 3 + 1]; uint8_t r = sdbuffer[srcX * 3 + 2];
                         lcdbuffer[thumbX] = tft->color565(r, g, b);
                     }
-                    tft->pushImage(x, y + thumbY, w, 1, lcdbuffer);
+                    tft->startWrite();
+                    tft->setAddrWindow(x, y + thumbY, w, 1);
+                    tft->pushColors(lcdbuffer, w, true);
+                    tft->endWrite();
                 }
             }
             if (sdbuffer) delete[] sdbuffer; if (lcdbuffer) delete[] lcdbuffer;

@@ -39,18 +39,7 @@ bool Wallpaper::loadWallpaperPath(String& outPath) {
 }
 
 void Wallpaper::drawFallback(TFT_eSPI* tft) {
-    
-    for (int y = 0; y < 320; y++) {
-        uint8_t r = 18 + (y * 18 / 320);
-        uint8_t g = 24 + (y * 22 / 320);
-        uint8_t b = 40 + (y * 45 / 320);
-        tft->drawFastHLine(0, y, 240, tft->color565(r, g, b));
-    }
-
-    
-    tft->fillCircle(190, 55, 55, tft->color565(55, 70, 120));
-    tft->fillCircle(40, 260, 70, tft->color565(70, 40, 110));
-    tft->fillCircle(120, 150, 45, tft->color565(40, 90, 120));
+    tft->fillScreen(tft->color565(100, 100, 105));
 }
 
 bool Wallpaper::drawBmp(TFT_eSPI* tft, const String& path) {
@@ -139,7 +128,10 @@ bool Wallpaper::drawBmp(TFT_eSPI* tft, const String& path) {
             lineBuffer[x] = tft->color565(r, g, b);
         }
 
-        tft->pushImage(dstX, dstY + y, drawW, 1, lineBuffer);
+        tft->startWrite();
+        tft->setAddrWindow(dstX, dstY + y, drawW, 1);
+        tft->pushColors(lineBuffer, drawW, true);
+        tft->endWrite();
     }
 
     delete[] sdbuffer;

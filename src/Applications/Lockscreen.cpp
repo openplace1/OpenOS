@@ -145,20 +145,17 @@ void Lockscreen::drawPasscodeDots() {
 
 
 void Lockscreen::drawNumericButton(int x, int y, int r, const String& label, const String& sublabel) {
-    uint16_t fill = tft->color565(88, 88, 92);
-    uint16_t edge = tft->color565(145, 145, 150);
-
-    tft->fillCircle(x, y, r, fill);
-    tft->drawCircle(x, y, r, edge);
+    tft->fillCircle(x, y, r, tft->color565(88, 88, 92));
+    tft->drawCircle(x, y, r, tft->color565(130, 130, 135));
 
     tft->setTextDatum(MC_DATUM);
     tft->setTextColor(TFT_WHITE);
     tft->setTextFont(4);
-    tft->drawString(label, x, y - 4);
+    tft->drawString(label, x, sublabel.length() > 0 ? y - 5 : y);
 
     if (sublabel.length() > 0) {
         tft->setTextFont(1);
-        tft->setTextColor(tft->color565(220, 220, 220));
+        tft->setTextColor(tft->color565(210, 210, 215));
         tft->drawString(sublabel, x, y + 11);
     }
 }
@@ -171,45 +168,16 @@ void Lockscreen::drawNumericButton(int x, int y, int r, const String& label, con
 
 
 void Lockscreen::drawNumericPad() {
-    
-    uint16_t btnFill   = tft->color565(30, 30, 30);  
-    uint16_t btnBorder = tft->color565(255, 255, 255);  
+    const int COLS[3] = {40, 120, 200};
+    const int ROWS[4] = {118, 166, 214, 262};
+    const int R = 22;
 
-    const int COLS[3]  = {40, 120, 200};
-    const int ROWS[4]  = {118, 166, 214, 262};
-    const int BUTTON_WIDTH = 68;   
-    const int BUTTON_HEIGHT = 40;   
-    const int BUTTON_RADIUS = 7;    
-
-    
-    auto drawBtn = [&](int cx, int cy, const char* lbl) {
-        int x = cx - BUTTON_WIDTH / 2;
-        int y = cy - BUTTON_HEIGHT / 2;
-        tft->fillRoundRect(x, y, BUTTON_WIDTH, BUTTON_HEIGHT, BUTTON_RADIUS, btnFill);
-        tft->drawRoundRect(x, y, BUTTON_WIDTH, BUTTON_HEIGHT, BUTTON_RADIUS, btnBorder);
-        tft->setTextFont(4);
-        tft->setTextColor(TFT_WHITE);
-        tft->setTextDatum(MC_DATUM);
-        tft->drawString(lbl, cx, cy);
-    };
-
-    
-    drawBtn(COLS[0], ROWS[0], "1");
-    drawBtn(COLS[1], ROWS[0], "2");
-    drawBtn(COLS[2], ROWS[0], "3");
-
-    drawBtn(COLS[0], ROWS[1], "4");
-    drawBtn(COLS[1], ROWS[1], "5");
-    drawBtn(COLS[2], ROWS[1], "6");
-
-    drawBtn(COLS[0], ROWS[2], "7");
-    drawBtn(COLS[1], ROWS[2], "8");
-    drawBtn(COLS[2], ROWS[2], "9");
-
-    
-    drawBtn(COLS[1], ROWS[3], "0");
-    drawBtn(COLS[2], ROWS[3], "<");
-    
+    const char* sublabels[9] = {"", "ABC", "DEF", "GHI", "JKL", "MNO", "PQRS", "TUV", "WXYZ"};
+    for (int i = 0; i < 9; i++) {
+        drawNumericButton(COLS[i % 3], ROWS[i / 3], R, String(i + 1), sublabels[i]);
+    }
+    drawNumericButton(COLS[1], ROWS[3], R, "0", "");
+    drawNumericButton(COLS[2], ROWS[3], R, "<", "");
 }
 
 void Lockscreen::drawKeyboardPasswordScreen() {
@@ -244,15 +212,13 @@ void Lockscreen::drawKeyboardPasswordScreen() {
 
 void Lockscreen::drawPasswordScreen() {
     
-    uint16_t bgColor = tft->color565(30, 30, 30);
-    tft->fillScreen(bgColor);
+    tft->fillScreen(tft->color565(28, 28, 32));
 
-    
     tft->setTextFont(2);
     tft->setTextSize(1);
     tft->setTextColor(tft->color565(100, 210, 255));
     tft->setTextDatum(ML_DATUM);
-    tft->drawString("< Cancel", 10, 22);
+    tft->drawString("Cancel", 10, 22);
 
     
     tft->setTextFont(2);
