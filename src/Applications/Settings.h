@@ -115,6 +115,9 @@ private:
     void loadWallpaperEnabled();
     void saveWallpaperEnabled();
     void saveTheme();
+    void saveWiFiState();
+    void saveWiFiNetwork(const String& ssid, const String& password);
+    void redrawWiFiPasswordField();
 
 public:
     SettingsApp(TFT_eSPI* tftInstance, XPT2046_Touchscreen* tsInstance);

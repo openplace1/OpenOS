@@ -7,6 +7,7 @@
 #include <WiFi.h>
 #include "BluetoothSerial.h"
 
+#include "Config.h"
 #include "Applications/Lockscreen.h"
 #include "Applications/Home.h"
 #include "Applications/Calculator.h"
@@ -14,6 +15,10 @@
 #include "Applications/Settings.h"
 #include "Applications/FilesApp.h"
 #include "Applications/ControlCenter.h"
+#include "Applications/Clock.h"
+#include "Applications/Crypto.h"
+#include "Applications/Wallpaper.h"
+#include "Applications/Theme.h"
 #include "Services/NotificationService.h"
 
 
@@ -44,6 +49,7 @@ TestKeyboard notesApp(&tft, &ts);
 SettingsApp settingsApp(&tft, &ts);
 FilesApp filesApp(&tft, &ts);
 ControlCenter controlCenter(&tft, &ts);
+ClockApp clockApp(&tft, &ts);
 
 NotificationService notifyService(&tft);
 
@@ -74,6 +80,8 @@ int startSwipeDownY = 0;
 bool isSdReady = false;
 bool sysWallpaperEnabled = true;
 int  sysTheme = 0; // 0 = light, 1 = dark
+bool sysNtpSynced = false;
+time_t sysLastNtpSync = 0;
 
 static void applySystemState() {
     pinMode(TFT_BL, OUTPUT);
@@ -158,25 +166,32 @@ void setup() {
     if (SD.begin(SD_CS, sdSPI, 20000000)) {
         Serial.println("SD Card mounted perfectly!");
         isSdReady = true;
-        File wpf = SD.open("/user/wp_enabled.txt", FILE_READ);
-        if (wpf) {
-            String val = wpf.readStringUntil('\n');
-            wpf.close(); val.trim();
-            if (val == "0") sysWallpaperEnabled = false;
-        }
-        File thf = SD.open("/user/theme.txt", FILE_READ);
-        if (thf) {
-            String val = thf.readStringUntil('\n');
-            thf.close(); val.trim();
-            if (val == "1") sysTheme = 1;
-        }
+        Config::load();
+        sysWallpaperEnabled = (Config::getInt("wallpaper", 1) != 0);
+        sysTheme            = Config::getInt("theme", 0);
+        sysWiFiEnabled      = (Config::getInt("wifi", 0) != 0);
     } else {
         Serial.println("No SD Card found at startup!");
     }
-    
 
     applySystemState();
 
+    // Auto-connect to last saved WiFi network (background, non-blocking)
+    if (sysWiFiEnabled && isSdReady) {
+        String enc = Config::get("net_0", "");
+        if (enc.length() > 0) {
+            String dec = Crypto::decrypt(enc);
+            int sep = dec.indexOf('|');
+            if (sep > 0) {
+                String ssid = dec.substring(0, sep);
+                String pass = dec.substring(sep + 1);
+                WiFi.begin(ssid.c_str(), pass.c_str());
+                Serial.println("[WiFi] Auto-connecting to: " + ssid);
+            }
+        }
+    }
+
+    home.addApp(&clockApp);
     home.addApp(&calcApp);
     home.addApp(&notesApp);
     home.addApp(&settingsApp);
@@ -202,12 +217,25 @@ void loop() {
     
 
     
+    // Detect background WiFi auto-connect → sync NTP
+    static bool autoNtpDone = false;
+    if (!autoNtpDone && sysNtpSynced == false && WiFi.status() == WL_CONNECTED) {
+        configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.cloudflare.com");
+        struct tm t;
+        if (getLocalTime(&t, 3000)) { sysNtpSynced = true; time(&sysLastNtpSync); notifyService.push("Time synced"); }
+        autoNtpDone = true;
+    }
+
     int notifChange = notifyService.update();
-    if (notifChange == 2) { // banner dismissed — restore covered area
+    if (notifChange == 2) { // banner dismissed — restore only the banner area (top 50px)
         if (currentState == STATE_HOMESCREEN) {
-            home.show(false);
+            // Restore wallpaper from cache, then redraw status bar on top
+            if (!Wallpaper::drawRegion(&tft, 0, 0, 240, 52)) {
+                tft.fillRect(0, 0, 240, 52, Theme::bg());
+            }
+            home.drawStatusBar();
         } else if (currentState == STATE_IN_APP && activeApp != nullptr) {
-            activeApp->show();
+            activeApp->drawHeader();
         } else if (currentState == STATE_LOCKSCREEN) {
             lockscreen.show();
         } else if (currentState == STATE_CONTROLCENTER) {

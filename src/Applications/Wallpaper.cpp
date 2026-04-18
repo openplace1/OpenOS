@@ -1,4 +1,5 @@
 #include "Wallpaper.h"
+#include "../Config.h"
 #include <SD.h>
 
 extern bool isSdReady;
@@ -213,14 +214,6 @@ bool Wallpaper::loadWallpaperPath(String& outPath) {
     outPath = "";
     if (!isSdReady) return false;
 
-    File cfg = SD.open("/system/wp.txt");
-    if (!cfg) return false;
-
-    String line = cfg.readStringUntil('\n');
-    cfg.close();
-    line.trim();
-    if (line.length() == 0) return false;
-
-    outPath = line;
-    return true;
+    outPath = Config::get("wallpaper_path", "");
+    return (outPath.length() > 0);
 }

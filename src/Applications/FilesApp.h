@@ -36,6 +36,7 @@ public:
 
     void show() override;
     void update() override;
+    void drawHeader() override;
 };
 
 #endif

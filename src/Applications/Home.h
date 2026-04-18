@@ -24,7 +24,6 @@ private:
     int dragY = 0;
     unsigned long touchStartTime = 0;
 
-    void drawStatusBar();
     void drawApps(bool renderingDrag);
     int getAppIndexAt(int x, int y);
 
@@ -33,6 +32,7 @@ public:
 
     void addApp(App* newApp);
     void show(bool renderingDrag = false);
+    void drawStatusBar();
     App* update();
 };
 

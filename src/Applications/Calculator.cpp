@@ -227,6 +227,10 @@ void Calculator::handleButtonPress(const String& label) {
     drawDisplay();
 }
 
+void Calculator::drawHeader() {
+    drawDisplay(); // restores y=0..72 (the display area that banner overlaps)
+}
+
 void Calculator::show() {
     tft->fillScreen(Theme::dark() ? Theme::c(28, 28, 30) : Theme::c(240, 240, 245));
     drawDisplay();

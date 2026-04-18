@@ -1,7 +1,8 @@
 #include "Lockscreen.h"
 #include "Wallpaper.h"
+#include "Crypto.h"
+#include "../Config.h"
 #include <time.h>
-#include <SD.h>
 
 extern bool isSdReady;
 
@@ -33,13 +34,10 @@ void Lockscreen::loadPassword() {
     numericMode = false;
 
     if (!isSdReady) return;
-    File f = SD.open("/user/pwd.txt", FILE_READ);
-    if (!f) return;
+    String raw = Config::get("passcode", "");
+    if (raw.length() == 0) return;
 
-    systemPassword = f.readStringUntil('\n');
-    systemPassword.trim();
-    f.close();
-
+    systemPassword = Crypto::decrypt(raw);
     numericMode = isNumericPassword(systemPassword);
 }
 

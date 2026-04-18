@@ -1,6 +1,8 @@
 #include "Settings.h"
 #include "Wallpaper.h"
 #include "Theme.h"
+#include "Crypto.h"
+#include "../Config.h"
 #include <time.h>
 
 extern bool isSdReady;
@@ -79,26 +81,21 @@ void SettingsApp::loadSystemPassword() {
     systemPassword = "";
     passcodeEnabled = false;
     if (!isSdReady) return;
-    if (!SD.exists("/user/pwd.txt")) return;
 
-    File f = SD.open("/user/pwd.txt", FILE_READ);
-    if (!f) return;
-    systemPassword = f.readStringUntil('\n');
-    systemPassword.trim();
-    f.close();
-
+    String raw = Config::get("passcode", "");
+    if (raw.length() == 0) return;
+    systemPassword = Crypto::decrypt(raw);
     if (systemPassword.length() > 0) passcodeEnabled = true;
 }
 
 bool SettingsApp::saveSystemPassword(const String& newPassword) {
     if (!isSdReady) return false;
-    if (!ensureUserFolder()) return false;
 
-    SD.remove("/user/pwd.txt");
-    File f = SD.open("/user/pwd.txt", FILE_WRITE);
-    if (!f) return false;
-    if (newPassword.length() > 0) f.println(newPassword);
-    f.close();
+    if (newPassword.length() > 0)
+        Config::set("passcode", Crypto::encrypt(newPassword));
+    else
+        Config::set("passcode", "");
+    Config::save();
 
     systemPassword = newPassword;
     passcodeEnabled = (systemPassword.length() > 0);
@@ -488,35 +485,93 @@ void SettingsApp::drawSDCardSettings() {
 }
 
 void SettingsApp::loadWallpaperEnabled() {
-    wallpaperEnabled = true;
-    if (!isSdReady) return;
-    File f = SD.open("/user/wp_enabled.txt", FILE_READ);
-    if (!f) return;
-    String val = f.readStringUntil('\n');
-    f.close();
-    val.trim();
-    wallpaperEnabled = (val != "0");
+    if (!isSdReady) { wallpaperEnabled = true; return; }
+    wallpaperEnabled = (Config::getInt("wallpaper", 1) != 0);
     sysWallpaperEnabled = wallpaperEnabled;
 }
 
 void SettingsApp::saveWallpaperEnabled() {
     if (!isSdReady) return;
-    ensureUserFolder();
-    SD.remove("/user/wp_enabled.txt");
-    File f = SD.open("/user/wp_enabled.txt", FILE_WRITE);
-    if (!f) return;
-    f.println(wallpaperEnabled ? "1" : "0");
-    f.close();
+    Config::setInt("wallpaper", wallpaperEnabled ? 1 : 0);
+    Config::save();
 }
 
 void SettingsApp::saveTheme() {
     if (!isSdReady) return;
-    ensureUserFolder();
-    SD.remove("/user/theme.txt");
-    File f = SD.open("/user/theme.txt", FILE_WRITE);
-    if (!f) return;
-    f.println(sysTheme);
-    f.close();
+    Config::setInt("theme", sysTheme);
+    Config::save();
+}
+
+void SettingsApp::saveWiFiState() {
+    if (!isSdReady) return;
+    Config::setInt("wifi", sysWiFiEnabled ? 1 : 0);
+    Config::save();
+}
+
+void SettingsApp::saveWiFiNetwork(const String& ssid, const String& password) {
+    if (!isSdReady) return;
+
+    const int MAX_SAVED = 10;
+    String savedSSIDs[MAX_SAVED];
+    String savedPwds[MAX_SAVED];
+    int savedCount = 0;
+
+    // Load existing entries from config
+    int stored = Config::getInt("net_count", 0);
+    for (int i = 0; i < stored && savedCount < MAX_SAVED; i++) {
+        String enc = Config::get("net_" + String(i), "");
+        if (enc.length() == 0) continue;
+        String dec = Crypto::decrypt(enc);
+        int sep = dec.indexOf('|');
+        if (sep < 0) continue;
+        savedSSIDs[savedCount] = dec.substring(0, sep);
+        savedPwds[savedCount]  = dec.substring(sep + 1);
+        savedCount++;
+    }
+
+    // Update existing or append
+    bool found = false;
+    for (int i = 0; i < savedCount; i++) {
+        if (savedSSIDs[i] == ssid) { savedPwds[i] = password; found = true; break; }
+    }
+    if (!found && savedCount < MAX_SAVED) {
+        savedSSIDs[savedCount] = ssid;
+        savedPwds[savedCount]  = password;
+        savedCount++;
+    }
+
+    // Float last connected to front
+    for (int i = 0; i < savedCount; i++) {
+        if (savedSSIDs[i] == ssid && i != 0) {
+            String ts = savedSSIDs[i]; String tp = savedPwds[i];
+            for (int j = i; j > 0; j--) { savedSSIDs[j] = savedSSIDs[j-1]; savedPwds[j] = savedPwds[j-1]; }
+            savedSSIDs[0] = ts; savedPwds[0] = tp;
+            break;
+        }
+    }
+
+    Config::setInt("net_count", savedCount);
+    for (int i = 0; i < savedCount; i++)
+        Config::set("net_" + String(i), Crypto::encrypt(savedSSIDs[i] + "|" + savedPwds[i]));
+    Config::save();
+}
+
+void SettingsApp::redrawWiFiPasswordField() {
+    tft->fillRect(10, 85, 160, 40, Theme::surface());
+    tft->drawRect(10, 85, 160, 40, Theme::divider());
+    tft->setTextFont(2); tft->setTextSize(1); tft->setTextDatum(ML_DATUM);
+    if (wifiPassword.length() == 0) {
+        tft->setTextColor(Theme::hint()); tft->drawString("Password...", 20, 105);
+    } else {
+        tft->setTextColor(Theme::text());
+        if (showPassword) {
+            tft->drawString(wifiPassword + "_", 20, 105);
+        } else {
+            String masked = "";
+            for (int i = 0; i < (int)wifiPassword.length(); i++) masked += "*";
+            tft->drawString(masked + "_", 20, 105);
+        }
+    }
 }
 
 void SettingsApp::loadWallpapers() {
@@ -839,8 +894,9 @@ void SettingsApp::update() {
                         int localIdx = i - startIdx; int col = localIdx % 2; int row = localIdx / 2;
                         int x = 26 + col * 107; int y = 108 + row * 105;
                         if (touchX > x && touchX < x + 80 && touchY > y && touchY < y + 90) {
-                            File cfg = SD.open("/system/wp.txt", FILE_WRITE);
-                            if (cfg) { cfg.println("/system/assets/wallpapers/" + wallpapers[i]); cfg.close(); notifyService.push("Wallpaper updated!"); }
+                            Config::set("wallpaper_path", "/system/assets/wallpapers/" + wallpapers[i]);
+                            Config::save();
+                            notifyService.push("Wallpaper updated!");
                             Wallpaper::invalidate();
                             currentState = STATE_MENU; show();
                         }
@@ -937,7 +993,8 @@ void SettingsApp::update() {
             else if (currentState == STATE_WIFI) {
                 if (touchY > 10 && touchY < 45 && touchX < 80) { currentState = STATE_MENU; show(); }
                 else if (touchY > 70 && touchY < 115) {
-                    wifiEnabled = !wifiEnabled; sysWiFiEnabled = wifiEnabled; networkCount = 0; scrollOffset = 0; show();
+                    wifiEnabled = !wifiEnabled; sysWiFiEnabled = wifiEnabled; networkCount = 0; scrollOffset = 0;
+                    saveWiFiState(); show();
                     if (wifiEnabled) { WiFi.mode(WIFI_STA); WiFi.disconnect(); delay(100); scanWiFi(); }
                     else { WiFi.disconnect(); WiFi.mode(WIFI_OFF); }
                 }
@@ -1042,11 +1099,20 @@ void SettingsApp::update() {
                 currentState = STATE_WIFI_CONNECTING; showPassword = false; show();
                 WiFi.disconnect(); delay(10); WiFi.begin(selectedSSID.c_str(), wifiPassword.c_str()); connectionStartTime = millis(); return;
             } else if (wifiPassword.length() < 32) wifiPassword += c;
-            show();
+            redrawWiFiPasswordField();
         }
     }
     else if (currentState == STATE_WIFI_CONNECTING) {
-        if (WiFi.status() == WL_CONNECTED) { currentState = STATE_WIFI; show(); }
+        if (WiFi.status() == WL_CONNECTED) {
+            saveWiFiNetwork(selectedSSID, wifiPassword);
+            // Auto-sync NTP on first connection
+            extern bool sysNtpSynced;
+            extern time_t sysLastNtpSync;
+            configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.cloudflare.com");
+            struct tm t;
+            if (getLocalTime(&t, 3000)) { sysNtpSynced = true; time(&sysLastNtpSync); notifyService.push("Time synced via NTP"); }
+            currentState = STATE_WIFI; show();
+        }
         else if (millis() - connectionStartTime > 10000) { WiFi.disconnect(); currentState = STATE_WIFI; show(); }
     }
 }

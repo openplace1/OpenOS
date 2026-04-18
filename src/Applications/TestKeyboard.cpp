@@ -91,17 +91,40 @@ String TestKeyboard::nextNoteFilename() {
 
 // ── draw ──────────────────────────────────────────────────────────────────────
 
+void TestKeyboard::drawHeader() {
+    tft->fillRect(0, 0, 240, 52, Theme::header());
+    tft->drawFastHLine(0, 50, 240, Theme::divider());
+    tft->setTextFont(2); tft->setTextSize(1);
+    if (currentState == STATE_EDITOR || currentState == STATE_DELETE_CONFIRM) {
+        tft->setTextColor(tft->color565(0, 122, 255)); tft->setTextDatum(ML_DATUM);
+        tft->drawString("< Notes", 8, 25);
+        String dispName = currentFile;
+        if (dispName.endsWith(".txt")) dispName = dispName.substring(0, dispName.length() - 4);
+        dispName.replace("_", " ");
+        tft->setTextColor(Theme::text()); tft->setTextDatum(MC_DATUM);
+        tft->drawString(dispName, 130, 25);
+        tft->setTextColor(tft->color565(255, 59, 48)); tft->setTextDatum(MR_DATUM);
+        tft->drawString("Del", 232, 25);
+    } else {
+        tft->setTextColor(Theme::text()); tft->setTextDatum(MC_DATUM);
+        tft->drawString("Notes", 120, 25);
+        tft->setTextFont(4);
+        tft->setTextColor(tft->color565(0, 122, 255)); tft->setTextDatum(MR_DATUM);
+        tft->drawString("+", 228, 25);
+    }
+}
+
 void TestKeyboard::drawList() {
     tft->fillScreen(Theme::bg());
-    tft->fillRect(0, 0, 240, 40, Theme::header());
-    tft->drawFastHLine(0, 40, 240, Theme::divider());
+    tft->fillRect(0, 0, 240, 50, Theme::header());
+    tft->drawFastHLine(0, 50, 240, Theme::divider());
 
     tft->setTextFont(2); tft->setTextSize(1);
     tft->setTextColor(Theme::text()); tft->setTextDatum(MC_DATUM);
-    tft->drawString("Notes", 120, 20);
+    tft->drawString("Notes", 120, 25);
     tft->setTextFont(4);
     tft->setTextColor(tft->color565(0, 122, 255)); tft->setTextDatum(MR_DATUM);
-    tft->drawString("+", 228, 20);
+    tft->drawString("+", 228, 25);
 
     if (!isSdReady) {
         tft->setTextFont(2); tft->setTextColor(Theme::hint()); tft->setTextDatum(MC_DATUM);
@@ -119,7 +142,7 @@ void TestKeyboard::drawList() {
     const int rowH = 50;
     tft->setTextFont(2); tft->setTextSize(1);
     for (int i = 0; i < noteCount; i++) {
-        int y = 40 + i * rowH - listScrollOffset;
+        int y = 50 + i * rowH - listScrollOffset;
         if (y + rowH < 0 || y > 320) continue;
         tft->fillRect(0, y, 240, rowH, Theme::surface());
         tft->drawFastHLine(0, y + rowH, 240, Theme::divider2());
@@ -137,28 +160,28 @@ void TestKeyboard::drawList() {
 
 void TestKeyboard::drawEditor() {
     tft->fillScreen(Theme::bg());
-    tft->fillRect(0, 0, 240, 40, Theme::header());
-    tft->drawFastHLine(0, 40, 240, Theme::divider());
+    tft->fillRect(0, 0, 240, 50, Theme::header());
+    tft->drawFastHLine(0, 50, 240, Theme::divider());
 
     tft->setTextFont(2); tft->setTextSize(1);
     tft->setTextColor(tft->color565(0, 122, 255)); tft->setTextDatum(ML_DATUM);
-    tft->drawString("< Notes", 8, 20);
+    tft->drawString("< Notes", 8, 25);
 
     String dispName = currentFile;
     if (dispName.endsWith(".txt")) dispName = dispName.substring(0, dispName.length() - 4);
     dispName.replace("_", " ");
     tft->setTextColor(Theme::text()); tft->setTextDatum(MC_DATUM);
-    tft->drawString(dispName, 130, 20);
+    tft->drawString(dispName, 130, 25);
 
     tft->setTextColor(tft->color565(255, 59, 48)); tft->setTextDatum(MR_DATUM);
-    tft->drawString("Del", 232, 20);
+    tft->drawString("Del", 232, 25);
 
     drawTextArea();
     kbd->draw();
 }
 
 void TestKeyboard::drawTextArea() {
-    tft->fillRect(0, 40, 240, 120, Theme::surface());
+    tft->fillRect(0, 50, 240, 110, Theme::surface());
 
     // Wrap text into lines (~28 chars or newline)
     String lines[24];
@@ -184,7 +207,7 @@ void TestKeyboard::drawTextArea() {
     tft->setTextFont(2); tft->setTextSize(1);
     tft->setTextColor(Theme::text()); tft->setTextDatum(TL_DATUM);
     for (int i = startLine; i < lineCount; i++)
-        tft->drawString(lines[i], 5, 44 + (i - startLine) * 16);
+        tft->drawString(lines[i], 5, 54 + (i - startLine) * 16);
 }
 
 void TestKeyboard::drawDeleteConfirm() {
@@ -243,7 +266,7 @@ void TestKeyboard::update() {
                 int touchX = map(p.x, 300, 3800, 0, 240);
                 int touchY = map(p.y, 300, 3800, 0, 320);
 
-                if (touchY < 40 && touchX > 190) {
+                if (touchY < 50 && touchX > 190) {
                     // "+" — new note
                     if (isSdReady) {
                         currentFile = nextNoteFilename();
@@ -252,8 +275,8 @@ void TestKeyboard::update() {
                         currentState = STATE_EDITOR;
                         show();
                     }
-                } else if (touchY >= 40) {
-                    int idx = (touchY - 40 + listScrollOffset) / 50;
+                } else if (touchY >= 50) {
+                    int idx = (touchY - 50 + listScrollOffset) / 50;
                     if (idx >= 0 && idx < noteCount) {
                         currentFile = notes[idx];
                         loadNote(currentFile);
@@ -301,13 +324,13 @@ void TestKeyboard::update() {
 
             if (!wasTouched) {
                 wasTouched = true;
-                if (touchY < 40 && touchX < 95) {
+                if (touchY < 50 && touchX < 95) {
                     saveNote();
                     currentState = STATE_LIST;
                     listScrollOffset = 0;
                     show();
                     return;
-                } else if (touchY < 40 && touchX > 190) {
+                } else if (touchY < 50 && touchX > 190) {
                     currentState = STATE_DELETE_CONFIRM;
                     drawDeleteConfirm();
                     return;

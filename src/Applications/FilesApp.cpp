@@ -59,6 +59,10 @@ void FilesApp::loadDirectory(String path) {
     }
 }
 
+void FilesApp::drawHeader() {
+    drawTopBar(); // redraws only the 50-px top bar
+}
+
 void FilesApp::show() {
     tft->fillScreen(Theme::bg());
     
