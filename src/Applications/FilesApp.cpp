@@ -9,7 +9,8 @@
 
 FilesApp::FilesApp(TFT_eSPI* tftInstance, XPT2046_Touchscreen* tsInstance) {
     tft = tftInstance;
-    ts = tsInstance;
+    ts  = tsInstance;
+    _pendingOSA = "";
     
     name = "Files"; 
     iconColor = tft->color565(52, 199, 89); 
@@ -130,9 +131,17 @@ void FilesApp::drawFileList() {
                 tft->fillRect(0, rowY, 240, 45, Theme::surface());
                 tft->drawFastHLine(0, rowY, 240, Theme::divider());
 
+                bool isOsa = !isDirectory[i] && fileNames[i].endsWith(".osa");
+
                 if (isDirectory[i]) {
                     tft->fillRoundRect(15, rowY + 12, 22, 16, 2, tft->color565(0, 122, 255));
-                    tft->fillRoundRect(15, rowY + 9, 10, 5, 2, tft->color565(0, 122, 255));
+                    tft->fillRoundRect(15, rowY + 9,  10,  5, 2, tft->color565(0, 122, 255));
+                } else if (isOsa) {
+                    // OSA app icon — orange rounded rect with "OSA" label
+                    tft->fillRoundRect(13, rowY + 9, 26, 26, 5, tft->color565(255, 149, 0));
+                    tft->setTextColor(TFT_WHITE); tft->setTextDatum(MC_DATUM);
+                    tft->setTextFont(1); tft->setTextSize(1);
+                    tft->drawString("OSA", 26, rowY + 23);
                 } else {
                     tft->fillRect(18, rowY + 10, 16, 20, tft->color565(142, 142, 147));
                     tft->fillRect(20, rowY + 12, 12, 16, Theme::surface());
@@ -141,7 +150,8 @@ void FilesApp::drawFileList() {
                 String dName = fileNames[i];
                 if (dName.length() > 18) dName = dName.substring(0, 15) + "...";
 
-                tft->setTextColor(Theme::text());
+                tft->setTextFont(2);
+                tft->setTextColor(isOsa ? tft->color565(255, 149, 0) : Theme::text());
                 tft->setTextDatum(ML_DATUM);
                 tft->drawString(dName, 48, rowY + 22);
 
@@ -149,6 +159,10 @@ void FilesApp::drawFileList() {
                     tft->setTextColor(Theme::hint());
                     tft->setTextDatum(MR_DATUM);
                     tft->drawString(">", 225, rowY + 22);
+                } else if (isOsa) {
+                    tft->setTextColor(tft->color565(255, 149, 0));
+                    tft->setTextDatum(MR_DATUM);
+                    tft->drawString("RUN", 225, rowY + 22);
                 }
             }
         }
@@ -213,12 +227,15 @@ void FilesApp::update() {
                 
                 if (tappedRow >= 0 && tappedRow < fileCount) {
                     if (isDirectory[tappedRow]) {
-                        if (currentPath == "/") {
-                            currentPath = "/" + fileNames[tappedRow];
-                        } else {
-                            currentPath = currentPath + "/" + fileNames[tappedRow];
-                        }
+                        currentPath = (currentPath == "/")
+                            ? "/" + fileNames[tappedRow]
+                            : currentPath + "/" + fileNames[tappedRow];
                         show();
+                    } else if (fileNames[tappedRow].endsWith(".osa")) {
+                        // Signal main loop to launch OSAApp
+                        _pendingOSA = (currentPath == "/")
+                            ? "/" + fileNames[tappedRow]
+                            : currentPath + "/" + fileNames[tappedRow];
                     }
                 }
             }

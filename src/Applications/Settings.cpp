@@ -3,6 +3,7 @@
 #include "Theme.h"
 #include "Crypto.h"
 #include "../Config.h"
+#include "../Runtime/OSARuntime.h"
 #include <time.h>
 
 extern bool isSdReady;
@@ -57,6 +58,8 @@ SettingsApp::SettingsApp(TFT_eSPI* tftInstance, XPT2046_Touchscreen* tsInstance)
 
     scrollOffset = 0; lastTouchY = -1; touchStartY = -1;
     isScrollingList = false; isDragging = false; wasTouched = false;
+
+    osaAppCount = 0; selectedOsaApp = 0;
 
     systemPassword = ""; passcodeTemp = ""; passcodeInput = "";
     passcodeEnabled = false; passcodeShow = false;
@@ -138,6 +141,8 @@ void SettingsApp::show() {
     else if (currentState == STATE_BLUETOOTH) drawBluetoothSettings();
     else if (currentState == STATE_WALLPAPERS) drawWallpapers();
     else if (currentState == STATE_ABOUT) drawAboutScreen();
+    else if (currentState == STATE_APPLICATIONS) drawApplicationsScreen();
+    else if (currentState == STATE_APP_DETAIL)   drawAppDetailScreen();
     else if (currentState == STATE_PASSCODE_GATE) drawPasscodeInputScreen("Passcode", "Enter current password", "Open");
     else if (currentState == STATE_PASSCODE_MANAGE) drawPasscodeManageScreen();
     else if (currentState == STATE_PASSCODE_SET) drawPasscodeInputScreen("New Passcode", "Type a new password", "Save");
@@ -156,34 +161,35 @@ void SettingsApp::drawMenu() {
     tft->setTextDatum(MC_DATUM);
     tft->drawString("Settings", 120, 20);
 
-    const int rowH = 35;
+    const int rowH = 31;
     auto drawRow = [&](int y, uint16_t iconColor, String iconText, String title, String valText, bool last) {
         tft->fillRect(0, y, 240, rowH, Theme::surface());
         if (!last) tft->drawFastHLine(0, y + rowH, 240, Theme::divider2());
 
-        tft->fillRoundRect(15, y + 4, 26, 26, 6, iconColor);
+        tft->fillRoundRect(14, y + 3, 24, 24, 6, iconColor);
         tft->setTextColor(TFT_WHITE);
         tft->setTextDatum(MC_DATUM);
-        tft->drawString(iconText, 28, y + 17);
+        tft->drawString(iconText, 26, y + 15);
 
         tft->setTextColor(Theme::text());
         tft->setTextDatum(ML_DATUM);
-        tft->drawString(title, 50, y + 17);
+        tft->drawString(title, 46, y + 15);
 
         tft->setTextColor(Theme::hint());
         tft->setTextDatum(MR_DATUM);
-        tft->drawString(valText, 225, y + 17);
+        tft->drawString(valText, 225, y + 15);
     };
 
     int y = 40;
-    drawRow(y, tft->color565(0, 122, 255), "W", "Wi-Fi", wifiEnabled ? "ON >" : "OFF >", false); y += rowH;
-    drawRow(y, tft->color565(0, 122, 255), "B", "Bluetooth", bluetoothEnabled ? "ON >" : "OFF >", false); y += rowH;
-    drawRow(y, tft->color565(142, 142, 147), "D", "Display & Brightness", ">", false); y += rowH;
-    drawRow(y, tft->color565(255, 45, 85), "P", "Passcode", passcodeEnabled ? "ON >" : "OFF >", false); y += rowH;
-    drawRow(y, tft->color565(175, 82, 222), "W", "Wallpapers", ">", false); y += rowH;
-    drawRow(y, tft->color565(255, 149, 0), "T", "Time & Date", ">", false); y += rowH;
-    drawRow(y, tft->color565(52, 199, 89), "SD", "SD Card", ">", false); y += rowH;
-    drawRow(y, tft->color565(142, 142, 147), "i", "About", ">", true);
+    drawRow(y, tft->color565(0, 122, 255),   "W",  "Wi-Fi",              wifiEnabled       ? "ON >" : "OFF >", false); y += rowH;
+    drawRow(y, tft->color565(0, 122, 255),   "B",  "Bluetooth",          bluetoothEnabled  ? "ON >" : "OFF >", false); y += rowH;
+    drawRow(y, tft->color565(142, 142, 147), "D",  "Display & Brightness", ">",                                false); y += rowH;
+    drawRow(y, tft->color565(255, 45,  85),  "P",  "Passcode",           passcodeEnabled   ? "ON >" : "OFF >", false); y += rowH;
+    drawRow(y, tft->color565(175, 82, 222),  "W",  "Wallpapers",         ">",                                  false); y += rowH;
+    drawRow(y, tft->color565(255, 149,  0),  "T",  "Time & Date",        ">",                                  false); y += rowH;
+    drawRow(y, tft->color565(52, 199,  89),  "SD", "SD Card",            ">",                                  false); y += rowH;
+    drawRow(y, tft->color565(255, 149,  0),  "A",  "Applications",       ">",                                  false); y += rowH;
+    drawRow(y, tft->color565(142, 142, 147), "i",  "About",              ">",                                  true);
 }
 
 void SettingsApp::drawAboutScreen() {
@@ -844,7 +850,7 @@ void SettingsApp::update() {
             lastTouchY = touchY;
 
             if (currentState == STATE_MENU) {
-                const int rowH = 35;
+                const int rowH = 31;
                 if (touchY > 40 && touchY < 40 + rowH) { currentState = STATE_WIFI; show(); if (wifiEnabled) scanWiFi(); }
                 else if (touchY > 40 + rowH && touchY < 40 + rowH * 2) { currentState = STATE_BLUETOOTH; show(); }
                 else if (touchY > 40 + rowH * 2 && touchY < 40 + rowH * 3) { currentState = STATE_DISPLAY; show(); }
@@ -864,10 +870,38 @@ void SettingsApp::update() {
                     currentState = STATE_TIME; show();
                 }
                 else if (touchY > 40 + rowH * 6 && touchY < 40 + rowH * 7) { currentState = STATE_SDCARD; show(); }
-                else if (touchY > 40 + rowH * 7 && touchY < 320) { currentState = STATE_ABOUT; show(); }
+                else if (touchY > 40 + rowH * 7 && touchY < 40 + rowH * 8) { loadOsaApps(); currentState = STATE_APPLICATIONS; show(); }
+                else if (touchY > 40 + rowH * 8 && touchY < 320) { currentState = STATE_ABOUT; show(); }
             }
             else if (currentState == STATE_ABOUT) {
                 if (touchY < 50 && touchX < 80) { currentState = STATE_MENU; show(); }
+            }
+            else if (currentState == STATE_APPLICATIONS) {
+                if (touchY < 50 && touchX < 80) { currentState = STATE_MENU; show(); }
+                else {
+                    int row = (touchY - 50) / 48;
+                    if (row >= 0 && row < osaAppCount) {
+                        selectedOsaApp = row;
+                        currentState = STATE_APP_DETAIL;
+                        show();
+                    }
+                }
+            }
+            else if (currentState == STATE_APP_DETAIL) {
+                if (touchY < 50 && touchX < 80) { currentState = STATE_APPLICATIONS; show(); }
+                else {
+                    // Permission toggle rows start at y=148, each 44px tall
+                    // NOTIFY row: 148-192, SYSTEM row: 192-236
+                    const int permY0 = 148, permRowH = 44;
+                    const int toggleX = 172, toggleW = 52;
+                    int permRow = (touchY - permY0) / permRowH;
+                    if (touchY >= permY0 && permRow >= 0 && permRow < 2
+                        && touchX >= toggleX && touchX <= toggleX + toggleW) {
+                        uint8_t bits[] = { OSA_PERM_NOTIFY, OSA_PERM_SYSTEM };
+                        toggleOsaPerm(selectedOsaApp, bits[permRow]);
+                        drawAppDetailScreen();
+                    }
+                }
             }
             else if (currentState == STATE_WALLPAPERS) {
                 if (touchY < 50 && touchX < 80) { currentState = STATE_MENU; show(); }
@@ -1115,4 +1149,194 @@ void SettingsApp::update() {
         }
         else if (millis() - connectionStartTime > 10000) { WiFi.disconnect(); currentState = STATE_WIFI; show(); }
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Applications tab
+// ═══════════════════════════════════════════════════════════════════════════════
+
+String SettingsApp::extractOsaName(const String& path) {
+    if (!isSdReady) return path;
+    File f = SD.open(path);
+    if (!f) return path;
+    String line = f.readStringUntil('\n');
+    f.close();
+    line.trim();
+    if (line.startsWith("#app ")) {
+        String nm = line.substring(5); nm.trim();
+        if (nm.startsWith("\"")) nm = nm.substring(1);
+        if (nm.endsWith("\""))   nm = nm.substring(0, nm.length() - 1);
+        return nm;
+    }
+    int slash = path.lastIndexOf('/');
+    return (slash >= 0) ? path.substring(slash + 1) : path;
+}
+
+String SettingsApp::makePermKey(const String& appName) {
+    String k = "perm_";
+    for (int i = 0; i < (int)appName.length() && k.length() < 22; i++) {
+        char c = appName[i];
+        k += isalnum(c) ? (char)tolower(c) : '_';
+    }
+    return k;
+}
+
+void SettingsApp::scanOsaDir(const String& dirPath, int depth) {
+    if (osaAppCount >= MAX_OSA_APPS || depth > 1) return;
+    File dir = SD.open(dirPath);
+    if (!dir || !dir.isDirectory()) return;
+
+    File f = dir.openNextFile();
+    while (f && osaAppCount < MAX_OSA_APPS) {
+        String fullPath = f.name();
+        if (!fullPath.startsWith("/")) fullPath = "/" + fullPath;
+
+        // Skip the sandbox folder — those are data, not scripts
+        if (fullPath.startsWith("/apps/")) { f = dir.openNextFile(); continue; }
+
+        if (f.isDirectory()) {
+            if (depth == 0) scanOsaDir(fullPath, 1);
+        } else {
+            String lower = fullPath; lower.toLowerCase();
+            if (lower.endsWith(".osa")) {
+                osaAppPaths[osaAppCount] = fullPath;
+                osaAppNames[osaAppCount] = extractOsaName(fullPath);
+                osaAppKeys [osaAppCount] = makePermKey(osaAppNames[osaAppCount]);
+                osaAppCount++;
+            }
+        }
+        f = dir.openNextFile();
+    }
+    dir.close();
+}
+
+void SettingsApp::loadOsaApps() {
+    osaAppCount = 0;
+    if (!isSdReady) return;
+    scanOsaDir("/", 0);
+}
+
+void SettingsApp::toggleOsaPerm(int idx, uint8_t bit) {
+    String key  = osaAppKeys[idx];
+    int stored  = Config::getInt(key, 0);
+    uint8_t granted = stored & 0x0F;
+    if (granted & bit) {
+        stored &= ~(int)bit;         // remove grant
+        stored |= ((int)bit << 4);   // set deny
+    } else {
+        stored |= (int)bit;          // set grant
+        stored &= ~((int)bit << 4);  // remove deny
+    }
+    Config::setInt(key, stored);
+    Config::save();
+}
+
+void SettingsApp::drawPermRow(int y, const String& label, const String& desc, bool enabled) {
+    tft->fillRect(0, y, 240, 44, Theme::surface());
+    tft->drawFastHLine(0, y + 44, 240, Theme::divider2());
+
+    tft->setTextFont(2); tft->setTextSize(1);
+    tft->setTextColor(Theme::text()); tft->setTextDatum(ML_DATUM);
+    tft->drawString(label, 15, y + 16);
+
+    tft->setTextFont(1);
+    tft->setTextColor(Theme::hint());
+    tft->drawString(desc, 15, y + 32);
+
+    drawToggle(174, y + 7, enabled);
+}
+
+void SettingsApp::drawApplicationsScreen() {
+    tft->fillScreen(Theme::bg());
+    tft->fillRect(0, 0, 240, 50, Theme::header());
+    tft->drawFastHLine(0, 50, 240, Theme::divider());
+
+    tft->setTextFont(2); tft->setTextSize(1);
+    tft->setTextColor(tft->color565(0, 122, 255)); tft->setTextDatum(ML_DATUM);
+    tft->drawString("< Back", 10, 25);
+    tft->setTextColor(Theme::text()); tft->setTextDatum(MC_DATUM);
+    tft->drawString("Applications", 120, 25);
+
+    if (osaAppCount == 0) {
+        tft->setTextColor(Theme::hint()); tft->setTextDatum(MC_DATUM);
+        tft->drawString("No .osa apps found", 120, 180);
+        tft->setTextFont(1);
+        tft->drawString("Place .osa files on the SD card", 120, 200);
+        return;
+    }
+
+    uint16_t osaOrange = tft->color565(255, 149, 0);
+    for (int i = 0; i < osaAppCount; i++) {
+        int rowY = 50 + i * 48;
+        tft->fillRect(0, rowY, 240, 48, Theme::surface());
+        tft->drawFastHLine(0, rowY + 48, 240, Theme::divider2());
+
+        tft->fillRoundRect(10, rowY + 9, 30, 30, 6, osaOrange);
+        tft->setTextFont(1); tft->setTextColor(TFT_WHITE); tft->setTextDatum(MC_DATUM);
+        tft->drawString("OSA", 25, rowY + 24);
+
+        tft->setTextFont(2); tft->setTextColor(Theme::text()); tft->setTextDatum(ML_DATUM);
+        String displayName = osaAppNames[i];
+        if (displayName.length() > 18) displayName = displayName.substring(0, 16) + "..";
+        tft->drawString(displayName, 48, rowY + 18);
+
+        tft->setTextFont(1); tft->setTextColor(Theme::hint());
+        String shortPath = osaAppPaths[i];
+        if (shortPath.length() > 24) shortPath = ".." + shortPath.substring(shortPath.length() - 22);
+        tft->drawString(shortPath, 48, rowY + 34);
+
+        tft->setTextColor(Theme::hint()); tft->setTextDatum(MR_DATUM); tft->setTextFont(2);
+        tft->drawString(">", 230, rowY + 24);
+    }
+}
+
+void SettingsApp::drawAppDetailScreen() {
+    tft->fillScreen(Theme::bg());
+    tft->fillRect(0, 0, 240, 50, Theme::header());
+    tft->drawFastHLine(0, 50, 240, Theme::divider());
+
+    tft->setTextFont(2); tft->setTextSize(1);
+    tft->setTextColor(tft->color565(0, 122, 255)); tft->setTextDatum(ML_DATUM);
+    tft->drawString("< Back", 10, 25);
+    tft->setTextColor(Theme::text()); tft->setTextDatum(MC_DATUM);
+    String hdr = osaAppNames[selectedOsaApp];
+    if (hdr.length() > 16) hdr = hdr.substring(0, 14) + "..";
+    tft->drawString(hdr, 120, 25);
+
+    // App info card
+    tft->fillRoundRect(10, 58, 220, 74, 10, Theme::surface());
+    tft->drawRoundRect(10, 58, 220, 74, 10, Theme::divider());
+
+    tft->fillRoundRect(20, 68, 36, 36, 8, tft->color565(255, 149, 0));
+    tft->setTextFont(1); tft->setTextColor(TFT_WHITE); tft->setTextDatum(MC_DATUM);
+    tft->drawString("OSA", 38, 86);
+
+    tft->setTextFont(2); tft->setTextColor(Theme::text()); tft->setTextDatum(ML_DATUM);
+    tft->drawString(osaAppNames[selectedOsaApp], 64, 78);
+
+    tft->setTextFont(1); tft->setTextColor(Theme::hint());
+    String sp = osaAppPaths[selectedOsaApp];
+    if (sp.length() > 26) sp = ".." + sp.substring(sp.length() - 24);
+    tft->drawString(sp, 64, 96);
+
+    String sbx = "/apps/";
+    for (int i = 0; i < (int)osaAppNames[selectedOsaApp].length() && sbx.length() < 20; i++) {
+        char c = osaAppNames[selectedOsaApp][i];
+        sbx += isalnum(c) ? (char)tolower(c) : '_';
+    }
+    tft->setTextColor(tft->color565(0, 122, 255));
+    tft->drawString(sbx, 64, 112);
+
+    // Permissions section
+    tft->setTextColor(Theme::subtext()); tft->setTextDatum(BL_DATUM);
+    tft->drawString("PERMISSIONS", 15, 146);
+
+    int stored  = Config::getInt(osaAppKeys[selectedOsaApp], 0);
+    uint8_t granted = stored & 0x0F;
+
+    drawPermRow(148, "Notifications", "notify() — system banners",     (granted & OSA_PERM_NOTIFY) != 0);
+    drawPermRow(192, "System Settings", "setbright(), setwallpaper()", (granted & OSA_PERM_SYSTEM) != 0);
+
+    tft->setTextFont(1); tft->setTextColor(Theme::hint()); tft->setTextDatum(MC_DATUM);
+    tft->drawString("Changes are saved automatically", 120, 248);
 }

@@ -37,6 +37,14 @@ public:
     void show() override;
     void update() override;
     void drawHeader() override;
+
+    // Returns non-empty path when user tapped a .osa file; clears after read
+    String getPendingOSA() {
+        String p = _pendingOSA; _pendingOSA = ""; return p;
+    }
+
+private:
+    String _pendingOSA;
 };
 
 #endif

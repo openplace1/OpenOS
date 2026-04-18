@@ -32,11 +32,14 @@ private:
         STATE_PASSCODE_DISABLE_VERIFY,
         STATE_PASSCODE_RESET_VERIFY,
         STATE_SDCARD_CONFIRM,
-        STATE_WALLPAPER_CONFIRM
+        STATE_WALLPAPER_CONFIRM,
+        STATE_APPLICATIONS,
+        STATE_APP_DETAIL
     };
 
-    static const int MAX_NETWORKS = 20;
+    static const int MAX_NETWORKS  = 20;
     static const int MAX_WALLPAPERS = 12;
+    static const int MAX_OSA_APPS  = 12;
 
     TFT_eSPI* tft;
     XPT2046_Touchscreen* ts;
@@ -78,6 +81,13 @@ private:
     bool passcodeEnabled;
     bool passcodeShow;
 
+    // Applications tab
+    String osaAppPaths[MAX_OSA_APPS];
+    String osaAppNames[MAX_OSA_APPS];
+    String osaAppKeys[MAX_OSA_APPS];
+    int    osaAppCount;
+    int    selectedOsaApp;
+
     void setBrightness(int val);
     void drawMenu();
     void drawAboutScreen();
@@ -108,6 +118,14 @@ private:
 
     void drawSDCardConfirm();
     void drawWallpaperConfirm();
+    void drawApplicationsScreen();
+    void drawAppDetailScreen();
+    void drawPermRow(int y, const String& label, const String& desc, bool enabled);
+    void loadOsaApps();
+    void scanOsaDir(const String& path, int depth);
+    String extractOsaName(const String& path);
+    String makePermKey(const String& appName);
+    void   toggleOsaPerm(int appIdx, uint8_t bit);
     void loadSystemPassword();
     bool saveSystemPassword(const String& newPassword);
     bool ensureUserFolder();

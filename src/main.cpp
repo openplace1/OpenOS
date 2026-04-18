@@ -19,6 +19,7 @@
 #include "Applications/Crypto.h"
 #include "Applications/Wallpaper.h"
 #include "Applications/Theme.h"
+#include "Applications/OSAApp.h"
 #include "Services/NotificationService.h"
 
 
@@ -52,6 +53,7 @@ ControlCenter controlCenter(&tft, &ts);
 ClockApp clockApp(&tft, &ts);
 
 NotificationService notifyService(&tft);
+OSAApp osaApp(&tft, &ts);
 
 
 bool sysWiFiEnabled = false;
@@ -317,6 +319,19 @@ void loop() {
 
         if (!blockApp && activeApp != nullptr) {
             activeApp->update();
+
+            // Check if FilesApp wants to launch a .osa script
+            if (activeApp == &filesApp) {
+                String osaPath = filesApp.getPendingOSA();
+                if (osaPath.length() > 0) {
+                    if (osaApp.loadScript(osaPath)) {
+                        activeApp = &osaApp;
+                        activeApp->show();
+                    } else {
+                        notifyService.push("Failed to load script");
+                    }
+                }
+            }
         }
     }
 }
