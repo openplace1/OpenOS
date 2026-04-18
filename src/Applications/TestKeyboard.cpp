@@ -1,4 +1,5 @@
 #include "TestKeyboard.h"
+#include "Theme.h"
 
 extern bool isSdReady;
 
@@ -91,25 +92,25 @@ String TestKeyboard::nextNoteFilename() {
 // ── draw ──────────────────────────────────────────────────────────────────────
 
 void TestKeyboard::drawList() {
-    tft->fillScreen(TFT_WHITE);
-    tft->fillRect(0, 0, 240, 40, tft->color565(248, 248, 248));
-    tft->drawFastHLine(0, 40, 240, tft->color565(200, 200, 200));
+    tft->fillScreen(Theme::bg());
+    tft->fillRect(0, 0, 240, 40, Theme::header());
+    tft->drawFastHLine(0, 40, 240, Theme::divider());
 
     tft->setTextFont(2); tft->setTextSize(1);
-    tft->setTextColor(TFT_BLACK); tft->setTextDatum(MC_DATUM);
+    tft->setTextColor(Theme::text()); tft->setTextDatum(MC_DATUM);
     tft->drawString("Notes", 120, 20);
     tft->setTextFont(4);
     tft->setTextColor(tft->color565(0, 122, 255)); tft->setTextDatum(MR_DATUM);
     tft->drawString("+", 228, 20);
 
     if (!isSdReady) {
-        tft->setTextFont(2); tft->setTextColor(tft->color565(150, 150, 150)); tft->setTextDatum(MC_DATUM);
+        tft->setTextFont(2); tft->setTextColor(Theme::hint()); tft->setTextDatum(MC_DATUM);
         tft->drawString("No SD card", 120, 180);
         return;
     }
 
     if (noteCount == 0) {
-        tft->setTextFont(2); tft->setTextColor(tft->color565(150, 150, 150)); tft->setTextDatum(MC_DATUM);
+        tft->setTextFont(2); tft->setTextColor(Theme::hint()); tft->setTextDatum(MC_DATUM);
         tft->drawString("No notes yet", 120, 175);
         tft->drawString("Tap + to create one", 120, 198);
         return;
@@ -120,24 +121,24 @@ void TestKeyboard::drawList() {
     for (int i = 0; i < noteCount; i++) {
         int y = 40 + i * rowH - listScrollOffset;
         if (y + rowH < 0 || y > 320) continue;
-        tft->fillRect(0, y, 240, rowH, TFT_WHITE);
-        tft->drawFastHLine(0, y + rowH, 240, tft->color565(220, 220, 220));
+        tft->fillRect(0, y, 240, rowH, Theme::surface());
+        tft->drawFastHLine(0, y + rowH, 240, Theme::divider2());
 
         String dispName = notes[i];
         if (dispName.endsWith(".txt")) dispName = dispName.substring(0, dispName.length() - 4);
         dispName.replace("_", " ");
 
-        tft->setTextColor(TFT_BLACK); tft->setTextDatum(ML_DATUM);
+        tft->setTextColor(Theme::text()); tft->setTextDatum(ML_DATUM);
         tft->drawString(dispName, 15, y + 25);
-        tft->setTextColor(tft->color565(200, 200, 200)); tft->setTextDatum(MR_DATUM);
+        tft->setTextColor(Theme::hint()); tft->setTextDatum(MR_DATUM);
         tft->drawString(">", 225, y + 25);
     }
 }
 
 void TestKeyboard::drawEditor() {
-    tft->fillScreen(TFT_WHITE);
-    tft->fillRect(0, 0, 240, 40, tft->color565(248, 248, 248));
-    tft->drawFastHLine(0, 40, 240, tft->color565(200, 200, 200));
+    tft->fillScreen(Theme::bg());
+    tft->fillRect(0, 0, 240, 40, Theme::header());
+    tft->drawFastHLine(0, 40, 240, Theme::divider());
 
     tft->setTextFont(2); tft->setTextSize(1);
     tft->setTextColor(tft->color565(0, 122, 255)); tft->setTextDatum(ML_DATUM);
@@ -146,7 +147,7 @@ void TestKeyboard::drawEditor() {
     String dispName = currentFile;
     if (dispName.endsWith(".txt")) dispName = dispName.substring(0, dispName.length() - 4);
     dispName.replace("_", " ");
-    tft->setTextColor(TFT_BLACK); tft->setTextDatum(MC_DATUM);
+    tft->setTextColor(Theme::text()); tft->setTextDatum(MC_DATUM);
     tft->drawString(dispName, 130, 20);
 
     tft->setTextColor(tft->color565(255, 59, 48)); tft->setTextDatum(MR_DATUM);
@@ -157,7 +158,7 @@ void TestKeyboard::drawEditor() {
 }
 
 void TestKeyboard::drawTextArea() {
-    tft->fillRect(0, 40, 240, 120, TFT_WHITE);
+    tft->fillRect(0, 40, 240, 120, Theme::surface());
 
     // Wrap text into lines (~28 chars or newline)
     String lines[24];
@@ -181,7 +182,7 @@ void TestKeyboard::drawTextArea() {
     int startLine = (lineCount > 7) ? lineCount - 7 : 0;
 
     tft->setTextFont(2); tft->setTextSize(1);
-    tft->setTextColor(TFT_BLACK); tft->setTextDatum(TL_DATUM);
+    tft->setTextColor(Theme::text()); tft->setTextDatum(TL_DATUM);
     for (int i = startLine; i < lineCount; i++)
         tft->drawString(lines[i], 5, 44 + (i - startLine) * 16);
 }
@@ -191,22 +192,22 @@ void TestKeyboard::drawDeleteConfirm() {
         tft->drawFastHLine(0, row, 240, tft->color565(0, 0, 0));
 
     int cx = 20, cy = 105, cw = 200, ch = 110;
-    tft->fillRoundRect(cx, cy, cw, ch, 14, TFT_WHITE);
-    tft->drawRoundRect(cx, cy, cw, ch, 14, tft->color565(200, 200, 200));
+    tft->fillRoundRect(cx, cy, cw, ch, 14, Theme::surface());
+    tft->drawRoundRect(cx, cy, cw, ch, 14, Theme::divider());
 
     tft->setTextFont(2); tft->setTextSize(1); tft->setTextDatum(MC_DATUM);
-    tft->setTextColor(TFT_BLACK);
+    tft->setTextColor(Theme::text());
     tft->drawString("Delete note?", 120, cy + 22);
 
     String dispName = currentFile;
     if (dispName.endsWith(".txt")) dispName = dispName.substring(0, dispName.length() - 4);
     dispName.replace("_", " ");
-    tft->setTextColor(tft->color565(120, 120, 120));
+    tft->setTextColor(Theme::subtext());
     tft->drawString(dispName, 120, cy + 46);
     tft->drawString("This cannot be undone.", 120, cy + 64);
 
-    tft->drawFastHLine(cx, cy + 80, cw, tft->color565(220, 220, 220));
-    tft->drawFastVLine(cx + cw / 2, cy + 80, ch - 80, tft->color565(220, 220, 220));
+    tft->drawFastHLine(cx, cy + 80, cw, Theme::divider2());
+    tft->drawFastVLine(cx + cw / 2, cy + 80, ch - 80, Theme::divider2());
 
     tft->setTextColor(tft->color565(0, 122, 255));
     tft->drawString("Cancel", cx + cw / 4, cy + 95);

@@ -1,4 +1,5 @@
 #include "FilesApp.h"
+#include "Theme.h"
 
 
 #define SD_CS 5 
@@ -59,7 +60,7 @@ void FilesApp::loadDirectory(String path) {
 }
 
 void FilesApp::show() {
-    tft->fillScreen(tft->color565(240, 240, 245));
+    tft->fillScreen(Theme::bg());
     
     
     if (!sdInitialized) {
@@ -81,19 +82,19 @@ void FilesApp::show() {
 }
 
 void FilesApp::drawTopBar() {
-    tft->fillRect(0, 0, 240, 50, tft->color565(248, 248, 248));
-    tft->drawFastHLine(0, 50, 240, tft->color565(200, 200, 200));
+    tft->fillRect(0, 0, 240, 50, Theme::header());
+    tft->drawFastHLine(0, 50, 240, Theme::divider());
 
     tft->setTextFont(2);
     tft->setTextSize(1);
-    
+
     if (currentPath != "/") {
-        tft->setTextColor(tft->color565(0, 122, 255)); 
+        tft->setTextColor(tft->color565(0, 122, 255));
         tft->setTextDatum(ML_DATUM);
         tft->drawString("< Back", 10, 25);
     }
 
-    tft->setTextColor(TFT_BLACK);
+    tft->setTextColor(Theme::text());
     tft->setTextDatum(MC_DATUM);
     
     String title = (currentPath == "/") ? "Files" : currentPath;
@@ -103,47 +104,45 @@ void FilesApp::drawTopBar() {
 
 void FilesApp::drawFileList() {
     tft->setViewport(0, 51, 240, 269); 
-    tft->fillScreen(tft->color565(240, 240, 245));
+    tft->fillScreen(Theme::bg());
 
     if (!sdInitialized) {
         
-        tft->setTextColor(tft->color565(255, 59, 48)); 
+        tft->setTextColor(tft->color565(255, 59, 48));
         tft->setTextDatum(MC_DATUM);
-        tft->drawString("No card or bad format", 120, 100); 
-        tft->setTextColor(tft->color565(150, 150, 150));
-        tft->drawString("FAT32 required", 120, 130); 
+        tft->drawString("No card or bad format", 120, 100);
+        tft->setTextColor(Theme::hint());
+        tft->drawString("FAT32 required", 120, 130);
     }
     else if (fileCount == 0) {
-        tft->setTextColor(tft->color565(150, 150, 150));
+        tft->setTextColor(Theme::hint());
         tft->setTextDatum(MC_DATUM);
-        tft->drawString("Directory is empty", 120, 100); 
+        tft->drawString("Directory is empty", 120, 100);
     } else {
         for (int i = 0; i < fileCount; i++) {
             int rowY = (i * 45) - scrollOffset;
 
             if (rowY > -45 && rowY < 269) {
-                tft->fillRect(0, rowY, 240, 45, TFT_WHITE);
-                tft->drawFastHLine(0, rowY, 240, tft->color565(200, 200, 200));
-                
+                tft->fillRect(0, rowY, 240, 45, Theme::surface());
+                tft->drawFastHLine(0, rowY, 240, Theme::divider());
+
                 if (isDirectory[i]) {
-                    
-                    tft->fillRoundRect(15, rowY + 12, 22, 16, 2, tft->color565(0, 122, 255)); 
+                    tft->fillRoundRect(15, rowY + 12, 22, 16, 2, tft->color565(0, 122, 255));
                     tft->fillRoundRect(15, rowY + 9, 10, 5, 2, tft->color565(0, 122, 255));
                 } else {
-                    
                     tft->fillRect(18, rowY + 10, 16, 20, tft->color565(142, 142, 147));
-                    tft->fillRect(20, rowY + 12, 12, 16, TFT_WHITE);
+                    tft->fillRect(20, rowY + 12, 12, 16, Theme::surface());
                 }
 
                 String dName = fileNames[i];
                 if (dName.length() > 18) dName = dName.substring(0, 15) + "...";
 
-                tft->setTextColor(TFT_BLACK);
+                tft->setTextColor(Theme::text());
                 tft->setTextDatum(ML_DATUM);
                 tft->drawString(dName, 48, rowY + 22);
 
                 if (isDirectory[i]) {
-                    tft->setTextColor(tft->color565(180, 180, 180));
+                    tft->setTextColor(Theme::hint());
                     tft->setTextDatum(MR_DATUM);
                     tft->drawString(">", 225, rowY + 22);
                 }
@@ -151,7 +150,7 @@ void FilesApp::drawFileList() {
         }
         int bottomY = (fileCount * 45) - scrollOffset;
         if (bottomY > 0 && bottomY < 269) {
-            tft->drawFastHLine(0, bottomY, 240, tft->color565(200, 200, 200));
+            tft->drawFastHLine(0, bottomY, 240, Theme::divider());
         }
     }
     tft->resetViewport();

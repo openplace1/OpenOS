@@ -1,4 +1,5 @@
 #include "OSKeyboard.h"
+#include "Theme.h"
 
 
 const char keysL[3][10] = {
@@ -30,14 +31,12 @@ char OSKeyboard::getCharFromLayout(int row, int col) {
 }
 
 void OSKeyboard::drawKey(int x, int y, int w, int h, String label, bool isSpecial) {
-    uint16_t bgColor = isSpecial ? tft->color565(170, 175, 185) : TFT_WHITE;
-    uint16_t textColor = TFT_BLACK;
+    uint16_t bgColor = isSpecial ? Theme::kbdSpec() : Theme::kbdKey();
 
-    
-    tft->fillRoundRect(x, y+2, w, h, 4, tft->color565(136, 138, 141));
+    tft->fillRoundRect(x, y+2, w, h, 4, Theme::kbdShadow());
     tft->fillRoundRect(x, y, w, h, 4, bgColor);
 
-    tft->setTextColor(textColor);
+    tft->setTextColor(Theme::kbdText());
     tft->setTextDatum(MC_DATUM); 
     
     
@@ -49,7 +48,7 @@ void OSKeyboard::drawKey(int x, int y, int w, int h, String label, bool isSpecia
 
 void OSKeyboard::draw() {
     
-    tft->fillRect(0, 160, 240, 160, tft->color565(209, 213, 219));
+    tft->fillRect(0, 160, 240, 160, Theme::kbdBg());
 
     
     for(int i=0; i<10; i++) {

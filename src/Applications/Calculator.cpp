@@ -1,4 +1,5 @@
 #include "Calculator.h"
+#include "Theme.h"
 #include <math.h>
 
 Calculator::Calculator(TFT_eSPI* tftInstance, XPT2046_Touchscreen* tsInstance) {
@@ -46,7 +47,8 @@ String Calculator::formatNumber(double value) {
 }
 
 void Calculator::drawDisplay() {
-    tft->fillRect(0, 0, 240, 72, TFT_BLACK);
+    uint16_t dispBg = Theme::dark() ? TFT_BLACK : Theme::c(30, 30, 35);
+    tft->fillRect(0, 0, 240, 72, dispBg);
 
     tft->setTextDatum(TR_DATUM);
     tft->setTextFont(2);
@@ -78,8 +80,9 @@ void Calculator::drawButton(const CalcButton& btn) {
 }
 
 void Calculator::drawButtons() {
-    uint16_t dark = tft->color565(58, 58, 60);
-    uint16_t light = tft->color565(165, 165, 170);
+    bool isDark = Theme::dark();
+    uint16_t dark  = isDark ? tft->color565(58, 58, 60)   : tft->color565(200, 200, 205);
+    uint16_t light = isDark ? tft->color565(165, 165, 170) : tft->color565(140, 140, 145);
     uint16_t orange = tft->color565(255, 149, 0);
 
     const CalcButton buttons[] = {
@@ -225,7 +228,7 @@ void Calculator::handleButtonPress(const String& label) {
 }
 
 void Calculator::show() {
-    tft->fillScreen(tft->color565(28, 28, 30));
+    tft->fillScreen(Theme::dark() ? Theme::c(28, 28, 30) : Theme::c(240, 240, 245));
     drawDisplay();
     drawButtons();
 }

@@ -198,21 +198,20 @@ App* Home::update() {
                     int iconX = 12 + (col * 55); 
                     int iconY = 30 + (row * 80);
 
-                    int steps = 7; 
+                    int steps = 7;
                     for (int frame = 1; frame <= steps; frame++) {
                         int currX = iconX - (iconX * frame / steps);
                         int currY = iconY - (iconY * frame / steps);
                         int currW = 46 + ((240 - 46) * frame / steps);
                         int currH = 46 + ((320 - 46) * frame / steps);
-                        int currRad = 12 - (12 * frame / steps); 
-
+                        int currRad = 12 - (12 * frame / steps);
                         tft->fillRoundRect(currX, currY, currW, currH, currRad, apps[draggedIndex]->iconColor);
                     }
-                    
-                    delay(80); 
+
+                    delay(80);
                     App* launchedApp = apps[draggedIndex];
-                    draggedIndex = -1; 
-                    return launchedApp; 
+                    draggedIndex = -1;
+                    return launchedApp;
                 }
             }
             draggedIndex = -1;
