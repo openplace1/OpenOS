@@ -3,14 +3,24 @@
 #include <TFT_eSPI.h>
 #include <XPT2046_Touchscreen.h>
 
-#define OSA_MAX_LINES  256
-#define OSA_MAX_VARS   64
-#define OSA_MAX_FUNCS  16
-#define OSA_STACK_MAX  8
+#define OSA_MAX_LINES  512
+#define OSA_MAX_VARS   96
+#define OSA_MAX_FUNCS  24
+#define OSA_STACK_MAX  10
 
 // Permission bits (granted = bits 0-3, denied = bits 4-7 in Config)
 #define OSA_PERM_NOTIFY   0x01   // notify()
+#define OSA_PERM_NETWORK  0x02   // http.get / http.post — outbound network access
 #define OSA_PERM_SYSTEM   0x04   // setbright, setwallpaper
+
+// Permission descriptor — used by Settings to render only declared toggles.
+struct OSAPermDesc {
+    uint8_t     bit;
+    const char* label;       // shown in Settings row title
+    const char* description; // shown in Settings row subtitle
+};
+extern const OSAPermDesc OSA_PERM_TABLE[];
+extern const int         OSA_PERM_TABLE_COUNT;
 
 // ─── Value type ──────────────────────────────────────────────────────────────
 
@@ -41,7 +51,28 @@ public:
     bool   hasLoop()  const { return loopStart >= 0; }
     bool   hasError() const { return errLine >= 0; }
     String getError() const { return errMsg; }
-    String appName;  // from #app "Name" header
+    String  appName;        // from #app "Name" header
+    uint8_t requiredPerms;  // bitmask from #perm header (0 = none declared)
+    bool    isException;    // #exception true → script gets full privileged SDK
+    // Set by app.launch(path) — host (main.cpp) reads this after the script
+    // unwinds and, when non-empty, loads it instead of returning to home.
+    String  pendingLaunch;
+    // Set by checkOverlayGesture (swipe-down from top). Host opens Control
+    // Center instead of going home when this is true on exit.
+    bool    wantsOverlay = false;
+
+    // Shared helpers used by Settings to keep perm-key derivation in sync.
+    static String  permKeyForName(const String& appName);
+    static String  readAppNameFromFile(const String& path);
+    static uint8_t readRequiredPermsFromFile(const String& path);
+    // Home-screen shortcut metadata. Scripts opt in with `#isApp true`
+    // and can set a tile color with `#appColor "#FF9500"`.
+    static bool     readIsAppFromFile(const String& path);
+    static uint16_t readIconColorFromFile(const String& path, uint16_t fallback);
+    // `#exception true` grants the script the privileged SDK (sys.*, cfg.*,
+    // fs.* outside sandbox, ntp.sync, sys.reboot, …). Used by built-in
+    // privileged apps that need to mutate global system state.
+    static bool     readIsExceptionFromFile(const String& path);
 
 private:
     TFT_eSPI*           tft;
@@ -80,12 +111,27 @@ private:
     uint8_t  textFont  = 2;
 
     // Execution flags
-    bool   exitFlag    = false;
-    bool   returnFlag  = false;
+    bool   exitFlag     = false;
+    bool   returnFlag   = false;
+    bool   breakFlag    = false;
+    bool   continueFlag = false;
     OSAVal returnValue;
-    int    errLine     = -1;
+    int    errLine      = -1;
     String errMsg;
-    int    execDepth   = 0;
+    int    execDepth    = 0;
+    // Tracks an in-progress swipe from the bottom edge — when the user lifts
+    // their finger after dragging up far enough, exitFlag is set and the
+    // script unwinds to OSAApp which signals main.cpp to go home.
+    int    swipeHomeStartY = -1;
+
+    // Tracks an in-progress swipe from the top edge for checkOverlayGesture.
+    int    swipeOverlayStartY = -1;
+
+    // Returns true if the swipe-up-to-home gesture just completed. Called from
+    // every blocking widget loop so the user can leave the app from anywhere.
+    bool checkExitGesture();
+    // Returns true if the swipe-down-from-top gesture just completed.
+    bool checkOverlayGesture();
 
     // ── Execution ────────────────────────────────────────────────────────────
     void execRange(int from, int to);
@@ -104,6 +150,10 @@ private:
     // ── Variables ────────────────────────────────────────────────────────────
     OSAVal getVar(const String& name) const;
     void   setVar(const String& name, const OSAVal& val);
+    // `var X = Y` — declare in the CURRENT scope. Same-named vars in parent
+    // scopes are shadowed, not overwritten. Plain assignment (X = Y) keeps the
+    // global-search behaviour of setVar.
+    void   declareVar(const String& name, const OSAVal& val);
 
     // ── Expression evaluator (recursive descent) ─────────────────────────────
     OSAVal eval(const String& expr);

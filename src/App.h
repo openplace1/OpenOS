@@ -12,6 +12,9 @@ public:
     String name = "";
     uint16_t iconColor = TFT_WHITE;
     bool isApp = false;
+    // Non-empty → this tile is a launcher for a .osa script. main.cpp redirects
+    // the tap to OSAApp::loadScript instead of calling show() on the tile itself.
+    String scriptPath = "";
 
     virtual ~App() = default;
 

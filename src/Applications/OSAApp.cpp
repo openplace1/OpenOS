@@ -22,6 +22,7 @@ OSAApp::OSAApp(TFT_eSPI* t, XPT2046_Touchscreen* touchscreen)
 bool OSAApp::loadScript(const String& path) {
     scriptLoaded = false;
     showDone     = false;
+    wantsExit    = false;
     if (!runtime.loadScript(path)) return false;
     name = runtime.appName.length() > 0 ? runtime.appName : "App";
     scriptLoaded = true;
@@ -61,6 +62,7 @@ void OSAApp::drawErrorScreen() {
 }
 
 void OSAApp::show() {
+    Serial.printf("[OSA] show() scriptLoaded=%d\n", scriptLoaded ? 1 : 0);
     if (!scriptLoaded) {
         tft->fillScreen(Theme::bg());
         drawHeaderBar();
@@ -72,7 +74,9 @@ void OSAApp::show() {
     showDone = false;
     tft->fillScreen(Theme::bg());
 
+    Serial.println("[OSA] calling runtime.runShow()");
     runtime.runShow();
+    Serial.println("[OSA] runtime.runShow() returned");
 
     if (runtime.hasError()) {
         drawErrorScreen();
@@ -97,14 +101,10 @@ void OSAApp::update() {
     }
 
     if (!runtime.runUpdate()) {
-        // Script called exit() or hit an error
+        // Script ended (exit(), error, or universal swipe-up gesture).
         if (runtime.hasError()) drawErrorScreen();
-        // Signal main loop to go back to homescreen by setting exitFlag
-        // We can't directly call the state machine, but we can re-use
-        // the "swipe up" mechanism — just stop responding so the OS
-        // global swipe-up at y>300 is the exit path.
-        // For cleaner UX: set showDone=false so update() is a no-op
         showDone = false;
+        wantsExit = true;  // main.cpp polls this and returns to home
     }
 }
 

@@ -1,8 +1,14 @@
 #include "Home.h"
 #include "Wallpaper.h"
+#include "../Config.h"
 #include <time.h>
 
 extern int sysTheme;
+
+// `|` because app names can contain spaces, hyphens, dots — but '|' never
+// shows up in a sensible display name and survives a round-trip through INI.
+static const char ORDER_SEP = '|';
+static const char* ORDER_KEY = "home_order";
 
 Home::Home(TFT_eSPI* tftInstance, XPT2046_Touchscreen* tsInstance) {
     tft = tftInstance;
@@ -188,8 +194,9 @@ App* Home::update() {
                     App* temp = apps[draggedIndex];
                     apps[draggedIndex] = apps[dropIndex];
                     apps[dropIndex] = temp;
+                    saveOrder();
                 }
-                show(false); 
+                show(false);
             } else {
                 if (draggedIndex != -1) {
                     
@@ -217,5 +224,50 @@ App* Home::update() {
             draggedIndex = -1;
         }
     }
-    return nullptr; 
+    return nullptr;
+}
+
+void Home::saveOrder() {
+    String order;
+    for (int i = 0; i < appCount; i++) {
+        if (i > 0) order += ORDER_SEP;
+        order += apps[i]->getDisplayName();
+    }
+    Config::set(ORDER_KEY, order);
+    Config::save();
+}
+
+void Home::applyOrder() {
+    String order = Config::get(ORDER_KEY, "");
+    if (order.length() == 0) return;
+
+    App* reordered[MAX_APPS];
+    int  rCount = 0;
+
+    // First pass — pick apps by name in the saved order. nullptr-ing the slot
+    // marks it as taken so duplicates in the saved list don't double-pick.
+    int start = 0;
+    for (int i = 0; i <= (int)order.length(); i++) {
+        if (i == (int)order.length() || order[i] == ORDER_SEP) {
+            String name = order.substring(start, i);
+            start = i + 1;
+            if (name.length() == 0) continue;
+            for (int j = 0; j < appCount; j++) {
+                if (apps[j] && apps[j]->getDisplayName() == name) {
+                    if (rCount < MAX_APPS) reordered[rCount++] = apps[j];
+                    apps[j] = nullptr;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Second pass — anything not in the saved order (newly installed app,
+    // first boot after a rename) lands at the end so it stays reachable.
+    for (int i = 0; i < appCount; i++) {
+        if (apps[i] && rCount < MAX_APPS) reordered[rCount++] = apps[i];
+    }
+
+    for (int i = 0; i < rCount; i++) apps[i] = reordered[i];
+    appCount = rCount;
 }

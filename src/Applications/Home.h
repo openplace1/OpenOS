@@ -34,6 +34,12 @@ public:
     void show(bool renderingDrag = false);
     void drawStatusBar();
     App* update();
+
+    // Persistence — call applyOrder() after all apps are registered to
+    // restore the user's last arrangement. saveOrder() is called internally
+    // after a successful drag-drop so callers don't need to wire it up.
+    void applyOrder();
+    void saveOrder();
 };
 
 #endif
