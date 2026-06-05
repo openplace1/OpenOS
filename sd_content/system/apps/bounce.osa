@@ -1,0 +1,96 @@
+#app "Bounce"
+#isApp true
+#appColor "#FF2D55"
+
+while touch.down() == 1 do wait(20) end
+wait(150)
+
+# Paint the TFT first — the sprite covers only the center; corners stay
+# untouched after gfx.push so they need a clean background underneath.
+cls()
+bg(8, 8, 16)
+textcolor(180, 180, 200)
+fontsize(2)
+textc(120, 14, "Sprite double-buffer")
+
+var W = 200
+var H = 200
+var ok = gfx.begin(W, H)
+if ok == 0 then
+  W = 160
+  H = 160
+  ok = gfx.begin(W, H)
+end
+if ok == 0 then
+  W = 120
+  H = 120
+  ok = gfx.begin(W, H)
+end
+if ok == 0 then
+  W = 96
+  H = 96
+  ok = gfx.begin(W, H)
+end
+if ok == 0 then
+  W = 80
+  H = 80
+  ok = gfx.begin(W, H)
+end
+if ok == 0 then
+  textcolor(255, 100, 100)
+  fontsize(2)
+  textc(120, 150, "Sprite OOM")
+  textc(120, 175, "free=" + str(freeram()) + " B")
+  wait(2500)
+  exit()
+end
+
+var px = (240 - W) / 2
+var py = (320 - H) / 2 + 8
+
+textcolor(120, 200, 255)
+fontsize(1)
+textc(120, py + H + 8, str(W) + "x" + str(H) + " sprite")
+textc(120, py + H + 22, "Swipe up to exit")
+
+var x = W / 2
+var y = H / 2
+var vx = 3.2
+var vy = 2.6
+var r = 18
+if W < 160 then r = 12 end
+if W < 100 then r = 8 end
+
+loop
+  bg(15, 15, 30)
+  setcolor(50, 50, 90)
+  frame(0, 0, W, H)
+  setcolor(255, 80, 80)
+  circle(x, y, r)
+  setcolor(255, 220, 220)
+  ring(x, y, r)
+  setcolor(255, 255, 255)
+  circle(x - r / 3, y - r / 3, 3)
+  gfx.push(px, py)
+
+  x = x + vx
+  y = y + vy
+  if x - r < 0 then
+    x = r
+    vx = -vx
+  end
+  if x + r > W then
+    x = W - r
+    vx = -vx
+  end
+  if y - r < 0 then
+    y = r
+    vy = -vy
+  end
+  if y + r > H then
+    y = H - r
+    vy = -vy
+  end
+
+  wait(16)
+end
