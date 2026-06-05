@@ -12,6 +12,8 @@
 #define OSA_PERM_NOTIFY   0x01   // notify()
 #define OSA_PERM_NETWORK  0x02   // http.get / http.post — outbound network access
 #define OSA_PERM_SYSTEM   0x04   // setbright, setwallpaper
+#define OSA_PERM_OVERLAY  0x08   // overlay.draw — draw on top of the active app
+                                  //   (like Android "Draw over other apps")
 
 // Permission descriptor — used by Settings to render only declared toggles.
 struct OSAPermDesc {
@@ -48,6 +50,10 @@ public:
     bool   loadScript(const String& path); // loads .osa from SD
     void   runShow();                      // execute setup section
     bool   runUpdate();                    // execute loop body; false = exit
+    // Release all script-owned heap (line text, var values, function bodies,
+    // any allocated sprite). Call after the app exits — Arduino's String
+    // destructor frees char buffers, so the next idle/launch starts clean.
+    void   reset();
     bool   hasLoop()  const { return loopStart >= 0; }
     bool   hasError() const { return errLine >= 0; }
     String getError() const { return errMsg; }
@@ -69,6 +75,11 @@ public:
     // and can set a tile color with `#appColor "#FF9500"`.
     static bool     readIsAppFromFile(const String& path);
     static uint16_t readIconColorFromFile(const String& path, uint16_t fallback);
+
+    // Allow OSAApp to inject an external sprite (pre-render before animation).
+    // All drawing builtins (CV macro) redirect there when non-null.
+    void         setActiveSprite(TFT_eSprite* s) { activeSprite = s; }
+    TFT_eSprite* getActiveSprite() const          { return activeSprite; }
     // `#exception true` grants the script the privileged SDK (sys.*, cfg.*,
     // fs.* outside sandbox, ntp.sync, sys.reboot, …). Used by built-in
     // privileged apps that need to mutate global system state.
@@ -77,6 +88,13 @@ public:
 private:
     TFT_eSPI*           tft;
     XPT2046_Touchscreen* ts;
+    // Off-screen sprite for flicker-free animations. Allocated on demand by
+    // gfx.begin(w, h); when non-null all drawing builtins redirect there.
+    TFT_eSprite*        activeSprite = nullptr;
+    // Stashed sprite — built once, blitted many times. Detached from
+    // activeSprite via gfx.stash so that subsequent drawing builtins target
+    // the screen, while gfx.show keeps blitting the stashed buffer.
+    TFT_eSprite*        stashSprite  = nullptr;
 
     // Script storage
     String lines[OSA_MAX_LINES];
@@ -126,6 +144,18 @@ private:
 
     // Tracks an in-progress swipe from the top edge for checkOverlayGesture.
     int    swipeOverlayStartY = -1;
+
+    // ── Gesture state (refreshed on every touch.*/gesture.* call) ────────────
+    int           gestureStartX  = 0;
+    int           gestureStartY  = 0;
+    int           gestureLastX   = 0;
+    int           gestureLastY   = 0;
+    unsigned long gestureStartT  = 0;
+    bool          gestureActive  = false;
+    bool          touchWasDown   = false;
+    bool          releasedOneShot = false;
+    int           swipeOneShot   = 0;  // 1=up,2=down,3=left,4=right, consumed on read
+    void pollGesture();
 
     // Returns true if the swipe-up-to-home gesture just completed. Called from
     // every blocking widget loop so the user can leave the app from anywhere.

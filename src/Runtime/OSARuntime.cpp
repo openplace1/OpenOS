@@ -1,8 +1,9 @@
 #include "OSARuntime.h"
 #include "../Config.h"
-#include "../Applications/OSKeyboard.h"
 #include "../Applications/Theme.h"
 #include "../Applications/Crypto.h"
+#include "../Applications/Wallpaper.h"
+#include "../Applications/Home.h"
 #include <SD.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
@@ -17,6 +18,129 @@ extern bool sysNtpSynced;
 extern bool sysWiFiEnabled;
 extern bool sysBTEnabled;
 extern BluetoothSerial SerialBT;
+extern Home home;
+// Folder + home animation helpers exposed by main.cpp. Used by OSA-side
+// home.osa so the script can trigger the same folder/open-anim UX without
+// owning the C++ Home/Folder data structures itself.
+extern void osaMakeFolder(int idx);
+extern void osaDeleteFolder(int idx);
+extern void osaAddToFolder(int folderIdx, int appIdx);
+extern void osaPlayOpenAnim(int idx);
+
+// ─── Inline keyboard (formerly OSKeyboard) ───────────────────────────────────
+// Was a standalone Applications/OSKeyboard.* class — now lives here as a
+// runtime-private helper so input() can use it without the rest of the
+// codebase depending on a separate file. lockscreen runs as an OSA script
+// and uses input() / ui.numpad, so this is the only consumer left.
+namespace {
+
+static const char kKeysL[3][10] = {
+    {'q','w','e','r','t','y','u','i','o','p'},
+    {'a','s','d','f','g','h','j','k','l',' '},
+    {'z','x','c','v','b','n','m',' ',' ',' '}
+};
+static const char kKeysU[3][10] = {
+    {'Q','W','E','R','T','Y','U','I','O','P'},
+    {'A','S','D','F','G','H','J','K','L',' '},
+    {'Z','X','C','V','B','N','M',' ',' ',' '}
+};
+static const char kKeysN[3][10] = {
+    {'1','2','3','4','5','6','7','8','9','0'},
+    {'-','/',':',';','(',')','$','&','@',' '},
+    {'.',',','?','!','\'','"','=',' ',' ',' '}
+};
+
+class InlineKbd {
+public:
+    InlineKbd(TFT_eSPI* t, XPT2046_Touchscreen* s) : tft(t), ts(s), layoutState(0) {}
+
+    void draw() {
+        tft->fillRect(0, 160, 240, 160, Theme::kbdBg());
+        for (int i = 0; i < 10; i++)
+            drawKey(2 + i * 24, 164, 20, 34, String(getCh(0, i)), false);
+        for (int i = 0; i < 9; i++)
+            drawKey(14 + i * 24, 202, 20, 34, String(getCh(1, i)), false);
+        drawKey(2, 240, 32, 34, layoutState == 1 ? "ABC" : "abc", true);
+        for (int i = 0; i < 7; i++)
+            drawKey(38 + i * 24, 240, 20, 34, String(getCh(2, i)), false);
+        drawKey(206, 240, 32, 34, "<X", true);
+        drawKey(2, 278, 54, 34, layoutState == 2 ? "ABC" : "123", true);
+        drawKey(60, 278, 120, 34, "space", false);
+        drawKey(184, 278, 54, 34, "Enter", true);
+    }
+
+    char update() {
+        if (!ts->touched()) return '\0';
+        TS_Point p = ts->getPoint();
+        int x = map(p.x, 300, 3800, 0, 240);
+        int y = map(p.y, 300, 3800, 0, 320);
+        if (y < 160) return '\0';
+
+        char result = '\0';
+        bool redraw = false;
+
+        if (y >= 160 && y < 200) {
+            int col = x / 24;
+            if (col >= 0 && col < 10) result = getCh(0, col);
+        } else if (y >= 200 && y < 240) {
+            if (x > 12 && x < 228) {
+                int col = (x - 12) / 24;
+                if (col >= 0 && col < 9) result = getCh(1, col);
+            }
+        } else if (y >= 240 && y < 280) {
+            if (x < 36) {
+                layoutState = (layoutState == 1) ? 0 : 1;
+                redraw = true;
+            } else if (x > 204) {
+                result = '\b';
+            } else {
+                int col = (x - 36) / 24;
+                if (col >= 0 && col < 7) result = getCh(2, col);
+            }
+        } else if (y >= 280 && y < 320) {
+            if (x < 60) {
+                layoutState = (layoutState == 2) ? 0 : 2;
+                redraw = true;
+            } else if (x > 180) {
+                result = '\n';
+            } else {
+                result = ' ';
+            }
+        }
+
+        if (redraw) {
+            draw();
+            delay(200);
+        } else if (result != '\0') {
+            if (layoutState == 1) { layoutState = 0; draw(); }
+            delay(200);
+        }
+        return result;
+    }
+
+private:
+    TFT_eSPI* tft;
+    XPT2046_Touchscreen* ts;
+    int layoutState;
+
+    char getCh(int row, int col) {
+        if (layoutState == 0) return kKeysL[row][col];
+        if (layoutState == 1) return kKeysU[row][col];
+        return kKeysN[row][col];
+    }
+
+    void drawKey(int x, int y, int w, int h, String label, bool isSpecial) {
+        uint16_t bg = isSpecial ? Theme::kbdSpec() : Theme::kbdKey();
+        tft->fillRoundRect(x, y + 2, w, h, 4, Theme::kbdShadow());
+        tft->fillRoundRect(x, y,     w, h, 4, bg);
+        tft->setTextColor(Theme::kbdText());
+        tft->setTextDatum(MC_DATUM);
+        tft->setTextFont(2); tft->setTextSize(1);
+        tft->drawString(label, x + w / 2, y + h / 2 + 2);
+    }
+};
+
+} // anonymous namespace
 
 // Forward — defined below near the block-navigation helpers.
 static bool isBlockOpen(const String& t);
@@ -26,11 +150,20 @@ namespace _osa_notify { void push(const char* msg); }
 
 // ─── Permission table ────────────────────────────────────────────────────────
 const OSAPermDesc OSA_PERM_TABLE[] = {
-    { OSA_PERM_NOTIFY,  "Notifications",   "notify() \xE2\x80\x94 system banners" },
-    { OSA_PERM_NETWORK, "Network",         "http.get(), http.post() \xE2\x80\x94 outbound" },
-    { OSA_PERM_SYSTEM,  "System Settings", "setbright(), setwallpaper()" },
+    { OSA_PERM_NOTIFY,  "Notifications",       "notify() \xE2\x80\x94 system banners" },
+    { OSA_PERM_NETWORK, "Network",             "http.get(), http.post() \xE2\x80\x94 outbound" },
+    { OSA_PERM_SYSTEM,  "System Settings",     "setbright(), setwallpaper()" },
+    { OSA_PERM_OVERLAY, "Draw over other apps","overlay.draw() \xE2\x80\x94 banners, alerts on top of any screen" },
 };
 const int OSA_PERM_TABLE_COUNT = sizeof(OSA_PERM_TABLE) / sizeof(OSA_PERM_TABLE[0]);
+
+// CV(...) routes a drawing call to the active sprite (off-screen buffer) if
+// gfx.begin() opened one, else direct to the TFT. TFT_eSPI's drawing methods
+// aren't virtual, so we have to dispatch at the call site explicitly.
+#define CV(call) do { \
+    if (activeSprite) activeSprite->call; \
+    else              tft->call; \
+} while (0)
 
 // Map keyword in #perm header to a bit. Returns 0 if unknown.
 static uint8_t permBitFromKeyword(const String& kw) {
@@ -305,6 +438,38 @@ void OSARuntime::setError(int line, const String& msg) {
     exitFlag = true;
 }
 
+void OSARuntime::reset() {
+    // Walk every slot that *might* hold heap-allocated String content from the
+    // previous script and release it. Counters get zeroed too so the next
+    // loadScript starts clean.
+    for (int i = 0; i < OSA_MAX_LINES; i++) lines[i] = "";
+    for (int i = 0; i < OSA_MAX_VARS; i++) {
+        vars[i].name = "";
+        vars[i].val  = OSAVal();
+    }
+    for (int i = 0; i < OSA_MAX_FUNCS; i++) {
+        funcs[i].name = "";
+        for (int j = 0; j < 8; j++) funcs[i].params[j] = "";
+    }
+    lineCount = varCount = funcCount = stackDepth = 0;
+    loopStart = loopEnd = -1;
+    exitFlag = returnFlag = breakFlag = continueFlag = false;
+    appName = "";
+    errMsg = "";
+    errLine = -1;
+    pendingLaunch = "";
+    if (activeSprite) {
+        activeSprite->deleteSprite();
+        delete activeSprite;
+        activeSprite = nullptr;
+    }
+    if (stashSprite) {
+        stashSprite->deleteSprite();
+        delete stashSprite;
+        stashSprite = nullptr;
+    }
+}
+
 // Waits until the touch panel has reported "not touched" for N consecutive
 // reads. XPT2046 occasionally flickers to !touched() while a finger is still
 // down, so a naive `while (ts->touched()) yield();` exits too early and lets
@@ -361,6 +526,42 @@ bool OSARuntime::checkExitGesture() {
     return false;
 }
 
+// Updates gesture state for touch.startX/Y/dx/dy/duration/released and
+// gesture.swipe*. Called lazily from each consumer so callers never miss a
+// frame, and the swipe one-shot is reset only on first read.
+void OSARuntime::pollGesture() {
+    bool now = ts->touched();
+    if (now) {
+        TS_Point p = ts->getPoint();
+        int cx = map(p.x, 300, 3800, 0, 240);
+        int cy = map(p.y, 300, 3800, 0, 320);
+        if (!touchWasDown) {
+            gestureStartX = cx;
+            gestureStartY = cy;
+            gestureStartT = millis();
+            gestureActive = true;
+            swipeOneShot  = 0;
+        }
+        gestureLastX = cx;
+        gestureLastY = cy;
+        releasedOneShot = false;
+    } else {
+        if (touchWasDown && gestureActive) {
+            int dx = gestureLastX - gestureStartX;
+            int dy = gestureLastY - gestureStartY;
+            int absX = abs(dx), absY = abs(dy);
+            const int swipeThresh = 40;
+            if (absX > swipeThresh || absY > swipeThresh) {
+                if (absY > absX) swipeOneShot = (dy < 0) ? 1 : 2;
+                else             swipeOneShot = (dx < 0) ? 3 : 4;
+            }
+            releasedOneShot = true;
+            gestureActive   = false;
+        }
+    }
+    touchWasDown = now;
+}
+
 bool OSARuntime::checkOverlayGesture() {
     // Swipe-down from the top edge → request Control Center. Same shape as
     // checkExitGesture but inverted. main.cpp inspects `wantsOverlay` after
@@ -387,8 +588,6 @@ bool OSARuntime::checkOverlayGesture() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 bool OSARuntime::loadScript(const String& path) {
-    Serial.printf("[RT] loadScript path='%s'\n", path.c_str());
-    // Reset state
     lineCount = varCount = funcCount = stackDepth = 0;
     loopStart = loopEnd = -1;
     exitFlag = returnFlag = false;
@@ -402,6 +601,13 @@ bool OSARuntime::loadScript(const String& path) {
     swipeHomeStartY = -1;
     swipeOverlayStartY = -1;
     wantsOverlay = false;
+    // Tear down any sprite the previous script left allocated so we don't
+    // leak the 10s of KB of pixel buffer between launches.
+    if (activeSprite) {
+        activeSprite->deleteSprite();
+        delete activeSprite;
+        activeSprite = nullptr;
+    }
     drawColor = txtColor = TFT_WHITE;
     textFont = 2;
     // Per-script HTTP state — never leak bearer tokens or status between apps.
@@ -418,14 +624,11 @@ bool OSARuntime::loadScript(const String& path) {
         lines[lineCount++] = raw;
     }
     f.close();
-    Serial.printf("[RT] read %d lines\n", lineCount);
 
-    // Headers — extracted via shared helpers so Settings and runtime stay in sync.
+    // Headers — shared helpers keep Settings + runtime in sync.
     appName       = readAppNameFromFile(path);
     requiredPerms = readRequiredPermsFromFile(path);
     isException   = readIsExceptionFromFile(path);
-    Serial.printf("[RT] appName='%s' perms=0x%02X exception=%d\n",
-                  appName.c_str(), requiredPerms, isException ? 1 : 0);
 
     // Find the *top-level* loop section. A bare `loop` keyword inside a
     // user-defined function would otherwise be picked up as the main update
@@ -461,9 +664,7 @@ void OSARuntime::runShow() {
     exitFlag = returnFlag = breakFlag = continueFlag = false;
     execDepth = 0;
     int to = (loopStart >= 0) ? loopStart : lineCount;
-    Serial.printf("[RT] runShow 0..%d (loopStart=%d)\n", to, loopStart);
     execRange(0, to);
-    Serial.printf("[RT] runShow done err=%d exit=%d\n", errLine, exitFlag ? 1 : 0);
 }
 
 bool OSARuntime::runUpdate() {
@@ -806,9 +1007,6 @@ void OSARuntime::declareVar(const String& name, const OSAVal& val) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 OSAVal OSARuntime::callUser(const String& name, const String& argsStr) {
-    Serial.printf("[RT] callUser %s(%s) depth=%d\n",
-                  name.c_str(), argsStr.c_str(), stackDepth);
-    // Find function
     int fi = -1;
     for (int i = 0; i < funcCount; i++)
         if (funcs[i].name == name) { fi = i; break; }
@@ -1362,70 +1560,161 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     // ── Screen drawing ────────────────────────────────────────────────────────
 
     if (name == "clear" || name == "cls") {
-        uint16_t bg = (sysTheme == 1) ? tft->color565(28, 28, 30) : TFT_WHITE;
-        tft->fillScreen(bg);
+        uint16_t c = (sysTheme == 1) ? tft->color565(28, 28, 30) : TFT_WHITE;
+        if (activeSprite) activeSprite->fillSprite(c);
+        else              tft->fillScreen(c);
         return OSAVal();
     }
     if (name == "bg") {
-        tft->fillScreen(tft->color565(iN(0), iN(1), iN(2)));
+        uint16_t c = tft->color565(iN(0), iN(1), iN(2));
+        if (activeSprite) activeSprite->fillSprite(c);
+        else              tft->fillScreen(c);
         return OSAVal();
     }
     if (name == "text") {
-        tft->setTextFont(textFont); tft->setTextSize(1);
-        tft->setTextColor(txtColor); tft->setTextDatum(TL_DATUM);
-        tft->drawString(S(2), iN(0), iN(1));
+        CV(setTextFont(textFont));
+        CV(setTextSize(1));
+        CV(setTextColor(txtColor));
+        CV(setTextDatum(TL_DATUM));
+        CV(drawString(S(2), iN(0), iN(1)));
         return OSAVal();
     }
     if (name == "textc") {
-        // text centered: textc(cx, y, "msg")
-        tft->setTextFont(textFont); tft->setTextSize(1);
-        tft->setTextColor(txtColor); tft->setTextDatum(MC_DATUM);
-        tft->drawString(S(2), iN(0), iN(1));
+        CV(setTextFont(textFont));
+        CV(setTextSize(1));
+        CV(setTextColor(txtColor));
+        CV(setTextDatum(MC_DATUM));
+        CV(drawString(S(2), iN(0), iN(1)));
         return OSAVal();
     }
     if (name == "rect") {
-        tft->fillRect(iN(0), iN(1), iN(2), iN(3), drawColor);
+        CV(fillRect(iN(0), iN(1), iN(2), iN(3), drawColor));
         return OSAVal();
     }
     if (name == "rrect") {
-        // rounded rect: rrect(x,y,w,h,r)
-        tft->fillRoundRect(iN(0), iN(1), iN(2), iN(3), iN(4), drawColor);
+        CV(fillRoundRect(iN(0), iN(1), iN(2), iN(3), iN(4), drawColor));
         return OSAVal();
     }
     if (name == "frame") {
-        tft->drawRect(iN(0), iN(1), iN(2), iN(3), drawColor);
+        CV(drawRect(iN(0), iN(1), iN(2), iN(3), drawColor));
         return OSAVal();
     }
     if (name == "circle") {
-        tft->fillCircle(iN(0), iN(1), iN(2), drawColor);
+        CV(fillCircle(iN(0), iN(1), iN(2), drawColor));
         return OSAVal();
     }
     if (name == "ring") {
-        tft->drawCircle(iN(0), iN(1), iN(2), drawColor);
+        CV(drawCircle(iN(0), iN(1), iN(2), drawColor));
         return OSAVal();
     }
     if (name == "line") {
-        tft->drawLine(iN(0), iN(1), iN(2), iN(3), drawColor);
+        CV(drawLine(iN(0), iN(1), iN(2), iN(3), drawColor));
         return OSAVal();
     }
     if (name == "pixel") {
-        tft->drawPixel(iN(0), iN(1), drawColor);
+        CV(drawPixel(iN(0), iN(1), drawColor));
         return OSAVal();
     }
     if (name == "setcolor") {
         drawColor = tft->color565(iN(0), iN(1), iN(2));
         return OSAVal();
     }
+    if (name == "setcolor565")  { drawColor = (uint16_t)iN(0); return OSAVal(); }
     if (name == "textcolor") {
         txtColor = tft->color565(iN(0), iN(1), iN(2));
         return OSAVal();
     }
+    if (name == "textcolor565") { txtColor  = (uint16_t)iN(0); return OSAVal(); }
     if (name == "fontsize") {
-        int fs = iN(0); textFont = (fs >= 4) ? 4 : (fs >= 2) ? 2 : 1;
+        // TFT_eSPI ships fonts 1, 2, 4, 6, 7 — 6 is digits-only (big clock
+        // glyphs), 7 is 7-segment. Anything in between rounds down.
+        int fs = iN(0);
+        if      (fs >= 7) textFont = 7;
+        else if (fs >= 6) textFont = 6;
+        else if (fs >= 4) textFont = 4;
+        else if (fs >= 2) textFont = 2;
+        else              textFont = 1;
         return OSAVal();
     }
     if (name == "screenw") return OSAVal(240.0);
     if (name == "screenh") return OSAVal(320.0);
+
+    // ── Off-screen sprite (double buffering for smooth animations) ────────────
+    //   ok = gfx.begin(w, h)   — allocate; subsequent draws go to the sprite
+    //   gfx.push(x, y)         — blit sprite to TFT at (x, y)
+    //   gfx.end()              — release sprite, drawing returns to direct TFT
+    if (name == "gfx.begin") {
+        // Optional 3rd arg: depth 1/8/16 (default 16). 8-bit halves memory
+        // (256-color palette) — perfect for solid-color sprites.
+        int w = iN(0), h = iN(1);
+        int depth = (argc >= 3) ? iN(2) : 16;
+        if (depth != 1 && depth != 8 && depth != 16) depth = 16;
+        if (w <= 0 || h <= 0) return OSAVal(0.0);
+        if (activeSprite) {
+            activeSprite->deleteSprite();
+            delete activeSprite;
+            activeSprite = nullptr;
+        }
+        activeSprite = new TFT_eSprite(tft);
+        if (!activeSprite) return OSAVal(0.0);
+        activeSprite->setColorDepth(depth);
+        if (!activeSprite->createSprite(w, h)) {
+            delete activeSprite;
+            activeSprite = nullptr;
+            return OSAVal(0.0);
+        }
+        activeSprite->fillSprite(TFT_BLACK);
+        return OSAVal(1.0);
+    }
+    if (name == "gfx.push") {
+        if (!activeSprite) return OSAVal(0.0);
+        activeSprite->pushSprite(iN(0), iN(1));
+        return OSAVal(1.0);
+    }
+    if (name == "gfx.end") {
+        if (activeSprite) {
+            activeSprite->deleteSprite();
+            delete activeSprite;
+            activeSprite = nullptr;
+        }
+        if (stashSprite) {
+            stashSprite->deleteSprite();
+            delete stashSprite;
+            stashSprite = nullptr;
+        }
+        return OSAVal();
+    }
+    if (name == "gfx.active") return OSAVal(activeSprite ? 1.0 : 0.0);
+    // ── gfx.stash / gfx.show / gfx.unstash ────────────────────────────────
+    // "Build once, blit many" pattern: build a sprite with gfx.begin + draws,
+    // call gfx.stash() to detach it (drawing returns to screen but the buffer
+    // stays alive), then gfx.show(x, y) to blit it on demand. gfx.unstash
+    // re-activates the stashed sprite for further drawing.
+    if (name == "gfx.stash") {
+        if (activeSprite) {
+            if (stashSprite) {
+                stashSprite->deleteSprite();
+                delete stashSprite;
+            }
+            stashSprite = activeSprite;
+            activeSprite = nullptr;
+        }
+        return OSAVal();
+    }
+    if (name == "gfx.show") {
+        if (!stashSprite) return OSAVal(0.0);
+        stashSprite->pushSprite(iN(0), iN(1));
+        return OSAVal(1.0);
+    }
+    if (name == "gfx.unstash") {
+        if (activeSprite) {
+            activeSprite->deleteSprite();
+            delete activeSprite;
+        }
+        activeSprite = stashSprite;
+        stashSprite = nullptr;
+        return OSAVal();
+    }
 
     // ── Touch ─────────────────────────────────────────────────────────────────
 
@@ -1778,7 +2067,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         String prompt = S(0);
         String buf    = S(1, "");
         bool   multi  = (argc >= 3) ? (iN(2) != 0) : false;
-        OSKeyboard kbd(tft, ts);
+        InlineKbd kbd(tft, ts);
         const int doneX = 178, doneY = 5, doneW = 56, doneH = 28;
 
         tft->fillRect(0, 0, 240, 160, Theme::bg());
@@ -1902,10 +2191,8 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     if (name == "ui.menu") {
         String items_str = S(0);
         String title     = (argc >= 2) ? S(1) : String("Menu");
-        // Optional third arg: showBack (1 = render "< Back" in header, tap
-        // returns -1).
         bool   showBack  = (argc >= 3) ? (iN(2) != 0) : false;
-        const int MAX_ITEMS = 12;
+        const int MAX_ITEMS = 32;
         String items[MAX_ITEMS];
         int    itemCount = 0;
         int start = 0;
@@ -1916,52 +2203,94 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
             }
         }
 
-        const int rowH    = 44;
-        const int headerH = showBack ? 50 : 40;
-        const int rowY0   = headerH + 10;
-        tft->fillScreen(Theme::bg());
-        tft->fillRect(0, 0, 240, headerH, Theme::header());
-        tft->drawFastHLine(0, headerH, 240, Theme::divider());
-        tft->setTextFont(2);
-        if (showBack) {
-            tft->setTextColor(tft->color565(0, 122, 255));
-            tft->setTextDatum(ML_DATUM);
-            tft->drawString("< Back", 10, headerH / 2);
-        }
-        tft->setTextColor(Theme::text()); tft->setTextDatum(MC_DATUM);
-        tft->drawString(title, 120, headerH / 2);
-        for (int i = 0; i < itemCount; i++) {
-            int y = rowY0 + i * rowH;
-            tft->fillRect(0, y, 240, rowH - 1, Theme::surface());
-            tft->drawFastHLine(0, y + rowH - 1, 240, Theme::divider2());
-            tft->setTextColor(Theme::text()); tft->setTextDatum(ML_DATUM);
-            tft->drawString(items[i], 16, y + rowH / 2);
-            tft->setTextColor(Theme::hint()); tft->setTextDatum(MR_DATUM);
-            tft->drawString(">", 222, y + rowH / 2);
-        }
+        const int rowH       = 44;
+        const int headerH    = showBack ? 50 : 40;
+        const int rowY0      = headerH + 10;
+        const int viewportH  = 320 - rowY0;
+        const int contentH   = itemCount * rowH;
+        const bool scrollable = contentH > viewportH;
+        const int maxScroll  = scrollable ? (contentH - viewportH) : 0;
+        int scrollY = 0;
 
+        auto paint = [&]() {
+            tft->fillScreen(Theme::bg());
+            // Rows first; header is repainted on top so scrolled rows don't bleed.
+            for (int i = 0; i < itemCount; i++) {
+                int y = rowY0 + i * rowH - scrollY;
+                if (y + rowH <= rowY0) continue;
+                if (y >= rowY0 + viewportH) break;
+                tft->fillRect(0, y, 240, rowH - 1, Theme::surface());
+                tft->drawFastHLine(0, y + rowH - 1, 240, Theme::divider2());
+                tft->setTextFont(2);
+                tft->setTextColor(Theme::text()); tft->setTextDatum(ML_DATUM);
+                tft->drawString(items[i], 16, y + rowH / 2);
+                tft->setTextColor(Theme::hint()); tft->setTextDatum(MR_DATUM);
+                int valX = scrollable ? 217 : 222;
+                tft->drawString(">", valX, y + rowH / 2);
+            }
+            tft->fillRect(0, 0, 240, headerH, Theme::header());
+            tft->drawFastHLine(0, headerH, 240, Theme::divider());
+            tft->setTextFont(2);
+            if (showBack) {
+                tft->setTextColor(tft->color565(0, 122, 255));
+                tft->setTextDatum(ML_DATUM);
+                tft->drawString("< Back", 10, headerH / 2);
+            }
+            tft->setTextColor(Theme::text()); tft->setTextDatum(MC_DATUM);
+            tft->drawString(title, 120, headerH / 2);
+
+            if (scrollable) {
+                int barH = viewportH * viewportH / contentH;
+                if (barH < 12) barH = 12;
+                int barY = rowY0 + (viewportH - barH) * scrollY /
+                                    (maxScroll > 0 ? maxScroll : 1);
+                tft->fillRect(236, rowY0, 4, viewportH, Theme::divider2());
+                tft->fillRect(236, barY, 4, barH, Theme::hint());
+            }
+        };
+
+        paint();
         enforceTapGap(ts);
         waitFullRelease(ts);
+
+        bool wasTouched = false;
+        int  startY = 0, startX = 0, startScroll = 0;
+        bool didScroll = false;
         while (true) {
             yield();
             if (checkExitGesture() || checkOverlayGesture()) return OSAVal(-1.0);
-            if (!ts->touched()) continue;
-            TS_Point p = ts->getPoint();
-            int tx = map(p.x, 300, 3800, 0, 240);
-            int ty = map(p.y, 300, 3800, 0, 320);
-            // Don't grab taps in the bottom strip — that's the exit gesture zone.
-            if (ty > 290) continue;
-            // "< Back" hot zone (top-left corner of header).
-            if (showBack && ty < headerH && tx < 80) {
-                waitFullRelease(ts);
-                markTapAccepted();
-                return OSAVal(-1.0);
-            }
-            if (ty >= rowY0 && ty < rowY0 + itemCount * rowH && tx >= 0 && tx <= 240) {
-                int idx = (ty - rowY0) / rowH;
-                waitFullRelease(ts);
-                markTapAccepted();
-                return OSAVal((double)idx);
+            if (ts->touched()) {
+                TS_Point p = ts->getPoint();
+                int tx = map(p.x, 300, 3800, 0, 240);
+                int ty = map(p.y, 300, 3800, 0, 320);
+                if (!wasTouched) {
+                    wasTouched = true;
+                    startX = tx; startY = ty; startScroll = scrollY; didScroll = false;
+                } else if (scrollable) {
+                    int dy = ty - startY;
+                    if (!didScroll && abs(dy) > 8) didScroll = true;
+                    if (didScroll) {
+                        int newScroll = startScroll - dy;
+                        if (newScroll < 0) newScroll = 0;
+                        if (newScroll > maxScroll) newScroll = maxScroll;
+                        if (newScroll != scrollY) { scrollY = newScroll; paint(); }
+                    }
+                }
+            } else if (wasTouched) {
+                wasTouched = false;
+                if (!didScroll) {
+                    if (showBack && startY < headerH && startX < 80) {
+                        markTapAccepted();
+                        return OSAVal(-1.0);
+                    }
+                    if (startY >= rowY0 && startY < rowY0 + viewportH) {
+                        int idx = (startY - rowY0 + scrollY) / rowH;
+                        if (idx >= 0 && idx < itemCount) {
+                            markTapAccepted();
+                            return OSAVal((double)idx);
+                        }
+                    }
+                }
             }
         }
     }
@@ -2115,61 +2444,122 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
             return OSAVal();
         }
         if (name == "ui.menuShow") {
-            const int headerH = s_rmShowBack ? 50 : 40;
-            tft->fillScreen(Theme::bg());
-            tft->fillRect(0, 0, 240, headerH, Theme::header());
-            tft->drawFastHLine(0, headerH, 240, Theme::divider());
-            tft->setTextFont(2); tft->setTextSize(1);
-            if (s_rmShowBack) {
-                tft->setTextColor(tft->color565(0, 122, 255));
-                tft->setTextDatum(ML_DATUM);
-                tft->drawString("< Back", 10, headerH / 2);
-            }
-            tft->setTextColor(Theme::text()); tft->setTextDatum(MC_DATUM);
-            tft->drawString(s_rmTitle, 120, headerH / 2);
+            const int headerH    = s_rmShowBack ? 50 : 40;
+            const int rowH       = 31;
+            // Use the full screen below the header. The last row may be
+            // partially clipped at the screen edge — better than leaving an
+            // obvious empty strip at the bottom.
+            const int viewportH  = 320 - headerH;
+            const int contentH   = s_rmCount * rowH;
+            const bool scrollable = contentH > viewportH;
+            const int maxScroll  = scrollable ? (contentH - viewportH) : 0;
+            int scrollY = 0;
 
-            const int rowH = 31;
-            for (int i = 0; i < s_rmCount; i++) {
-                int y = headerH + i * rowH;
-                tft->fillRect(0, y, 240, rowH, Theme::surface());
-                if (i < s_rmCount - 1)
-                    tft->drawFastHLine(0, y + rowH, 240, Theme::divider2());
+            auto paint = [&]() {
+                tft->fillScreen(Theme::bg());
 
-                tft->fillRoundRect(14, y + 3, 24, 24, 6, s_rmColors[i]);
-                tft->setTextColor(TFT_WHITE); tft->setTextDatum(MC_DATUM);
-                tft->drawString(s_rmLetters[i], 26, y + 15);
+                // Render rows first so a partially-scrolled row that overlaps
+                // the header area can be hidden by repainting the header on top.
+                for (int i = 0; i < s_rmCount; i++) {
+                    int y = headerH + i * rowH - scrollY;
+                    if (y + rowH <= headerH) continue;
+                    if (y >= headerH + viewportH) break;
+                    tft->fillRect(0, y, 240, rowH, Theme::surface());
+                    if (i < s_rmCount - 1)
+                        tft->drawFastHLine(0, y + rowH, 240, Theme::divider2());
+                    tft->fillRoundRect(14, y + 3, 24, 24, 6, s_rmColors[i]);
+                    tft->setTextColor(TFT_WHITE); tft->setTextDatum(MC_DATUM);
+                    tft->setTextFont(2); tft->setTextSize(1);
+                    tft->drawString(s_rmLetters[i], 26, y + 15);
+                    tft->setTextColor(Theme::text()); tft->setTextDatum(ML_DATUM);
+                    int valX = scrollable ? 220 : 225;
+                    tft->drawString(s_rmTitles[i], 46, y + 15);
+                    tft->setTextColor(Theme::hint()); tft->setTextDatum(MR_DATUM);
+                    tft->drawString(s_rmValues[i], valX, y + 15);
+                }
 
-                tft->setTextColor(Theme::text()); tft->setTextDatum(ML_DATUM);
-                tft->drawString(s_rmTitles[i], 46, y + 15);
+                // Header repainted on top — covers any bleed from a scrolled row.
+                tft->fillRect(0, 0, 240, headerH, Theme::header());
+                tft->drawFastHLine(0, headerH, 240, Theme::divider());
+                tft->setTextFont(2); tft->setTextSize(1);
+                if (s_rmShowBack) {
+                    tft->setTextColor(tft->color565(0, 122, 255));
+                    tft->setTextDatum(ML_DATUM);
+                    tft->drawString("< Back", 10, headerH / 2);
+                }
+                tft->setTextColor(Theme::text()); tft->setTextDatum(MC_DATUM);
+                tft->drawString(s_rmTitle, 120, headerH / 2);
 
-                tft->setTextColor(Theme::hint()); tft->setTextDatum(MR_DATUM);
-                tft->drawString(s_rmValues[i], 225, y + 15);
-            }
+                // Scrollbar spans the full viewport so the track length matches
+                // the row strip exactly.
+                if (scrollable) {
+                    int barH = viewportH * viewportH / contentH;
+                    if (barH < 12) barH = 12;
+                    int barY = headerH + (viewportH - barH) * scrollY /
+                                          (maxScroll > 0 ? maxScroll : 1);
+                    tft->fillRect(236, headerH, 4, viewportH, Theme::divider2());
+                    tft->fillRect(236, barY, 4, barH, Theme::hint());
+                }
+            };
 
-            // enforceTapGap() guarantees a cool-down since the last widget tap,
-            // and waitFullRelease() makes sure the finger really is up.
+            paint();
             enforceTapGap(ts);
             waitFullRelease(ts);
+
+            bool wasTouched      = false;
+            int  touchStartY     = 0;
+            int  touchStartX     = 0;
+            int  touchStartScroll = 0;
+            bool didScroll       = false;
+            int  lastY           = 0;
+
             while (true) {
                 yield();
                 if (checkExitGesture() || checkOverlayGesture()) return OSAVal(-1.0);
-                if (!ts->touched()) continue;
-                TS_Point p = ts->getPoint();
-                int tx = map(p.x, 300, 3800, 0, 240);
-                int ty = map(p.y, 300, 3800, 0, 320);
-                // Reserve the bottom strip for the exit gesture.
-                if (ty > 290) continue;
-                // "< Back" hot zone in the header (top-left corner).
-                if (s_rmShowBack && ty < headerH && tx < 80) {
-                    waitFullRelease(ts);
-                    markTapAccepted();
-                    return OSAVal(-1.0);
-                }
-                if (ty >= headerH && ty < headerH + s_rmCount * rowH && tx >= 0 && tx <= 240) {
-                    int idx = (ty - headerH) / rowH;
-                    waitFullRelease(ts);
-                    markTapAccepted();
-                    return OSAVal((double)idx);
+
+                if (ts->touched()) {
+                    TS_Point p = ts->getPoint();
+                    int tx = map(p.x, 300, 3800, 0, 240);
+                    int ty = map(p.y, 300, 3800, 0, 320);
+
+                    if (!wasTouched) {
+                        wasTouched      = true;
+                        touchStartY     = ty;
+                        touchStartX     = tx;
+                        touchStartScroll = scrollY;
+                        didScroll       = false;
+                        lastY           = ty;
+                    } else if (scrollable) {
+                        int dy = ty - touchStartY;
+                        if (!didScroll && abs(dy) > 8) didScroll = true;
+                        if (didScroll) {
+                            int newScroll = touchStartScroll - (ty - touchStartY);
+                            if (newScroll < 0) newScroll = 0;
+                            if (newScroll > maxScroll) newScroll = maxScroll;
+                            if (newScroll != scrollY) {
+                                scrollY = newScroll;
+                                paint();
+                            }
+                        }
+                        lastY = ty;
+                    }
+                } else if (wasTouched) {
+                    wasTouched = false;
+                    if (!didScroll) {
+                        // Pure tap — hit-test against the (possibly scrolled) list.
+                        int ty = touchStartY, tx = touchStartX;
+                        if (s_rmShowBack && ty < headerH && tx < 80) {
+                            markTapAccepted();
+                            return OSAVal(-1.0);
+                        }
+                        if (ty >= headerH && ty < headerH + viewportH) {
+                            int idx = (ty - headerH + scrollY) / rowH;
+                            if (idx >= 0 && idx < s_rmCount) {
+                                markTapAccepted();
+                                return OSAVal((double)idx);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2281,32 +2671,34 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         if (maxDigits < 1) maxDigits = 1;
         if (maxDigits > 12) maxDigits = 12;
         String buf;
-        const int btn = 55, gap = 5;
-        const int gridW = 3 * btn + 2 * gap;
-        const int gridX = (240 - gridW) / 2;
-        const int gridY = 95;
+        // Compact layout: 4×3 grid sized so the bottom row ends at y=290,
+        // safely above the swipe-up dead zone (ty > 290) checked below.
+        const int btn = 50, gap = 5;
+        const int gridW = 3 * btn + 2 * gap;          // 160
+        const int gridX = (240 - gridW) / 2;          // 40
+        const int gridY = 75;                         // row 3 bottom = 290
         const char* keys = "123456789<0>";
 
         auto drawHeader = [&]() {
-            tft->fillRect(0, 0, 240, 50, Theme::header());
-            tft->drawFastHLine(0, 50, 240, Theme::divider());
+            tft->fillRect(0, 0, 240, 45, Theme::header());
+            tft->drawFastHLine(0, 45, 240, Theme::divider());
             tft->setTextFont(2); tft->setTextColor(tft->color565(0, 122, 255));
             tft->setTextDatum(ML_DATUM);
-            tft->drawString("< Back", 10, 25);
+            tft->drawString("< Back", 10, 22);
             tft->setTextColor(Theme::text()); tft->setTextDatum(MC_DATUM);
-            tft->drawString(prompt, 120, 25);
+            tft->drawString(prompt, 120, 22);
         };
         auto drawDots = [&]() {
-            tft->fillRect(0, 60, 240, 28, Theme::bg());
+            tft->fillRect(0, 48, 240, 24, Theme::bg());
             int dotW = 20 * maxDigits; if (dotW > 220) dotW = 220;
             int dotX = (240 - dotW) / 2;
             int step = dotW / maxDigits;
             for (int i = 0; i < maxDigits; i++) {
                 int cx = dotX + i * step + step / 2;
                 if (i < (int)buf.length())
-                    tft->fillCircle(cx, 74, 7, Theme::text());
+                    tft->fillCircle(cx, 62, 6, Theme::text());
                 else
-                    tft->drawCircle(cx, 74, 7, Theme::divider2());
+                    tft->drawCircle(cx, 62, 6, Theme::divider2());
             }
         };
         auto drawKeys = [&]() {
@@ -2809,6 +3201,248 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         }
         dir.close();
         return OSAVal(out);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // Extended SDK — drawing extras, gestures, animation, home access
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // ── Drawing extras ───────────────────────────────────────────────────────
+    if (name == "triangle") {
+        CV(fillTriangle(iN(0), iN(1), iN(2), iN(3), iN(4), iN(5), drawColor));
+        return OSAVal();
+    }
+    if (name == "tframe") {
+        CV(drawTriangle(iN(0), iN(1), iN(2), iN(3), iN(4), iN(5), drawColor));
+        return OSAVal();
+    }
+    if (name == "rframe") {
+        CV(drawRoundRect(iN(0), iN(1), iN(2), iN(3), iN(4), drawColor));
+        return OSAVal();
+    }
+    if (name == "gradient") {
+        // Vertical gradient from (r1,g1,b1) at top to (r2,g2,b2) at bottom.
+        int x = iN(0), y = iN(1), w = iN(2), h = iN(3);
+        int r1 = iN(4), g1 = iN(5), b1 = iN(6);
+        int r2 = iN(7), g2 = iN(8), b2 = iN(9);
+        if (h <= 0 || w <= 0) return OSAVal();
+        for (int row = 0; row < h; row++) {
+            float t = (float)row / (float)(h - 1 > 0 ? h - 1 : 1);
+            int r = r1 + (int)((r2 - r1) * t);
+            int g = g1 + (int)((g2 - g1) * t);
+            int b = b1 + (int)((b2 - b1) * t);
+            uint16_t c = tft->color565(r, g, b);
+            if (activeSprite) activeSprite->drawFastHLine(x, y + row, w, c);
+            else              tft->drawFastHLine(x, y + row, w, c);
+        }
+        return OSAVal();
+    }
+
+    // ── Text metrics / alignment ─────────────────────────────────────────────
+    if (name == "textw") {
+        tft->setTextFont(textFont); tft->setTextSize(1);
+        return OSAVal((double)tft->textWidth(S(0)));
+    }
+    if (name == "texth") {
+        tft->setTextFont(textFont); tft->setTextSize(1);
+        return OSAVal((double)tft->fontHeight());
+    }
+    if (name == "textr") {
+        CV(setTextFont(textFont)); CV(setTextSize(1));
+        CV(setTextColor(txtColor)); CV(setTextDatum(TR_DATUM));
+        CV(drawString(S(2), iN(0), iN(1)));
+        return OSAVal();
+    }
+    if (name == "textmr") {
+        CV(setTextFont(textFont)); CV(setTextSize(1));
+        CV(setTextColor(txtColor)); CV(setTextDatum(MR_DATUM));
+        CV(drawString(S(2), iN(0), iN(1)));
+        return OSAVal();
+    }
+    if (name == "textml") {
+        CV(setTextFont(textFont)); CV(setTextSize(1));
+        CV(setTextColor(txtColor)); CV(setTextDatum(ML_DATUM));
+        CV(drawString(S(2), iN(0), iN(1)));
+        return OSAVal();
+    }
+
+    // ── Wallpaper (shared cache from main.cpp) ───────────────────────────────
+    if (name == "wallpaper.draw") {
+        if (!activeSprite) Wallpaper::draw(tft);
+        return OSAVal();
+    }
+    if (name == "wallpaper.region") {
+        if (!activeSprite)
+            Wallpaper::drawRegion(tft, iN(0), iN(1), iN(2), iN(3));
+        return OSAVal();
+    }
+
+    // ── Gesture / touch state ────────────────────────────────────────────────
+    if (name == "touch.startX")  { pollGesture(); return OSAVal((double)gestureStartX); }
+    if (name == "touch.startY")  { pollGesture(); return OSAVal((double)gestureStartY); }
+    if (name == "touch.dx")      { pollGesture();
+        if (!gestureActive && !touchWasDown) return OSAVal(0.0);
+        return OSAVal((double)(gestureLastX - gestureStartX)); }
+    if (name == "touch.dy")      { pollGesture();
+        if (!gestureActive && !touchWasDown) return OSAVal(0.0);
+        return OSAVal((double)(gestureLastY - gestureStartY)); }
+    if (name == "touch.duration") { pollGesture();
+        if (!gestureActive) return OSAVal(0.0);
+        return OSAVal((double)(millis() - gestureStartT)); }
+    if (name == "touch.released") {
+        pollGesture();
+        bool r = releasedOneShot;
+        releasedOneShot = false;
+        return OSAVal(r ? 1.0 : 0.0);
+    }
+    if (name == "gesture.swipeUp")    { pollGesture(); bool ok = (swipeOneShot == 1);
+                                        if (ok) swipeOneShot = 0; return OSAVal(ok ? 1.0 : 0.0); }
+    if (name == "gesture.swipeDown")  { pollGesture(); bool ok = (swipeOneShot == 2);
+                                        if (ok) swipeOneShot = 0; return OSAVal(ok ? 1.0 : 0.0); }
+    if (name == "gesture.swipeLeft")  { pollGesture(); bool ok = (swipeOneShot == 3);
+                                        if (ok) swipeOneShot = 0; return OSAVal(ok ? 1.0 : 0.0); }
+    if (name == "gesture.swipeRight") { pollGesture(); bool ok = (swipeOneShot == 4);
+                                        if (ok) swipeOneShot = 0; return OSAVal(ok ? 1.0 : 0.0); }
+
+    // ── Animation helpers ────────────────────────────────────────────────────
+    if (name == "lerp") {
+        double a = N(0), b = N(1), t = N(2);
+        return OSAVal(a + (b - a) * t);
+    }
+    if (name == "clamp") {
+        double v = N(0), lo = N(1), hi = N(2);
+        if (v < lo) v = lo; if (v > hi) v = hi;
+        return OSAVal(v);
+    }
+    if (name == "ease") {
+        // type: 0=linear, 1=ease-in (quad), 2=ease-out (quad),
+        //       3=ease-in-out (cubic), 4=cubic-in, 5=cubic-out
+        double t = N(0); int type = iN(1);
+        if (t < 0) t = 0; if (t > 1) t = 1;
+        double out = t;
+        switch (type) {
+            case 1: out = t * t; break;
+            case 2: out = 1.0 - (1.0 - t) * (1.0 - t); break;
+            case 3: out = (t < 0.5) ? 4 * t * t * t
+                                    : 1.0 - pow(-2.0 * t + 2.0, 3) / 2.0; break;
+            case 4: out = t * t * t; break;
+            case 5: { double u = 1.0 - t; out = 1.0 - u * u * u; break; }
+            default: out = t;
+        }
+        return OSAVal(out);
+    }
+
+    // ── Time formatting helpers ──────────────────────────────────────────────
+    if (name == "time.fmtHM" || name == "time.fmtHMS" || name == "time.fmtDate") {
+        time_t now; time(&now); struct tm t; localtime_r(&now, &t);
+        char buf[24];
+        if (name == "time.fmtHM")  snprintf(buf, sizeof(buf), "%02d:%02d", t.tm_hour, t.tm_min);
+        if (name == "time.fmtHMS") snprintf(buf, sizeof(buf), "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
+        if (name == "time.fmtDate")snprintf(buf, sizeof(buf), "%02d.%02d.%d", t.tm_mday, t.tm_mon + 1, t.tm_year + 1900);
+        return OSAVal(String(buf));
+    }
+
+    // ── Battery / system info ────────────────────────────────────────────────
+    if (name == "battery") return OSAVal(97.0);   // mock; no fuel gauge on CYD
+    if (name == "wifi.rssi") {
+        if (WiFi.status() != WL_CONNECTED) return OSAVal(0.0);
+        return OSAVal((double)WiFi.RSSI());
+    }
+
+    // ── Home enumeration (read-only) ─────────────────────────────────────────
+    if (name == "home.appCount") return OSAVal((double)home.appCount);
+    if (name == "home.appName") {
+        int i = iN(0);
+        if (i < 0 || i >= home.appCount) return OSAVal("");
+        return OSAVal(home.tiles[i].name);
+    }
+    if (name == "home.appColor") {
+        int i = iN(0);
+        if (i < 0 || i >= home.appCount) return OSAVal(0.0);
+        return OSAVal((double)home.tiles[i].color);
+    }
+    if (name == "home.appIsFolder") {
+        int i = iN(0);
+        if (i < 0 || i >= home.appCount) return OSAVal(0.0);
+        return OSAVal(home.tiles[i].isFolder ? 1.0 : 0.0);
+    }
+    if (name == "home.appPath") {
+        int i = iN(0);
+        if (i < 0 || i >= home.appCount) return OSAVal("");
+        return OSAVal(home.tiles[i].scriptPath);
+    }
+    if (name == "home.folderCount") {
+        int i = iN(0);
+        if (i < 0 || i >= home.appCount || !home.tiles[i].isFolder) return OSAVal(0.0);
+        return OSAVal((double)home.tiles[i].childCount);
+    }
+    if (name == "home.folderAppName" || name == "home.folderAppColor" ||
+        name == "home.folderAppPath") {
+        int i = iN(0), j = iN(1);
+        bool wantsNum = (name == "home.folderAppColor");
+        if (i < 0 || i >= home.appCount || !home.tiles[i].isFolder)
+            return wantsNum ? OSAVal(0.0) : OSAVal("");
+        const HomeTile& f = home.tiles[i];
+        if (j < 0 || j >= f.childCount)
+            return wantsNum ? OSAVal(0.0) : OSAVal("");
+        if (name == "home.folderAppName")  return OSAVal(f.children[j].name);
+        if (name == "home.folderAppColor") return OSAVal((double)f.children[j].color);
+        return OSAVal(f.children[j].scriptPath);
+    }
+
+    // ── Home mutations (privileged-ish — gate behind isException) ────────────
+    if (name == "home.swap") {
+        if (!isException) return OSAVal(0.0);
+        int i = iN(0), j = iN(1);
+        if (i < 0 || j < 0 || i >= home.appCount || j >= home.appCount) return OSAVal(0.0);
+        HomeTile tmp = home.tiles[i]; home.tiles[i] = home.tiles[j]; home.tiles[j] = tmp;
+        return OSAVal(1.0);
+    }
+    if (name == "home.makeFolder") {
+        if (!isException) return OSAVal(0.0);
+        osaMakeFolder(iN(0));
+        return OSAVal(1.0);
+    }
+    if (name == "home.deleteFolder") {
+        if (!isException) return OSAVal(0.0);
+        osaDeleteFolder(iN(0));
+        return OSAVal(1.0);
+    }
+    if (name == "home.addToFolder") {
+        if (!isException) return OSAVal(0.0);
+        osaAddToFolder(iN(0), iN(1));
+        return OSAVal(1.0);
+    }
+    if (name == "home.saveOrder") {
+        if (!isException) return OSAVal();
+        home.saveOrder();
+        return OSAVal();
+    }
+    if (name == "anim.openTile") {
+        if (!isException) return OSAVal();
+        osaPlayOpenAnim(iN(0));
+        return OSAVal();
+    }
+
+    // ── theme.* — current theme palette as packed RGB565 ─────────────────────
+    // Apps use these to stay consistent with system widgets across dark/light.
+    if (name == "theme.bg")       return OSAVal((double)Theme::bg());
+    if (name == "theme.surface")  return OSAVal((double)Theme::surface());
+    if (name == "theme.header")   return OSAVal((double)Theme::header());
+    if (name == "theme.divider")  return OSAVal((double)Theme::divider());
+    if (name == "theme.divider2") return OSAVal((double)Theme::divider2());
+    if (name == "theme.text")     return OSAVal((double)Theme::text());
+    if (name == "theme.subtext")  return OSAVal((double)Theme::subtext());
+    if (name == "theme.hint")     return OSAVal((double)Theme::hint());
+
+    // Grid geometry — keeps the layout source of truth in C++.
+    if (name == "home.iconX") {
+        int i = iN(0); int col = i % 4;
+        return OSAVal((double)(12 + col * 55));
+    }
+    if (name == "home.iconY") {
+        int i = iN(0); int row = i / 4;
+        return OSAVal((double)(30 + row * 80));
     }
 
     // Unknown built-in (user funcs were handled at the top)

@@ -1,28 +1,18 @@
 #include "OSAApp.h"
 #include "Theme.h"
-#include "../Services/NotificationService.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
-extern NotificationService notifyService;
-
-// Called by the runtime's notify() built-in
-void osa_notify(const char* msg) {
-    notifyService.push(msg);
-}
+// notify() builtin used to forward here; with NotificationService removed
+// it's a silent no-op (the builtin itself still exists for back-compat).
+void osa_notify(const char*) {}
 
 OSAApp::OSAApp(TFT_eSPI* t, XPT2046_Touchscreen* touchscreen)
-    : runtime(t, touchscreen)
-{
-    tft  = t;
-    ts   = touchscreen;
-    name = "App";
-    iconColor = tft->color565(255, 149, 0);
-    isApp     = true;
-}
+    : tft(t), ts(touchscreen), runtime(t, touchscreen)
+{}
 
 bool OSAApp::loadScript(const String& path) {
-    scriptLoaded = false;
-    showDone     = false;
-    wantsExit    = false;
+    scriptLoaded = showDone = wantsExit = false;
     if (!runtime.loadScript(path)) return false;
     name = runtime.appName.length() > 0 ? runtime.appName : "App";
     scriptLoaded = true;
@@ -42,18 +32,14 @@ void OSAApp::drawHeaderBar() {
 void OSAApp::drawErrorScreen() {
     tft->fillScreen(Theme::bg());
     drawHeaderBar();
-
     tft->setTextFont(2); tft->setTextSize(1);
     tft->setTextColor(tft->color565(255, 59, 48));
     tft->setTextDatum(MC_DATUM);
     tft->drawString("Script Error", 120, 90);
 
-    tft->setTextColor(Theme::subtext());
-    tft->setTextFont(1);
+    tft->setTextColor(Theme::subtext()); tft->setTextFont(1);
     String err = runtime.getError();
-    // Word-wrap crude split at ~30 chars
-    int start = 0;
-    int y = 115;
+    int start = 0, y = 115;
     while (start < (int)err.length() && y < 290) {
         int end = min(start + 30, (int)err.length());
         tft->drawString(err.substring(start, end), 120, y);
@@ -62,7 +48,6 @@ void OSAApp::drawErrorScreen() {
 }
 
 void OSAApp::show() {
-    Serial.printf("[OSA] show() scriptLoaded=%d\n", scriptLoaded ? 1 : 0);
     if (!scriptLoaded) {
         tft->fillScreen(Theme::bg());
         drawHeaderBar();
@@ -70,46 +55,70 @@ void OSAApp::show() {
         tft->drawString("No script loaded", 120, 160);
         return;
     }
-
     showDone = false;
     tft->fillScreen(Theme::bg());
-
-    Serial.println("[OSA] calling runtime.runShow()");
     runtime.runShow();
-    Serial.println("[OSA] runtime.runShow() returned");
-
-    if (runtime.hasError()) {
-        drawErrorScreen();
-        return;
-    }
-
-    // If no loop section, show is all there is — draw a header so it doesn't look bare
-    if (!runtime.hasLoop()) {
-        // Script has already drawn; nothing extra needed
-    }
-
+    if (runtime.hasError()) { drawErrorScreen(); return; }
     showDone = true;
 }
 
 void OSAApp::update() {
-    if (!scriptLoaded || !showDone) return;
-    if (runtime.hasError()) return;
-
-    if (!runtime.hasLoop()) {
-        // One-shot script — nothing to update
-        return;
-    }
-
+    if (!scriptLoaded || !showDone || runtime.hasError()) return;
+    if (!runtime.hasLoop()) return;
     if (!runtime.runUpdate()) {
-        // Script ended (exit(), error, or universal swipe-up gesture).
         if (runtime.hasError()) drawErrorScreen();
         showDone = false;
-        wantsExit = true;  // main.cpp polls this and returns to home
+        wantsExit = true;
     }
 }
 
-void OSAApp::drawHeader() {
-    // Called when a notification banner is dismissed — redraw just the header area.
-    // Scripts can draw anywhere so we just redraw a minimal top bar.
-    drawHeaderBar();
+void OSAApp::drawHeader() { drawHeaderBar(); }
+
+// ─── Parallel pre-render ─────────────────────────────────────────────────────
+// Runs the script's setup section into a sprite on core 0 while the
+// open-animation plays on core 1. finishPreRender() blits the result.
+
+void OSAApp::preRenderTaskFn(void* arg) {
+    OSAApp* self = (OSAApp*)arg;
+    self->runtime.runShow();
+    self->preRenderDone = true;
+    vTaskDelete(nullptr);
+}
+
+void OSAApp::beginPreRender() {
+    if (!scriptLoaded) return;
+    preRenderDone   = false;
+    preRenderSprite = new TFT_eSprite(tft);
+    if (!preRenderSprite) return;
+    preRenderSprite->setColorDepth(8);
+    if (!preRenderSprite->createSprite(240, 320)) {
+        delete preRenderSprite;
+        preRenderSprite = nullptr;
+        return;
+    }
+    preRenderSprite->fillSprite(TFT_BLACK);
+    runtime.setActiveSprite(preRenderSprite);
+    BaseType_t r = xTaskCreatePinnedToCore(preRenderTaskFn, "preRender",
+                                           8192, this, 1, nullptr, 0);
+    if (r != pdPASS) {
+        runtime.setActiveSprite(nullptr);
+        preRenderSprite->deleteSprite();
+        delete preRenderSprite;
+        preRenderSprite = nullptr;
+    }
+}
+
+bool OSAApp::finishPreRender() {
+    if (!preRenderSprite) return false;
+    while (!preRenderDone) { yield(); delay(2); }
+    bool ours = (runtime.getActiveSprite() == preRenderSprite);
+    if (ours) {
+        preRenderSprite->pushSprite(0, 0);
+        runtime.setActiveSprite(nullptr);
+        preRenderSprite->deleteSprite();
+        delete preRenderSprite;
+    }
+    preRenderSprite = nullptr;
+    showDone = true;
+    return ours;
 }

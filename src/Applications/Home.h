@@ -4,42 +4,52 @@
 #include <Arduino.h>
 #include <TFT_eSPI.h>
 #include <XPT2046_Touchscreen.h>
-#include "App.h"
 
+// Pure data tile. No virtual hierarchy — folders are just tiles with
+// isFolder=true plus a dynamically-allocated children array (each child is
+// itself a HomeTile copy, never a shared pointer).
+struct HomeTile {
+    String    name;
+    String    scriptPath;   // empty for folders
+    uint16_t  color         = 0xFFFF;
+    bool      isFolder      = false;
+    HomeTile* children      = nullptr;
+    int       childCount    = 0;
+    int       childCap      = 0;
+
+    // Take ownership of `c` into this folder. Returns false if full.
+    bool addChild(const HomeTile& c);
+    // Frees the children array (called from Home dtor + delete-folder path).
+    void freeChildren();
+};
+
+// Pure data store for the home grid. /system/apps/home.osa does all rendering
+// and gesture handling via home.* runtime builtins.
 class Home {
-private:
+public:
     static const int MAX_APPS = 16;
 
-    TFT_eSPI* tft;
-    XPT2046_Touchscreen* ts;
+    HomeTile tiles[MAX_APPS];
+    int      appCount = 0;
 
-    App* apps[MAX_APPS];
-    int appCount;
+    // Set by anim.openTile; read by main.cpp on close transitions.
+    int      lastLaunchX     = 120;
+    int      lastLaunchY     = 160;
+    uint16_t lastLaunchColor = TFT_WHITE;
 
-    bool wasTouched = false;
-    bool isDragging = false;
-    bool dragPositionSet = false;
-    int draggedIndex = -1;
-    int dragX = 0;
-    int dragY = 0;
-    unsigned long touchStartTime = 0;
-
-    void drawApps(bool renderingDrag);
-    int getAppIndexAt(int x, int y);
-
-public:
     Home(TFT_eSPI* tftInstance, XPT2046_Touchscreen* tsInstance);
 
-    void addApp(App* newApp);
-    void show(bool renderingDrag = false);
-    void drawStatusBar();
-    App* update();
+    // Build a leaf tile from a discovered .osa script + add to grid.
+    void addScript(const String& scriptPath, const String& displayName, uint16_t color);
 
-    // Persistence — call applyOrder() after all apps are registered to
-    // restore the user's last arrangement. saveOrder() is called internally
-    // after a successful drag-drop so callers don't need to wire it up.
+    // applyOrder() restores the user's last arrangement; saveOrder() is
+    // called from the OSA-side home.* mutation builtins after every change.
     void applyOrder();
     void saveOrder();
+
+private:
+    TFT_eSPI*            tft;
+    XPT2046_Touchscreen* ts;
 };
 
 #endif
