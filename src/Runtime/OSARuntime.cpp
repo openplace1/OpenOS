@@ -425,6 +425,773 @@ String OSAVal::toString() const { return isNum ? numToStr(num) : str; }
 double OSAVal::toNum()    const { return isNum ? num : str.toDouble(); }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Bytecode VM — Phase A skeleton
+// ═══════════════════════════════════════════════════════════════════════════════
+
+void OSABytecode::clear() {
+    codeLen = numPoolLen = strPoolLen = namePoolLen = 0;
+    setupEnd = 0;
+    loopStart = loopEnd = -1;
+    valid = false;
+    // Pool entries dropped — Arduino's String dtor frees the heap backing.
+    for (int i = 0; i < OSA_STR_CONST;  i++) strPool[i]  = "";
+    for (int i = 0; i < OSA_NAME_CONST; i++) namePool[i] = "";
+}
+
+int OSARuntime::bcAddNum(double v) {
+    for (int i = 0; i < bc.numPoolLen; i++)
+        if (bc.numPool[i] == v) return i;
+    if (bc.numPoolLen >= OSA_NUM_CONST) return -1;
+    bc.numPool[bc.numPoolLen] = v;
+    return bc.numPoolLen++;
+}
+
+int OSARuntime::bcAddStr(const String& s) {
+    for (int i = 0; i < bc.strPoolLen; i++)
+        if (bc.strPool[i] == s) return i;
+    if (bc.strPoolLen >= OSA_STR_CONST) return -1;
+    bc.strPool[bc.strPoolLen] = s;
+    return bc.strPoolLen++;
+}
+
+int OSARuntime::bcAddName(const String& s) {
+    for (int i = 0; i < bc.namePoolLen; i++)
+        if (bc.namePool[i] == s) return i;
+    if (bc.namePoolLen >= OSA_NAME_CONST) return -1;
+    bc.namePool[bc.namePoolLen] = s;
+    return bc.namePoolLen++;
+}
+
+void OSARuntime::vmPush(const OSAVal& v) {
+    if (vmSp >= OSA_STACK_SIZE) { setError(-1, "VM stack overflow"); return; }
+    vmStack[vmSp++] = v;
+}
+
+OSAVal OSARuntime::vmPop() {
+    if (vmSp == 0) { setError(-1, "VM stack underflow"); return OSAVal(); }
+    return vmStack[--vmSp];
+}
+
+int OSARuntime::bcFindMatchingEnd(int n) { return findMatchingEnd(n); }
+int OSARuntime::bcFindNextBranch(int n)  { return findNextBranch(n); }
+
+// ─── Compiler helpers ────────────────────────────────────────────────────────
+namespace {
+
+static void emit1(OSABytecode& bc, uint8_t op) {
+    if (bc.codeLen + 1 > OSA_BC_MAX) return;
+    bc.code[bc.codeLen++] = op;
+}
+static void emit3(OSABytecode& bc, uint8_t op, int16_t operand) {
+    if (bc.codeLen + 3 > OSA_BC_MAX) return;
+    bc.code[bc.codeLen++] = op;
+    bc.code[bc.codeLen++] = (uint8_t)(operand & 0xFF);
+    bc.code[bc.codeLen++] = (uint8_t)((operand >> 8) & 0xFF);
+}
+static void emit4(OSABytecode& bc, uint8_t op, int16_t operand, uint8_t b) {
+    emit3(bc, op, operand);
+    if (bc.codeLen + 1 > OSA_BC_MAX) return;
+    bc.code[bc.codeLen++] = b;
+}
+static int16_t readI16(const uint8_t* p) {
+    return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+static void patch16(OSABytecode& bc, int at, int16_t v) {
+    bc.code[at]     = (uint8_t)(v & 0xFF);
+    bc.code[at + 1] = (uint8_t)((v >> 8) & 0xFF);
+}
+
+// Tokenizer for one source line.
+enum TK { TK_END, TK_NUM, TK_STR, TK_IDENT,
+          TK_LP, TK_RP, TK_COMMA,
+          TK_PLUS, TK_MINUS, TK_STAR, TK_SLASH, TK_PERCENT,
+          TK_EQ, TK_EQEQ, TK_NE, TK_LT, TK_LE, TK_GT, TK_GE,
+          TK_AND, TK_OR, TK_NOT };
+struct Tok { TK type; double num; String str; };
+
+struct Lex {
+    const String& s;
+    int p;
+    Lex(const String& src) : s(src), p(0) {}
+    void skip() { while (p < (int)s.length() && (s[p] == ' ' || s[p] == '\t')) p++; }
+    Tok peek() { int save = p; Tok t = next(); p = save; return t; }
+    Tok next() {
+        skip();
+        Tok t; t.type = TK_END;
+        if (p >= (int)s.length()) return t;
+        char c = s[p];
+        if (c >= '0' && c <= '9') {
+            int q = p; bool seen = false;
+            while (q < (int)s.length() && ((s[q] >= '0' && s[q] <= '9') || s[q] == '.')) {
+                if (s[q] == '.') seen = true;
+                q++;
+            }
+            t.type = TK_NUM; t.num = s.substring(p, q).toDouble();
+            p = q; (void)seen; return t;
+        }
+        if (c == '"') {
+            int q = p + 1; String acc;
+            while (q < (int)s.length() && s[q] != '"') {
+                if (s[q] == '\\' && q + 1 < (int)s.length()) {
+                    char n = s[q + 1];
+                    if      (n == 'n')  acc += '\n';
+                    else if (n == 't')  acc += '\t';
+                    else if (n == '"')  acc += '"';
+                    else if (n == '\\') acc += '\\';
+                    else acc += n;
+                    q += 2;
+                } else { acc += s[q]; q++; }
+            }
+            p = q + 1;
+            t.type = TK_STR; t.str = acc; return t;
+        }
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_') {
+            int q = p;
+            while (q < (int)s.length() && ((s[q] >= 'a' && s[q] <= 'z') ||
+                   (s[q] >= 'A' && s[q] <= 'Z') || (s[q] >= '0' && s[q] <= '9') ||
+                   s[q] == '_' || s[q] == '.')) q++;
+            t.str = s.substring(p, q); p = q;
+            if      (t.str == "and") t.type = TK_AND;
+            else if (t.str == "or")  t.type = TK_OR;
+            else if (t.str == "not") t.type = TK_NOT;
+            else                     t.type = TK_IDENT;
+            return t;
+        }
+        p++;
+        switch (c) {
+            case '(': t.type = TK_LP; return t;
+            case ')': t.type = TK_RP; return t;
+            case ',': t.type = TK_COMMA; return t;
+            case '+': t.type = TK_PLUS; return t;
+            case '-': t.type = TK_MINUS; return t;
+            case '*': t.type = TK_STAR; return t;
+            case '/': t.type = TK_SLASH; return t;
+            case '%': t.type = TK_PERCENT; return t;
+            case '!': if (p < (int)s.length() && s[p] == '=') { p++; t.type = TK_NE; }
+                      else                                    { t.type = TK_NOT; }
+                      return t;
+            case '<': if (p < (int)s.length() && s[p] == '=') { p++; t.type = TK_LE; }
+                      else                                    { t.type = TK_LT; }
+                      return t;
+            case '>': if (p < (int)s.length() && s[p] == '=') { p++; t.type = TK_GE; }
+                      else                                    { t.type = TK_GT; }
+                      return t;
+            case '=': if (p < (int)s.length() && s[p] == '=') { p++; t.type = TK_EQEQ; }
+                      else                                    { t.type = TK_EQ; }
+                      return t;
+        }
+        return t;
+    }
+};
+
+} // anonymous namespace
+
+// Forward refs for recursive descent.
+static bool compExpr(OSARuntime* rt, Lex& lex);
+static bool compOr  (OSARuntime* rt, Lex& lex);
+static bool compAnd (OSARuntime* rt, Lex& lex);
+static bool compCmp (OSARuntime* rt, Lex& lex);
+static bool compSum (OSARuntime* rt, Lex& lex);
+static bool compMul (OSARuntime* rt, Lex& lex);
+static bool compUny (OSARuntime* rt, Lex& lex);
+static bool compPri (OSARuntime* rt, Lex& lex);
+
+// Friend-ish access — these emit through rt->bc and use rt->bcAdd*.
+// Implementations below use OSARuntime's bc/bcAddNum/bcAddStr/bcAddName.
+
+// Per-loop frame for tracking break/continue jumps to patch.
+struct LoopFrame {
+    int startPc;          // jump target for `continue`
+    int breaks[16];       // PCs of OP_JMP operand bytes to patch with end-pc
+    int breakCount = 0;
+};
+static LoopFrame g_loopStack[OSA_LOOP_DEPTH];
+static int       g_loopDepth = 0;
+
+// Recursive forward refs.
+static bool compileLineRange(OSARuntime* rt, int from, int to);
+static bool compileLineAt(OSARuntime* rt, int& i, int rangeEnd);
+
+bool OSARuntime::compile() {
+    bc.clear();
+    g_loopDepth = 0;
+
+    // Find function spans + main loop position the same way loadScript does.
+    int topLoopStart = -1, topLoopEnd = -1;
+    {
+        int depth = 0;
+        for (int i = 0; i < lineCount; i++) {
+            const String& t = lines[i];
+            if (depth == 0 && t == "loop") { topLoopStart = i; break; }
+            if (isBlockOpen(t)) depth++;
+            else if (t == "end" && depth > 0) depth--;
+        }
+    }
+    if (topLoopStart >= 0) topLoopEnd = findMatchingEnd(topLoopStart);
+
+    // Setup section — everything up to the main loop, skipping function defs.
+    int setupEnd = (topLoopStart >= 0) ? topLoopStart : lineCount;
+    if (!compileLineRange(this, 0, setupEnd)) { bc.clear(); return false; }
+    emit1(bc, OP_HALT);
+    bc.setupEnd = bc.codeLen;
+
+    // Main loop body.
+    if (topLoopStart >= 0 && topLoopEnd > topLoopStart) {
+        bc.loopStart = bc.codeLen;
+        emit1(bc, OP_LOOP_TICK);
+        if (!compileLineRange(this, topLoopStart + 1, topLoopEnd)) {
+            bc.clear(); return false;
+        }
+        int jumpAt = bc.codeLen;
+        emit3(bc, OP_JMP, 0);
+        int16_t back = (int16_t)(bc.loopStart - (jumpAt + 3));
+        patch16(bc, jumpAt + 1, back);
+        bc.loopEnd = bc.codeLen;
+    }
+
+    // Function bodies — appended after the main bytecode. Each starts at
+    // funcs[i].bcStart and ends with OP_RET_VOID (in case the body never
+    // returns explicitly). Callers reach them through OP_CALL_USER.
+    for (int f = 0; f < funcCount; f++) {
+        funcs[f].bcStart = bc.codeLen;
+        if (!compileLineRange(this, funcs[f].bodyStart, funcs[f].bodyEnd)) {
+            bc.clear(); return false;
+        }
+        emit1(bc, OP_RET_VOID);
+    }
+
+    bc.valid = true;
+    return true;
+}
+
+static bool compileLineRange(OSARuntime* rt, int from, int to) {
+    int i = from;
+    while (i < to) {
+        if (!compileLineAt(rt, i, to)) return false;
+    }
+    return true;
+}
+
+static bool compileLineAt(OSARuntime* rt, int& i, int rangeEnd) {
+    String s = rt->bcLines()[i]; s.trim();
+    if (s.length() == 0 || s[0] == '#') { i++; return true; }
+
+    // def name(...) — top-level compile() emits bodies separately at the end
+    // of the bytecode. Here we just skip past the matching `end`.
+    if (s.startsWith("def ")) {
+        int end = rt->bcFindMatchingEnd(i);
+        if (end < 0 || end > rangeEnd) return false;
+        i = end + 1;
+        return true;
+    }
+
+    // ── if / elif / else / end ──────────────────────────────────────────────
+    if (s.startsWith("if ")) {
+        // Bail out on inline-if for now: `if X then stmt end` on one line.
+        // The block form (then-newline-…-newline-end) is supported below.
+        int thenPos = s.indexOf("then");
+        if (thenPos < 0) return false;
+        String tail = s.substring(thenPos + 4); tail.trim();
+        if (tail.length() > 0) return false;  // inline → fall back to tree-walker
+
+        int finalEnd = rt->bcFindMatchingEnd(i);
+        if (finalEnd < 0 || finalEnd > rangeEnd) return false;
+
+        int branchPc = -1;            // current JMP_IF_FALSE operand to patch
+        int forwardJumps[16];         // JMP-to-end operands to patch when done
+        int forwardCount = 0;
+
+        int j = i;
+        while (j < finalEnd) {
+            String h = rt->bcLines()[j]; h.trim();
+            if (h.startsWith("if ") || h.startsWith("elif ")) {
+                if (branchPc >= 0)
+                    patch16(rt->bc, branchPc, (int16_t)(rt->bc.codeLen - (branchPc + 2)));
+                int prefix = h.startsWith("if ") ? 3 : 5;
+                int tp = h.indexOf("then");
+                if (tp < 0) return false;
+                String cond = h.substring(prefix, tp); cond.trim();
+                Lex lex(cond);
+                if (!compExpr(rt, lex)) return false;
+                emit3(rt->bc, OP_JMP_IF_FALSE, 0);
+                branchPc = rt->bc.codeLen - 2;
+
+                int next = rt->bcFindNextBranch(j + 1);
+                if (next < 0 || next > finalEnd) return false;
+                if (!compileLineRange(rt, j + 1, next)) return false;
+
+                if (forwardCount >= 16) return false;
+                emit3(rt->bc, OP_JMP, 0);
+                forwardJumps[forwardCount++] = rt->bc.codeLen - 2;
+                j = next;
+            } else if (h == "else") {
+                if (branchPc >= 0) {
+                    patch16(rt->bc, branchPc, (int16_t)(rt->bc.codeLen - (branchPc + 2)));
+                    branchPc = -1;
+                }
+                if (!compileLineRange(rt, j + 1, finalEnd)) return false;
+                j = finalEnd;
+            } else {
+                return false;          // unexpected mid-block content
+            }
+        }
+        if (branchPc >= 0)
+            patch16(rt->bc, branchPc, (int16_t)(rt->bc.codeLen - (branchPc + 2)));
+        for (int k = 0; k < forwardCount; k++)
+            patch16(rt->bc, forwardJumps[k],
+                    (int16_t)(rt->bc.codeLen - (forwardJumps[k] + 2)));
+        i = finalEnd + 1;
+        return true;
+    }
+
+    // ── while cond do … end ────────────────────────────────────────────────
+    if (s.startsWith("while ")) {
+        int doPos = s.indexOf(" do");
+        if (doPos < 0) return false;
+        String tail = s.substring(doPos + 3); tail.trim();
+        if (tail.length() > 0) return false;  // inline-while not supported here
+        String cond = s.substring(6, doPos); cond.trim();
+        int finalEnd = rt->bcFindMatchingEnd(i);
+        if (finalEnd < 0 || finalEnd > rangeEnd) return false;
+
+        int topPc = rt->bc.codeLen;
+        Lex lex(cond);
+        if (!compExpr(rt, lex)) return false;
+        emit3(rt->bc, OP_JMP_IF_FALSE, 0);
+        int exitPatch = rt->bc.codeLen - 2;
+
+        if (g_loopDepth >= OSA_LOOP_DEPTH) return false;
+        { LoopFrame& fr0 = g_loopStack[g_loopDepth++]; fr0.startPc = topPc; fr0.breakCount = 0; }
+
+        if (!compileLineRange(rt, i + 1, finalEnd)) { g_loopDepth--; return false; }
+
+        int backAt = rt->bc.codeLen;
+        emit3(rt->bc, OP_JMP, 0);
+        patch16(rt->bc, backAt + 1, (int16_t)(topPc - (backAt + 3)));
+
+        patch16(rt->bc, exitPatch, (int16_t)(rt->bc.codeLen - (exitPatch + 2)));
+        LoopFrame& fr = g_loopStack[--g_loopDepth];
+        for (int k = 0; k < fr.breakCount; k++)
+            patch16(rt->bc, fr.breaks[k], (int16_t)(rt->bc.codeLen - (fr.breaks[k] + 2)));
+
+        i = finalEnd + 1;
+        return true;
+    }
+
+    // ── for IDENT = a to b do … end ────────────────────────────────────────
+    if (s.startsWith("for ")) {
+        int eqPos = s.indexOf('=');
+        int toPos = s.indexOf(" to ");
+        int doPos = s.indexOf(" do");
+        if (eqPos < 0 || toPos < 0 || doPos < 0) return false;
+        String tail = s.substring(doPos + 3); tail.trim();
+        if (tail.length() > 0) return false;
+        String var = s.substring(4, eqPos); var.trim();
+        String startE = s.substring(eqPos + 1, toPos); startE.trim();
+        String endE   = s.substring(toPos + 4, doPos); endE.trim();
+        int finalEnd = rt->bcFindMatchingEnd(i);
+        if (finalEnd < 0 || finalEnd > rangeEnd) return false;
+        int nameIdx = rt->bcAddName(var);
+
+        // i = start
+        { Lex lex(startE); if (!compExpr(rt, lex)) return false; }
+        emit3(rt->bc, OP_DECLARE_VAR, (int16_t)nameIdx);
+
+        // Compute end once, store in a hidden var.
+        String endVar = String("__for_end_") + i;
+        int endIdx = rt->bcAddName(endVar);
+        { Lex lex(endE); if (!compExpr(rt, lex)) return false; }
+        emit3(rt->bc, OP_DECLARE_VAR, (int16_t)endIdx);
+
+        int topPc = rt->bc.codeLen;
+        // while i <= __end__ do
+        emit3(rt->bc, OP_LOAD_VAR, (int16_t)nameIdx);
+        emit3(rt->bc, OP_LOAD_VAR, (int16_t)endIdx);
+        emit1(rt->bc, OP_LE);
+        emit3(rt->bc, OP_JMP_IF_FALSE, 0);
+        int exitPatch = rt->bc.codeLen - 2;
+
+        if (g_loopDepth >= OSA_LOOP_DEPTH) return false;
+        { LoopFrame& fr0 = g_loopStack[g_loopDepth++]; fr0.startPc = topPc; fr0.breakCount = 0; }
+
+        if (!compileLineRange(rt, i + 1, finalEnd)) { g_loopDepth--; return false; }
+
+        // i = i + 1
+        emit3(rt->bc, OP_LOAD_VAR, (int16_t)nameIdx);
+        emit1(rt->bc, OP_PUSH_NUM1);
+        emit1(rt->bc, OP_ADD);
+        emit3(rt->bc, OP_STORE_VAR, (int16_t)nameIdx);
+
+        int backAt = rt->bc.codeLen;
+        emit3(rt->bc, OP_JMP, 0);
+        patch16(rt->bc, backAt + 1, (int16_t)(topPc - (backAt + 3)));
+
+        patch16(rt->bc, exitPatch, (int16_t)(rt->bc.codeLen - (exitPatch + 2)));
+        LoopFrame& fr = g_loopStack[--g_loopDepth];
+        for (int k = 0; k < fr.breakCount; k++)
+            patch16(rt->bc, fr.breaks[k], (int16_t)(rt->bc.codeLen - (fr.breaks[k] + 2)));
+
+        i = finalEnd + 1;
+        return true;
+    }
+
+    // ── break / continue ───────────────────────────────────────────────────
+    if (s == "break") {
+        if (g_loopDepth == 0) return false;
+        LoopFrame& fr = g_loopStack[g_loopDepth - 1];
+        if (fr.breakCount >= 16) return false;
+        emit3(rt->bc, OP_JMP, 0);
+        fr.breaks[fr.breakCount++] = rt->bc.codeLen - 2;
+        i++;
+        return true;
+    }
+    if (s == "continue") {
+        if (g_loopDepth == 0) return false;
+        LoopFrame& fr = g_loopStack[g_loopDepth - 1];
+        int at = rt->bc.codeLen;
+        emit3(rt->bc, OP_JMP, 0);
+        patch16(rt->bc, at + 1, (int16_t)(fr.startPc - (at + 3)));
+        i++;
+        return true;
+    }
+
+    // ── return / exit ──────────────────────────────────────────────────────
+    if (s == "exit()" || s == "exit") {
+        emit1(rt->bc, OP_EXIT);
+        i++;
+        return true;
+    }
+    if (s == "return" || s.startsWith("return ")) {
+        String rhs = s.length() > 6 ? s.substring(7) : String(""); rhs.trim();
+        if (rhs.length() == 0) { emit1(rt->bc, OP_RET_VOID); i++; return true; }
+        Lex lex(rhs);
+        if (!compExpr(rt, lex)) return false;
+        emit1(rt->bc, OP_RET);
+        i++;
+        return true;
+    }
+
+    // Nested `loop` keyword — only top-level supported.
+    if (s == "loop") return false;
+
+    // ── Expression / assignment / var decl ─────────────────────────────────
+    {
+        Lex lex(s);
+        Tok first = lex.peek();
+        if (first.type == TK_IDENT && first.str == "var") {
+            lex.next();
+            Tok name = lex.next();
+            if (name.type != TK_IDENT) return false;
+            Tok eq = lex.next();
+            if (eq.type != TK_EQ) return false;
+            if (!compExpr(rt, lex)) return false;
+            emit3(rt->bc, OP_DECLARE_VAR, (int16_t)rt->bcAddName(name.str));
+            i++;
+            return true;
+        }
+        if (first.type == TK_IDENT) {
+            int save = lex.p;
+            lex.next();
+            Tok maybeEq = lex.next();
+            if (maybeEq.type == TK_EQ) {
+                if (!compExpr(rt, lex)) return false;
+                emit3(rt->bc, OP_STORE_VAR, (int16_t)rt->bcAddName(first.str));
+                i++;
+                return true;
+            }
+            lex.p = save;
+        }
+        if (!compExpr(rt, lex)) return false;
+        emit1(rt->bc, OP_POP);
+        i++;
+        return true;
+    }
+}
+
+// Recursive descent — mirrors evalOr/evalAnd/… and emits bytecode.
+
+static bool compExpr(OSARuntime* rt, Lex& lex) { return compOr(rt, lex); }
+
+static bool compOr(OSARuntime* rt, Lex& lex) {
+    if (!compAnd(rt, lex)) return false;
+    while (lex.peek().type == TK_OR) { lex.next();
+        if (!compAnd(rt, lex)) return false;
+        emit1(rt->bc, OP_OR);
+    }
+    return true;
+}
+static bool compAnd(OSARuntime* rt, Lex& lex) {
+    if (!compCmp(rt, lex)) return false;
+    while (lex.peek().type == TK_AND) { lex.next();
+        if (!compCmp(rt, lex)) return false;
+        emit1(rt->bc, OP_AND);
+    }
+    return true;
+}
+static bool compCmp(OSARuntime* rt, Lex& lex) {
+    if (!compSum(rt, lex)) return false;
+    Tok t = lex.peek();
+    if (t.type == TK_EQEQ || t.type == TK_NE || t.type == TK_LT ||
+        t.type == TK_LE   || t.type == TK_GT || t.type == TK_GE) {
+        lex.next();
+        if (!compSum(rt, lex)) return false;
+        switch (t.type) {
+            case TK_EQEQ: emit1(rt->bc, OP_EQ); break;
+            case TK_NE:   emit1(rt->bc, OP_NE); break;
+            case TK_LT:   emit1(rt->bc, OP_LT); break;
+            case TK_LE:   emit1(rt->bc, OP_LE); break;
+            case TK_GT:   emit1(rt->bc, OP_GT); break;
+            case TK_GE:   emit1(rt->bc, OP_GE); break;
+            default: break;
+        }
+    }
+    return true;
+}
+static bool compSum(OSARuntime* rt, Lex& lex) {
+    if (!compMul(rt, lex)) return false;
+    while (true) {
+        Tok t = lex.peek();
+        if (t.type == TK_PLUS)       { lex.next(); if (!compMul(rt, lex)) return false; emit1(rt->bc, OP_ADD); }
+        else if (t.type == TK_MINUS) { lex.next(); if (!compMul(rt, lex)) return false; emit1(rt->bc, OP_SUB); }
+        else break;
+    }
+    return true;
+}
+static bool compMul(OSARuntime* rt, Lex& lex) {
+    if (!compUny(rt, lex)) return false;
+    while (true) {
+        Tok t = lex.peek();
+        if      (t.type == TK_STAR)    { lex.next(); if (!compUny(rt, lex)) return false; emit1(rt->bc, OP_MUL); }
+        else if (t.type == TK_SLASH)   { lex.next(); if (!compUny(rt, lex)) return false; emit1(rt->bc, OP_DIV); }
+        else if (t.type == TK_PERCENT) { lex.next(); if (!compUny(rt, lex)) return false; emit1(rt->bc, OP_MOD); }
+        else break;
+    }
+    return true;
+}
+static bool compUny(OSARuntime* rt, Lex& lex) {
+    Tok t = lex.peek();
+    if (t.type == TK_MINUS) { lex.next(); if (!compUny(rt, lex)) return false; emit1(rt->bc, OP_NEG); return true; }
+    if (t.type == TK_NOT)   { lex.next(); if (!compUny(rt, lex)) return false; emit1(rt->bc, OP_NOT); return true; }
+    return compPri(rt, lex);
+}
+static bool compPri(OSARuntime* rt, Lex& lex) {
+    Tok t = lex.next();
+    if (t.type == TK_NUM) {
+        if      (t.num == 0.0) emit1(rt->bc, OP_PUSH_NUM0);
+        else if (t.num == 1.0) emit1(rt->bc, OP_PUSH_NUM1);
+        else                   emit3(rt->bc, OP_PUSH_NUM, (int16_t)rt->bcAddNum(t.num));
+        return true;
+    }
+    if (t.type == TK_STR) {
+        emit3(rt->bc, OP_PUSH_STR, (int16_t)rt->bcAddStr(t.str));
+        return true;
+    }
+    if (t.type == TK_LP) {
+        if (!compExpr(rt, lex)) return false;
+        if (lex.next().type != TK_RP) return false;
+        return true;
+    }
+    if (t.type == TK_IDENT) {
+        // Function call?
+        if (lex.peek().type == TK_LP) {
+            lex.next();   // eat '('
+            int argc = 0;
+            if (lex.peek().type != TK_RP) {
+                while (true) {
+                    if (!compExpr(rt, lex)) return false;
+                    argc++;
+                    Tok next = lex.peek();
+                    if (next.type == TK_COMMA) { lex.next(); continue; }
+                    break;
+                }
+            }
+            if (lex.next().type != TK_RP) return false;
+            // Prefer a user-defined function over a builtin of the same name.
+            int userIdx = -1;
+            for (int k = 0; k < rt->bcFuncCount(); k++)
+                if (rt->bcFuncName(k) == t.str) { userIdx = k; break; }
+            if (userIdx >= 0) {
+                emit4(rt->bc, OP_CALL_USER, (int16_t)userIdx, (uint8_t)argc);
+            } else {
+                emit4(rt->bc, OP_CALL_BUILTIN,
+                      (int16_t)rt->bcAddName(t.str), (uint8_t)argc);
+            }
+            return true;
+        }
+        // Plain variable read.
+        emit3(rt->bc, OP_LOAD_VAR, (int16_t)rt->bcAddName(t.str));
+        return true;
+    }
+    return false;
+}
+
+// ─── VM exec ────────────────────────────────────────────────────────────────
+bool OSARuntime::exec(int pcStart, int pcEnd) {
+    if (!bc.valid) return false;
+    int pc = pcStart;
+    vmSp = 0;
+    while (pc < pcEnd && !exitFlag && errLine < 0) {
+        uint8_t op = bc.code[pc++];
+        switch (op) {
+            case OP_NOP: break;
+            case OP_PUSH_NUM: {
+                int idx = (uint16_t)readI16(bc.code + pc); pc += 2;
+                vmPush(OSAVal(bc.numPool[idx]));
+                break;
+            }
+            case OP_PUSH_STR: {
+                int idx = (uint16_t)readI16(bc.code + pc); pc += 2;
+                vmPush(OSAVal(bc.strPool[idx]));
+                break;
+            }
+            case OP_PUSH_NUM0: vmPush(OSAVal(0.0)); break;
+            case OP_PUSH_NUM1: vmPush(OSAVal(1.0)); break;
+            case OP_POP:       (void)vmPop(); break;
+            case OP_DUP:       if (vmSp > 0) vmStack[vmSp] = vmStack[vmSp-1], vmSp++; break;
+            case OP_LOAD_VAR: {
+                int idx = (uint16_t)readI16(bc.code + pc); pc += 2;
+                vmPush(getVar(bc.namePool[idx]));
+                break;
+            }
+            case OP_STORE_VAR: {
+                int idx = (uint16_t)readI16(bc.code + pc); pc += 2;
+                setVar(bc.namePool[idx], vmPop());
+                break;
+            }
+            case OP_DECLARE_VAR: {
+                int idx = (uint16_t)readI16(bc.code + pc); pc += 2;
+                declareVar(bc.namePool[idx], vmPop());
+                break;
+            }
+            case OP_ADD: { OSAVal b = vmPop(), a = vmPop();
+                if (a.isNum && b.isNum) vmPush(OSAVal(a.num + b.num));
+                else                    vmPush(OSAVal(a.toString() + b.toString()));
+                break;
+            }
+            case OP_SUB: { OSAVal b = vmPop(), a = vmPop(); vmPush(OSAVal(a.toNum() - b.toNum())); break; }
+            case OP_MUL: { OSAVal b = vmPop(), a = vmPop(); vmPush(OSAVal(a.toNum() * b.toNum())); break; }
+            case OP_DIV: { OSAVal b = vmPop(), a = vmPop();
+                double db = b.toNum();
+                vmPush(OSAVal(db == 0.0 ? 0.0 : a.toNum() / db));
+                break;
+            }
+            case OP_MOD: { OSAVal b = vmPop(), a = vmPop();
+                double db = b.toNum();
+                vmPush(OSAVal(db == 0.0 ? 0.0 : fmod(a.toNum(), db)));
+                break;
+            }
+            case OP_NEG: { OSAVal a = vmPop(); vmPush(OSAVal(-a.toNum())); break; }
+            case OP_EQ:  { OSAVal b = vmPop(), a = vmPop();
+                bool eq = (a.isNum && b.isNum) ? (a.num == b.num)
+                                                : (a.toString() == b.toString());
+                vmPush(OSAVal(eq ? 1.0 : 0.0));
+                break;
+            }
+            case OP_NE:  { OSAVal b = vmPop(), a = vmPop();
+                bool eq = (a.isNum && b.isNum) ? (a.num == b.num)
+                                                : (a.toString() == b.toString());
+                vmPush(OSAVal(eq ? 0.0 : 1.0));
+                break;
+            }
+            case OP_LT:  { OSAVal b = vmPop(), a = vmPop(); vmPush(OSAVal(a.toNum() <  b.toNum() ? 1.0 : 0.0)); break; }
+            case OP_LE:  { OSAVal b = vmPop(), a = vmPop(); vmPush(OSAVal(a.toNum() <= b.toNum() ? 1.0 : 0.0)); break; }
+            case OP_GT:  { OSAVal b = vmPop(), a = vmPop(); vmPush(OSAVal(a.toNum() >  b.toNum() ? 1.0 : 0.0)); break; }
+            case OP_GE:  { OSAVal b = vmPop(), a = vmPop(); vmPush(OSAVal(a.toNum() >= b.toNum() ? 1.0 : 0.0)); break; }
+            case OP_AND: { OSAVal b = vmPop(), a = vmPop(); vmPush(OSAVal(a.truthy() && b.truthy() ? 1.0 : 0.0)); break; }
+            case OP_OR:  { OSAVal b = vmPop(), a = vmPop(); vmPush(OSAVal(a.truthy() || b.truthy() ? 1.0 : 0.0)); break; }
+            case OP_NOT: { OSAVal a = vmPop(); vmPush(OSAVal(a.truthy() ? 0.0 : 1.0)); break; }
+            case OP_JMP: {
+                int16_t off = readI16(bc.code + pc); pc += 2;
+                pc += off;
+                break;
+            }
+            case OP_JMP_IF_FALSE: {
+                int16_t off = readI16(bc.code + pc); pc += 2;
+                OSAVal v = vmPop();
+                if (!v.truthy()) pc += off;
+                break;
+            }
+            case OP_JMP_IF_TRUE: {
+                int16_t off = readI16(bc.code + pc); pc += 2;
+                OSAVal v = vmPop();
+                if (v.truthy()) pc += off;
+                break;
+            }
+            case OP_LOOP_TICK:
+                yield();
+                if (checkExitGesture() || checkOverlayGesture()) {
+                    exitFlag = true;
+                    return false;
+                }
+                break;
+            case OP_CALL_BUILTIN: {
+                int nameIdx = (uint16_t)readI16(bc.code + pc); pc += 2;
+                int argc    = bc.code[pc++];
+                OSAVal args[8];
+                if (argc > 8) argc = 8;
+                for (int i = argc - 1; i >= 0; i--) args[i] = vmPop();
+                // Rebuild a source-level argsStr so callBuiltin (which still
+                // parses its own arguments) sees the same shape it expects.
+                String argsStr;
+                for (int i = 0; i < argc; i++) {
+                    if (i) argsStr += ',';
+                    if (args[i].isNum) argsStr += String(args[i].num, 6);
+                    else { argsStr += '"'; argsStr += args[i].str; argsStr += '"'; }
+                }
+                OSAVal r = callBuiltin(bc.namePool[nameIdx], argsStr);
+                vmPush(r);
+                break;
+            }
+            case OP_CALL_USER: {
+                int funcIdx = (uint16_t)readI16(bc.code + pc); pc += 2;
+                int argc    = bc.code[pc++];
+                if (funcIdx < 0 || funcIdx >= funcCount ||
+                    vmCallDepth >= OSA_STACK_MAX) {
+                    setError(-1, "VM: bad CALL_USER");
+                    return false;
+                }
+                Func& fn = funcs[funcIdx];
+                OSAVal args[8];
+                int n = argc < 8 ? argc : 8;
+                for (int i = n - 1; i >= 0; i--) args[i] = vmPop();
+                // Save resume point + scope size so locals don't leak.
+                vmCallStack[vmCallDepth].returnPc       = pc;
+                vmCallStack[vmCallDepth].savedVarCount  = varCount;
+                vmCallDepth++;
+                // Bind params as locals in the callee's scope.
+                for (int i = 0; i < n && i < fn.paramCount; i++)
+                    declareVar(fn.params[i], args[i]);
+                pc = fn.bcStart;
+                break;
+            }
+            case OP_RET: {
+                OSAVal retval = vmPop();
+                if (vmCallDepth == 0) { setError(-1, "VM: RET at top"); return false; }
+                VMFrame& fr = vmCallStack[--vmCallDepth];
+                varCount = fr.savedVarCount;
+                pc = fr.returnPc;
+                vmPush(retval);
+                break;
+            }
+            case OP_RET_VOID: {
+                if (vmCallDepth == 0) { setError(-1, "VM: RET at top"); return false; }
+                VMFrame& fr = vmCallStack[--vmCallDepth];
+                varCount = fr.savedVarCount;
+                pc = fr.returnPc;
+                vmPush(OSAVal());
+                break;
+            }
+            case OP_HALT: return true;
+            case OP_EXIT: exitFlag = true; return true;
+            default:
+                setError(-1, String("VM: unhandled op ") + (int)op);
+                return false;
+        }
+    }
+    return errLine < 0;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Constructor / reset
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -468,6 +1235,8 @@ void OSARuntime::reset() {
         delete stashSprite;
         stashSprite = nullptr;
     }
+    bc.clear();
+    vmSp = 0;
 }
 
 // Waits until the touch panel has reported "not touched" for N consecutive
@@ -647,6 +1416,11 @@ bool OSARuntime::loadScript(const String& path) {
     // Pre-register all user functions
     registerFuncs();
 
+    // Try to compile the script into bytecode. On success, runShow/runUpdate
+    // use the VM. On failure (any unsupported language feature, currently
+    // including `def` functions) the tree-walking interpreter is the fallback.
+    compile();
+
     // Create per-app sandbox directory
     if (isSdReady) {
         SD.mkdir("/apps");
@@ -663,15 +1437,23 @@ bool OSARuntime::loadScript(const String& path) {
 void OSARuntime::runShow() {
     exitFlag = returnFlag = breakFlag = continueFlag = false;
     execDepth = 0;
+    if (bc.valid) {
+        exec(0, bc.setupEnd);
+        return;
+    }
     int to = (loopStart >= 0) ? loopStart : lineCount;
     execRange(0, to);
 }
 
 bool OSARuntime::runUpdate() {
     if (exitFlag || errLine >= 0) return false;
-    if (loopStart < 0) return false;
     returnFlag = breakFlag = continueFlag = false;
     execDepth = 0;
+    if (bc.valid && bc.loopStart >= 0) {
+        exec(bc.loopStart, bc.loopEnd);
+        return !(exitFlag || errLine >= 0);
+    }
+    if (loopStart < 0) return false;
     execRange(loopStart + 1, loopEnd);
     return !(exitFlag || errLine >= 0);
 }

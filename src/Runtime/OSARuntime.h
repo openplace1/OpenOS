@@ -8,6 +8,72 @@
 #define OSA_MAX_FUNCS  24
 #define OSA_STACK_MAX  10
 
+// ─── Bytecode VM limits ──────────────────────────────────────────────────────
+#define OSA_BC_MAX       8192   // total bytecode bytes (opcodes + operands)
+#define OSA_NUM_CONST    64     // numeric constant pool
+#define OSA_STR_CONST    48     // string constant pool
+#define OSA_NAME_CONST   64     // identifier pool (var names, builtin names)
+#define OSA_STACK_SIZE   48     // operand stack
+#define OSA_LOOP_DEPTH   8      // nested while/for/loop tracking
+
+// Bytecode opcodes — single byte each, operands packed inline (2-byte LE).
+enum OSAOp : uint8_t {
+    OP_NOP = 0,
+    // Stack
+    OP_PUSH_NUM,     // 2-byte: numPool[idx]
+    OP_PUSH_STR,     // 2-byte: strPool[idx]
+    OP_PUSH_NUM0,    // push 0
+    OP_PUSH_NUM1,    // push 1
+    OP_POP,
+    OP_DUP,
+    // Variables (operand = name pool idx)
+    OP_LOAD_VAR,     // 2-byte name idx
+    OP_STORE_VAR,    // 2-byte name idx (assignment — global lookup, may create)
+    OP_DECLARE_VAR,  // 2-byte name idx (var X = … — local scope)
+    // Arithmetic
+    OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_NEG,
+    // Comparison
+    OP_EQ, OP_NE, OP_LT, OP_LE, OP_GT, OP_GE,
+    // Logic
+    OP_AND, OP_OR, OP_NOT,
+    // Control flow (operand = signed 2-byte offset from end of operand)
+    OP_JMP,
+    OP_JMP_IF_FALSE,
+    OP_JMP_IF_TRUE,
+    // Calls (operand: name idx 2-byte, then argc 1-byte)
+    OP_CALL_BUILTIN,
+    OP_CALL_USER,
+    OP_RET,           // return from user fn (pop = return value, 0 if none)
+    OP_RET_VOID,
+    // Loops
+    OP_LOOP_TICK,     // top of main loop — yield + checkExitGesture
+    // Lifecycle
+    OP_EXIT,          // set exitFlag, halt
+    OP_HALT,          // end of bytecode marker
+};
+
+// Compiled script — replaces line[]+parsing on every execLine.
+struct OSABytecode {
+    uint8_t  code[OSA_BC_MAX];
+    int      codeLen = 0;
+
+    double   numPool[OSA_NUM_CONST];
+    int      numPoolLen = 0;
+
+    String   strPool[OSA_STR_CONST];
+    int      strPoolLen = 0;
+
+    String   namePool[OSA_NAME_CONST];
+    int      namePoolLen = 0;
+
+    int      setupEnd  = 0;    // pc where setup section ends, loop body begins
+    int      loopStart = -1;   // pc of OP_LOOP_TICK (top of main loop)
+    int      loopEnd   = -1;   // pc just past OP_JMP that closes the loop
+    bool     valid     = false;
+
+    void clear();
+};
+
 // Permission bits (granted = bits 0-3, denied = bits 4-7 in Config)
 #define OSA_PERM_NOTIFY   0x01   // notify()
 #define OSA_PERM_NETWORK  0x02   // http.get / http.post — outbound network access
@@ -80,6 +146,20 @@ public:
     // All drawing builtins (CV macro) redirect there when non-null.
     void         setActiveSprite(TFT_eSprite* s) { activeSprite = s; }
     TFT_eSprite* getActiveSprite() const          { return activeSprite; }
+
+    // Bytecode compiler — these are exposed (read-only conceptually) so the
+    // file-local static compile* helpers in OSARuntime.cpp can touch them
+    // without friend boilerplate.
+    OSABytecode bc;
+    int  bcAddNum(double v);
+    int  bcAddStr(const String& s);
+    int  bcAddName(const String& s);
+    String*  bcLines()             { return lines; }
+    int      bcLineCount() const   { return lineCount; }
+    int      bcFindMatchingEnd(int n);
+    int      bcFindNextBranch(int n);
+    int      bcFuncCount() const   { return funcCount; }
+    const String& bcFuncName(int i) const { return funcs[i].name; }
     // `#exception true` grants the script the privileged SDK (sys.*, cfg.*,
     // fs.* outside sandbox, ntp.sync, sys.reboot, …). Used by built-in
     // privileged apps that need to mutate global system state.
@@ -112,6 +192,7 @@ private:
         String name;
         int    bodyStart; // first line after def header
         int    bodyEnd;   // matching end line
+        int    bcStart = -1;   // pc where bytecode body starts (set by compile)
         String params[8];
         int    paramCount = 0;
     };
@@ -122,6 +203,16 @@ private:
     struct Frame { int retVarCount; };
     Frame callStack[OSA_STACK_MAX];
     int   stackDepth = 0;
+
+    // VM operand stack (bc itself is public — compiler helpers in the .cpp
+    // need to emit into it).
+    OSAVal      vmStack[OSA_STACK_SIZE];
+    int         vmSp = 0;
+    // Per-call frame for OP_CALL_USER. Records where to resume + the var
+    // scope size to restore so locals declared by the callee go away on ret.
+    struct VMFrame { int returnPc; int savedVarCount; };
+    VMFrame     vmCallStack[OSA_STACK_MAX];
+    int         vmCallDepth = 0;
 
     // Draw state
     uint16_t drawColor = TFT_WHITE;
@@ -163,7 +254,15 @@ private:
     // Returns true if the swipe-down-from-top gesture just completed.
     bool checkOverlayGesture();
 
-    // ── Execution ────────────────────────────────────────────────────────────
+    // ── Bytecode VM ──────────────────────────────────────────────────────────
+    // compile(): walks lines[], emits bytecode into `bc` (public).
+    // exec(): interprets bc.code[pcStart..pcEnd].
+    bool compile();
+    bool exec(int pcStart, int pcEnd);
+    void vmPush(const OSAVal& v);
+    OSAVal vmPop();
+
+    // ── Execution (tree-walker fallback) ─────────────────────────────────────
     void execRange(int from, int to);
     void execLine(int lineNo, int& pc);
     void processIf(int lineNo, int& pc);

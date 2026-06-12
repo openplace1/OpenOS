@@ -292,19 +292,19 @@ void osaPlayOpenAnim(int idx) {
     home.lastLaunchColor = home.tiles[idx].color;
 }
 
-// TEMPORARY: loads /main.osa into osaApp on every "return to home" transition
-// (boot, lockscreen unlock, every app exit). No fallback. Restore the normal
-// home.osa path when done testing.
+// Loads /system/apps/home.osa into osaApp and shows it. Called on boot,
+// after lockscreen unlock, and after every app exit.
 static void loadHomeScript() {
     osaApp.recycle();
-    if (osaApp.loadScript("/main.osa")) {
+    if (osaApp.loadScript("/system/apps/home.osa")) {
         activeApp = &osaApp;
         osaApp.show();
     } else {
         tft.fillScreen(TFT_BLACK);
-        tft.setTextColor(TFT_RED); tft.setTextDatum(MC_DATUM); tft.setTextFont(2);
-        tft.drawString("/main.osa missing", 120, 150);
-        tft.drawString("Copy it to the SD root", 120, 175);
+        tft.setTextColor(TFT_RED); tft.setTextDatum(MC_DATUM);
+        tft.setTextFont(2);
+        tft.drawString("home.osa missing", 120, 150);
+        tft.drawString("Copy sd_content/ to SD root", 120, 175);
         activeApp = nullptr;
     }
 }
@@ -418,18 +418,14 @@ void setup() {
     registerOsaShortcuts();
     home.applyOrder();
 
-    // TEMPORARY: boot straight into /main.osa. No fallback — if it's missing
-    // we paint a hard error and stop. Restore the normal lockscreen flow when
-    // done testing.
-    if (osaApp.loadScript("/main.osa")) {
+    // Boot into the OSA lockscreen — exit() routes to STATE_HOMESCREEN in the
+    // loop below. Fall through to home if SD failed so we don't dead-screen.
+    if (osaApp.loadScript("/system/apps/lockscreen.osa")) {
         osaApp.show();
         activeApp = &osaApp;
     } else {
-        tft.fillScreen(TFT_BLACK);
-        tft.setTextColor(TFT_RED); tft.setTextDatum(MC_DATUM); tft.setTextFont(2);
-        tft.drawString("/main.osa missing", 120, 150);
-        tft.drawString("Copy it to the SD root", 120, 175);
-        activeApp = nullptr;
+        currentState = STATE_HOMESCREEN;
+        loadHomeScript();
     }
 }
 
