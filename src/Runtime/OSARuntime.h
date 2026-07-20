@@ -7,14 +7,26 @@
 #define OSA_MAX_VARS   96
 #define OSA_MAX_FUNCS  24
 #define OSA_STACK_MAX  10
+#define OSA_MAX_SOURCE_BYTES (128 * 1024)
+#define OSA_MAX_LINE_BYTES   4096
 
 // ─── Bytecode VM limits ──────────────────────────────────────────────────────
 #define OSA_BC_MAX       8192   // total bytecode bytes (opcodes + operands)
-#define OSA_NUM_CONST    64     // numeric constant pool
-#define OSA_STR_CONST    48     // string constant pool
-#define OSA_NAME_CONST   64     // identifier pool (var names, builtin names)
+#define OSA_NUM_CONST    96     // numeric constant pool
+#define OSA_STR_CONST    160    // string constant pool (Settings uses ~126)
+#define OSA_NAME_CONST   192    // variables, functions and builtin names
 #define OSA_STACK_SIZE   48     // operand stack
 #define OSA_LOOP_DEPTH   8      // nested while/for/loop tracking
+
+enum OSABytecodeBuildError : uint8_t {
+    OSA_BCERR_NONE = 0,
+    OSA_BCERR_CODE_FULL,
+    OSA_BCERR_NUM_POOL_FULL,
+    OSA_BCERR_STR_POOL_FULL,
+    OSA_BCERR_NAME_POOL_FULL,
+    OSA_BCERR_BAD_PATCH,
+    OSA_BCERR_UNSUPPORTED,
+};
 
 // Bytecode opcodes — single byte each, operands packed inline (2-byte LE).
 enum OSAOp : uint8_t {
@@ -70,6 +82,7 @@ struct OSABytecode {
     int      loopStart = -1;   // pc of OP_LOOP_TICK (top of main loop)
     int      loopEnd   = -1;   // pc just past OP_JMP that closes the loop
     bool     valid     = false;
+    uint8_t  buildError = OSA_BCERR_NONE;
 
     void clear();
 };
@@ -100,6 +113,7 @@ struct OSAVal {
     OSAVal() = default;
     OSAVal(double n)       : isNum(true),  num(n) {}
     OSAVal(const String& s): isNum(false), str(s) {}
+    OSAVal(String&& s)     : isNum(false), str(static_cast<String&&>(s)) {}
     OSAVal(bool b)         : isNum(true),  num(b ? 1.0 : 0.0) {}
 
     bool   truthy()   const;
@@ -112,15 +126,18 @@ struct OSAVal {
 class OSARuntime {
 public:
     OSARuntime(TFT_eSPI* tft, XPT2046_Touchscreen* ts);
+    ~OSARuntime();
 
-    bool   loadScript(const String& path); // loads .osa from SD
+    // Pass by value intentionally: reset() releases every String owned by the
+    // runtime, so a caller may safely pass pendingLaunch/loadedScriptPath.
+    bool   loadScript(String path); // loads .osa/.osac from SD
     void   runShow();                      // execute setup section
     bool   runUpdate();                    // execute loop body; false = exit
     // Release all script-owned heap (line text, var values, function bodies,
     // any allocated sprite). Call after the app exits — Arduino's String
     // destructor frees char buffers, so the next idle/launch starts clean.
     void   reset();
-    bool   hasLoop()  const { return loopStart >= 0; }
+    bool   hasLoop()  const { return loopStart >= 0 || (bc.valid && bc.loopStart >= 0); }
     bool   hasError() const { return errLine >= 0; }
     String getError() const { return errMsg; }
     String  appName;        // from #app "Name" header
@@ -135,6 +152,7 @@ public:
 
     // Shared helpers used by Settings to keep perm-key derivation in sync.
     static String  permKeyForName(const String& appName);
+    static String  permKeyForPath(const String& scriptPath);
     static String  readAppNameFromFile(const String& path);
     static uint8_t readRequiredPermsFromFile(const String& path);
     // Home-screen shortcut metadata. Scripts opt in with `#isApp true`
@@ -154,12 +172,23 @@ public:
     int  bcAddNum(double v);
     int  bcAddStr(const String& s);
     int  bcAddName(const String& s);
+    uint8_t bytecodeError() const { return lastCompileError; }
     String*  bcLines()             { return lines; }
     int      bcLineCount() const   { return lineCount; }
     int      bcFindMatchingEnd(int n);
     int      bcFindNextBranch(int n);
     int      bcFuncCount() const   { return funcCount; }
     const String& bcFuncName(int i) const { return funcs[i].name; }
+    // Full read access to the function table (.osac serializer needs it).
+    int      bcFuncBcStart(int i)    const { return funcs[i].bcStart; }
+    int      bcFuncParamCount(int i) const { return funcs[i].paramCount; }
+    const String& bcFuncParam(int i, int j) const { return funcs[i].params[j]; }
+    // Setters used during .osac deserialization.
+    void     bcSetFuncCount(int n)             { funcCount = n; }
+    void     bcSetFuncName(int i, const String& n) { funcs[i].name = n; }
+    void     bcSetFuncBcStart(int i, int pc)   { funcs[i].bcStart = pc; }
+    void     bcSetFuncParamCount(int i, int n) { funcs[i].paramCount = n; }
+    void     bcSetFuncParam(int i, int j, const String& p) { funcs[i].params[j] = p; }
     // `#exception true` grants the script the privileged SDK (sys.*, cfg.*,
     // fs.* outside sandbox, ntp.sync, sys.reboot, …). Used by built-in
     // privileged apps that need to mutate global system state.
@@ -179,6 +208,7 @@ private:
     // Script storage
     String lines[OSA_MAX_LINES];
     int    lineCount = 0;
+    String loadedScriptPath;
     int    loopStart = -1; // index of 'loop' line
     int    loopEnd   = -1; // index of matching 'end'
 
@@ -208,11 +238,14 @@ private:
     // need to emit into it).
     OSAVal      vmStack[OSA_STACK_SIZE];
     int         vmSp = 0;
+    bool        vmHalted = false;
     // Per-call frame for OP_CALL_USER. Records where to resume + the var
     // scope size to restore so locals declared by the callee go away on ret.
     struct VMFrame { int returnPc; int savedVarCount; };
     VMFrame     vmCallStack[OSA_STACK_MAX];
     int         vmCallDepth = 0;
+    OSAVal*     directBuiltinArgs = nullptr;
+    int         directBuiltinArgc = 0;
 
     // Draw state
     uint16_t drawColor = TFT_WHITE;
@@ -228,6 +261,10 @@ private:
     int    errLine      = -1;
     String errMsg;
     int    execDepth    = 0;
+    uint8_t lastCompileError = OSA_BCERR_NONE;
+    uint32_t scriptSliceStarted = 0;
+    uint32_t scriptOpsSinceYield = 0;
+    uint32_t scriptLoopOpsTotal = 0;
     // Tracks an in-progress swipe from the bottom edge — when the user lifts
     // their finger after dragging up far enough, exitFlag is set and the
     // script unwinds to OSAApp which signals main.cpp to go home.
@@ -246,6 +283,11 @@ private:
     bool          touchWasDown   = false;
     bool          releasedOneShot = false;
     int           swipeOneShot   = 0;  // 1=up,2=down,3=left,4=right, consumed on read
+    uint32_t      touchSampleMs   = UINT32_MAX;
+    bool          touchSampleDown = false;
+    int           touchSampleX    = -1;
+    int           touchSampleY    = -1;
+    void sampleTouch();
     void pollGesture();
 
     // Returns true if the swipe-up-to-home gesture just completed. Called from
@@ -259,8 +301,14 @@ private:
     // exec(): interprets bc.code[pcStart..pcEnd].
     bool compile();
     bool exec(int pcStart, int pcEnd);
-    void vmPush(const OSAVal& v);
+    // Pass by value so temporary String results can be moved onto the VM stack
+    // without allocating a second equally large buffer. Lvalues still make the
+    // one copy required by OP_LOAD_VAR / OP_DUP.
+    bool vmPush(OSAVal v);
     OSAVal vmPop();
+    // Binary .osac format — write the compiled state out / read it back.
+    bool serializeOsac(const String& dstPath);
+    bool loadOsac(const String& srcPath);
 
     // ── Execution (tree-walker fallback) ─────────────────────────────────────
     void execRange(int from, int to);
@@ -268,6 +316,7 @@ private:
     void processIf(int lineNo, int& pc);
     void processWhile(int lineNo, int& pc);
     void processFor(int lineNo, int& pc);
+    bool cooperativeTick(uint32_t interval = 128);
 
     // ── Helpers ──────────────────────────────────────────────────────────────
     int  findMatchingEnd(int lineNo);  // finds 'end' matching block at lineNo
@@ -278,11 +327,11 @@ private:
 
     // ── Variables ────────────────────────────────────────────────────────────
     OSAVal getVar(const String& name) const;
-    void   setVar(const String& name, const OSAVal& val);
+    void   setVar(const String& name, OSAVal val);
     // `var X = Y` — declare in the CURRENT scope. Same-named vars in parent
     // scopes are shadowed, not overwritten. Plain assignment (X = Y) keeps the
     // global-search behaviour of setVar.
-    void   declareVar(const String& name, const OSAVal& val);
+    void   declareVar(const String& name, OSAVal val);
 
     // ── Expression evaluator (recursive descent) ─────────────────────────────
     OSAVal eval(const String& expr);
@@ -314,4 +363,6 @@ private:
     // ── Sandbox ───────────────────────────────────────────────────────────────
     String sandboxDir()  const;                    // /apps/<name>
     String sandboxPath(const String& rel) const;   // /apps/<name>/<safe-rel>
+    String packageAssetPath(const String& rel) const;
+    String packageRoot;
 };

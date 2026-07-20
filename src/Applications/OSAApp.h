@@ -14,6 +14,8 @@ public:
 
     void show();
     void update();
+    void showLoadError();
+    String lastError() const { return runtime.getError(); }
     // Repaints just the top bar — used after a notification banner clears.
     void drawHeader();
 

@@ -17,6 +17,13 @@ struct HomeTile {
     int       childCount    = 0;
     int       childCap      = 0;
 
+    HomeTile() = default;
+    HomeTile(const HomeTile& other);
+    HomeTile& operator=(const HomeTile& other);
+    HomeTile(HomeTile&& other) noexcept;
+    HomeTile& operator=(HomeTile&& other) noexcept;
+    ~HomeTile();
+
     // Take ownership of `c` into this folder. Returns false if full.
     bool addChild(const HomeTile& c);
     // Frees the children array (called from Home dtor + delete-folder path).
@@ -46,6 +53,12 @@ public:
     // called from the OSA-side home.* mutation builtins after every change.
     void applyOrder();
     void saveOrder();
+
+    // Removes every leaf whose script path is exactly `path` or begins with
+    // `pathPrefix`. This keeps the live grid and folders in sync after an OPK
+    // is uninstalled without requiring a reboot.
+    int removeScriptPath(const String& path);
+    int removeScriptsUnder(const String& pathPrefix);
 
 private:
     TFT_eSPI*            tft;

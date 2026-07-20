@@ -1,4 +1,5 @@
 #include "OSARuntime.h"
+#include "PackageManager.h"
 #include "../Config.h"
 #include "../Applications/Theme.h"
 #include "../Applications/Crypto.h"
@@ -10,6 +11,43 @@
 #include <WiFiClientSecure.h>
 #include <BluetoothSerial.h>
 #include <math.h>
+#include <new>
+
+// Arduino String intentionally keeps capacity when assigned "" so it can be
+// reused. Runtime recycle needs the opposite: return large script/HTTP buffers
+// to the heap. Explicit lifetime restart is safe here because these objects are
+// immediately reconstructed at the same address.
+static void releaseStringStorage(String& value) {
+    value.~String();
+    new (&value) String();
+}
+
+static void releaseValueStorage(OSAVal& value) {
+    value.~OSAVal();
+    new (&value) OSAVal();
+}
+
+static bool userPackageFromEntry(const String& path, String& id,
+                                 String* packagePrefix = nullptr) {
+    static const char* root = "/packages/";
+    static const int rootLength = 10;
+    if (!path.startsWith(root)) return false;
+    int slash = path.indexOf('/', rootLength);
+    if (slash <= rootLength) return false;
+    id = path.substring(rootLength, slash);
+    if (packagePrefix) *packagePrefix = root + id + "/";
+    return true;
+}
+
+static bool isLooseUserScript(const String& path) {
+    String lower = path;
+    lower.toLowerCase();
+    bool script = lower.endsWith(".osa") || lower.endsWith(".osac");
+    return script && path.startsWith("/") &&
+           !path.startsWith("/system/") &&
+           !path.startsWith("/packages/") &&
+           !path.startsWith("/apps/");
+}
 
 extern bool isSdReady;
 extern int  sysTheme;
@@ -17,14 +55,15 @@ extern int  sysBrightness;
 extern bool sysNtpSynced;
 extern bool sysWiFiEnabled;
 extern bool sysBTEnabled;
-extern BluetoothSerial SerialBT;
 extern Home home;
+extern bool osaSetBluetoothEnabled(bool enabled);
+extern const char* osaBluetoothLastError();
 // Folder + home animation helpers exposed by main.cpp. Used by OSA-side
 // home.osa so the script can trigger the same folder/open-anim UX without
 // owning the C++ Home/Folder data structures itself.
-extern void osaMakeFolder(int idx);
-extern void osaDeleteFolder(int idx);
-extern void osaAddToFolder(int folderIdx, int appIdx);
+extern bool osaMakeFolder(int idx);
+extern bool osaDeleteFolder(int idx);
+extern bool osaAddToFolder(int folderIdx, int appIdx);
 extern void osaPlayOpenAnim(int idx);
 
 // ─── Inline keyboard (formerly OSKeyboard) ───────────────────────────────────
@@ -33,6 +72,20 @@ extern void osaPlayOpenAnim(int idx);
 // codebase depending on a separate file. lockscreen runs as an OSA script
 // and uses input() / ui.numpad, so this is the only consumer left.
 namespace {
+
+// Native SDK calls may spend most of their time transferring pixels over SPI,
+// waiting for touch input, reading SD, or doing network I/O. That time must not
+// be charged to the tree-walker's CPU budget. A separate loop-operation limit
+// still catches scripts that spin forever by repeatedly calling tiny builtins.
+class BuiltinBudgetGuard {
+public:
+    explicit BuiltinBudgetGuard(uint32_t& sliceStarted)
+        : started(sliceStarted) {}
+    ~BuiltinBudgetGuard() { started = millis(); }
+
+private:
+    uint32_t& started;
+};
 
 static const char kKeysL[3][10] = {
     {'q','w','e','r','t','y','u','i','o','p'},
@@ -140,6 +193,221 @@ private:
     }
 };
 
+static int popupNextUtf8(const String& text, int pos) {
+    int next = pos + 1;
+    while (next < (int)text.length() &&
+           (((uint8_t)text[next] & 0xC0) == 0x80)) ++next;
+    return next;
+}
+
+static void popupAddEllipsis(TFT_eSPI* tft, String& line, int maxWidth) {
+    static const char* dots = "...";
+    while (line.length() > 0 && tft->textWidth(line + dots) > maxWidth) {
+        int cut = (int)line.length() - 1;
+        while (cut > 0 && (((uint8_t)line[cut] & 0xC0) == 0x80)) --cut;
+        line.remove((unsigned int)cut);
+    }
+    line.trim();
+    line += dots;
+}
+
+static String popupFitLine(TFT_eSPI* tft, const String& text, int maxWidth) {
+    if (tft->textWidth(text) <= maxWidth) return text;
+    String fitted = text;
+    popupAddEllipsis(tft, fitted, maxWidth);
+    return fitted;
+}
+
+static bool popupStoreLine(String lines[], int maxLines, int& lineCount,
+                           String& current) {
+    if (lineCount >= maxLines) return false;
+    current.trim();
+    lines[lineCount++] = current;
+    current = "";
+    return true;
+}
+
+static bool popupAppendWord(TFT_eSPI* tft, const String& word,
+                            String lines[], int maxLines, int& lineCount,
+                            String& current, int maxWidth) {
+    if (word.length() == 0) return true;
+
+    if (current.length() > 0) {
+        String candidate = current + " " + word;
+        if (tft->textWidth(candidate) <= maxWidth) {
+            current = candidate;
+            return true;
+        }
+        if (!popupStoreLine(lines, maxLines, lineCount, current)) return false;
+    }
+
+    // A URL, path or error token may contain no spaces. Split it at UTF-8
+    // character boundaries so even one very long word cannot escape the box.
+    int start = 0;
+    while (start < (int)word.length()) {
+        int end = start;
+        int lastFit = start;
+        while (end < (int)word.length()) {
+            int next = popupNextUtf8(word, end);
+            if (tft->textWidth(word.substring(start, next)) > maxWidth) break;
+            lastFit = next;
+            end = next;
+        }
+
+        if (lastFit == start) lastFit = popupNextUtf8(word, start);
+        String part = word.substring(start, lastFit);
+        start = lastFit;
+        if (start < (int)word.length()) {
+            if (!popupStoreLine(lines, maxLines, lineCount, part)) return false;
+        } else {
+            current = part;
+        }
+    }
+    return true;
+}
+
+static int popupWrapBody(TFT_eSPI* tft, const String& body1,
+                         const String& body2, String lines[], int maxLines,
+                         int maxWidth) {
+    String text = body1;
+    if (body2.length() > 0) {
+        if (text.length() > 0) text += '\n';
+        text += body2;
+    }
+
+    int lineCount = 0;
+    String current;
+    bool truncated = false;
+    int pos = 0;
+    while (pos < (int)text.length()) {
+        char c = text[pos];
+        if (c == '\r') { ++pos; continue; }
+        if (c == '\n') {
+            if (!popupStoreLine(lines, maxLines, lineCount, current)) {
+                truncated = true;
+                break;
+            }
+            ++pos;
+            continue;
+        }
+        if (c == ' ' || c == '\t') { ++pos; continue; }
+
+        int wordStart = pos;
+        while (pos < (int)text.length() && text[pos] != ' ' &&
+               text[pos] != '\t' && text[pos] != '\r' && text[pos] != '\n') {
+            pos = popupNextUtf8(text, pos);
+        }
+        if (!popupAppendWord(tft, text.substring(wordStart, pos), lines,
+                             maxLines, lineCount, current, maxWidth)) {
+            truncated = true;
+            break;
+        }
+    }
+
+    if (!truncated && (current.length() > 0 || lineCount == 0) &&
+        !popupStoreLine(lines, maxLines, lineCount, current)) {
+        truncated = true;
+    }
+    if (truncated && lineCount > 0)
+        popupAddEllipsis(tft, lines[lineCount - 1], maxWidth);
+    return lineCount;
+}
+
+struct WrappedDrawContext {
+    TFT_eSPI* tft;
+    TFT_eSprite* sprite;
+    int x;
+    int y;
+    int lineHeight;
+    int scroll;
+    int clipTop;
+    int clipBottom;
+    int fontHeight;
+};
+
+static void drawWrappedLine(const String& line, int index, void* opaque) {
+    WrappedDrawContext* context = (WrappedDrawContext*)opaque;
+    int y = context->y + index * context->lineHeight - context->scroll;
+    if (y < context->clipTop || y + context->fontHeight > context->clipBottom)
+        return;
+    if (context->sprite) context->sprite->drawString(line, context->x, y);
+    else                 context->tft->drawString(line, context->x, y);
+}
+
+// Iterates wrapped lines without allocating an array proportional to the text
+// length. This keeps a 10 KB store description practical on a non-PSRAM ESP32.
+static int visitWrappedText(TFT_eSPI* metrics, const String& text, int maxWidth,
+                            int maxLines,
+                            void (*visitor)(const String&, int, void*),
+                            void* context) {
+    if (maxWidth < 1 || text.length() == 0) return 0;
+    int lineCount = 0;
+    int pos = 0;
+    const int length = text.length();
+    const int limit = maxLines > 0 ? min(maxLines, 10000) : 10000;
+
+    while (pos < length && lineCount < limit) {
+        while (pos < length &&
+               (text[pos] == ' ' || text[pos] == '\t' || text[pos] == '\r')) ++pos;
+        if (pos >= length) break;
+
+        if (text[pos] == '\n') {
+            if (visitor) visitor(String(""), lineCount, context);
+            ++lineCount;
+            ++pos;
+            continue;
+        }
+
+        int start = pos;
+        int scan = pos;
+        int lastFit = pos;
+        int lastBreak = -1;
+        int end = pos;
+        bool decided = false;
+
+        while (scan < length) {
+            char c = text[scan];
+            if (c == '\n') {
+                end = scan;
+                pos = scan + 1;
+                decided = true;
+                break;
+            }
+            int next = popupNextUtf8(text, scan);
+            if (c == ' ' || c == '\t' || c == '\r') lastBreak = scan;
+            if (metrics->textWidth(text.substring(start, next)) > maxWidth) {
+                if (lastBreak > start) {
+                    end = lastBreak;
+                    pos = lastBreak;
+                    while (pos < length &&
+                           (text[pos] == ' ' || text[pos] == '\t' || text[pos] == '\r')) ++pos;
+                } else {
+                    end = lastFit > start ? lastFit : next;
+                    pos = end;
+                }
+                decided = true;
+                break;
+            }
+            lastFit = next;
+            scan = next;
+        }
+        if (!decided) {
+            end = length;
+            pos = length;
+        }
+        while (end > start &&
+               (text[end - 1] == ' ' || text[end - 1] == '\t' || text[end - 1] == '\r')) --end;
+
+        String line = text.substring(start, end);
+        bool truncated = lineCount + 1 >= limit && pos < length;
+        if (truncated) popupAddEllipsis(metrics, line, maxWidth);
+        if (visitor) visitor(line, lineCount, context);
+        ++lineCount;
+        if (truncated) break;
+    }
+    return lineCount;
+}
+
 } // anonymous namespace
 
 // Forward — defined below near the block-navigation helpers.
@@ -177,6 +445,143 @@ static uint8_t permBitFromKeyword(const String& kw) {
 // ─── HTTP state (per-runtime) ────────────────────────────────────────────────
 static int    s_httpStatus = 0;
 static String s_httpBearer;
+static String s_httpError;
+static String s_ioError;
+
+// Native widget caches must be released with the runtime. Function-local
+// statics used to retain their String capacities after Settings was closed,
+// taking heap away from the next application and from HTTPS.
+static const int RICH_MAX_ROWS = 16;
+static String   s_rmTitle;
+static String   s_rmTitles[RICH_MAX_ROWS];
+static String   s_rmLetters[RICH_MAX_ROWS];
+static uint16_t s_rmColors[RICH_MAX_ROWS];
+static String   s_rmValues[RICH_MAX_ROWS];
+static int      s_rmCount = 0;
+static bool     s_rmShowBack = false;
+
+static const int APPS_MAX_SLOTS = 16;
+static String s_appsPaths[APPS_MAX_SLOTS];
+static String s_appsNames[APPS_MAX_SLOTS];
+static int    s_appsCount = 0;
+
+static void clearRichMenuCache() {
+    releaseStringStorage(s_rmTitle);
+    for (int i = 0; i < RICH_MAX_ROWS; ++i) {
+        releaseStringStorage(s_rmTitles[i]);
+        releaseStringStorage(s_rmLetters[i]);
+        releaseStringStorage(s_rmValues[i]);
+        s_rmColors[i] = 0;
+    }
+    s_rmCount = 0;
+    s_rmShowBack = false;
+}
+
+static void clearAppsScanCache() {
+    for (int i = 0; i < APPS_MAX_SLOTS; ++i) {
+        releaseStringStorage(s_appsPaths[i]);
+        releaseStringStorage(s_appsNames[i]);
+    }
+    s_appsCount = 0;
+}
+
+static constexpr size_t OSA_HTTP_MAX_BODY = 24 * 1024;
+static constexpr size_t OSA_HTTP_MAX_SEND = 24 * 1024;
+static constexpr size_t OSA_MAX_FILE_READ = 32 * 1024;
+
+// HTTPClient::getString() grows an unbounded String. This sink is passed to
+// writeToStream(), so both fixed-length and chunked responses stop at the same
+// hard cap before they can exhaust or fragment the ESP32 heap.
+class BoundedStringStream : public Stream {
+public:
+    explicit BoundedStringStream(size_t maximum) : maxBytes(maximum) {}
+
+    bool begin(size_t hint) {
+        if (hint > maxBytes) hint = maxBytes;
+        return hint == 0 || body.reserve(hint);
+    }
+    size_t write(uint8_t value) override { return write(&value, 1); }
+    size_t write(const uint8_t* data, size_t length) override {
+        if (overflowed || length > maxBytes - body.length()) {
+            overflowed = true;
+            setWriteError();
+            return 0;
+        }
+        if (length > 0 && !body.concat((const char*)data, (unsigned int)length)) {
+            allocationFailed = true;
+            setWriteError();
+            return 0;
+        }
+        return length;
+    }
+    int available() override { return 0; }
+    int read() override { return -1; }
+    int peek() override { return -1; }
+    void flush() override {}
+
+    String take() { return static_cast<String&&>(body); }
+    bool tooLarge() const { return overflowed; }
+    bool outOfMemory() const { return allocationFailed; }
+
+private:
+    String body;
+    size_t maxBytes;
+    bool overflowed = false;
+    bool allocationFailed = false;
+};
+
+static bool readFileBounded(const String& path, size_t offset, size_t requested,
+                            bool explicitLength, String& out) {
+    s_ioError = "";
+    File f = SD.open(path);
+    if (!f || f.isDirectory()) {
+        if (f) f.close();
+        s_ioError = "File not found";
+        return false;
+    }
+
+    size_t total = (size_t)f.size();
+    if (offset > total) {
+        f.close();
+        s_ioError = "Offset outside file";
+        return false;
+    }
+    size_t available = total - offset;
+    size_t amount = explicitLength ? min(requested, available) : available;
+    if (requested > OSA_MAX_FILE_READ || amount > OSA_MAX_FILE_READ) {
+        f.close();
+        s_ioError = "Read exceeds 32768 byte limit";
+        return false;
+    }
+    if (!f.seek(offset)) {
+        f.close();
+        s_ioError = "Seek failed";
+        return false;
+    }
+
+    out = "";
+    if (amount > 0 && !out.reserve(amount)) {
+        f.close();
+        s_ioError = "Not enough memory";
+        return false;
+    }
+    uint8_t buffer[512];
+    size_t left = amount;
+    while (left > 0) {
+        size_t want = min(left, sizeof(buffer));
+        int got = f.read(buffer, want);
+        if (got <= 0 || !out.concat((const char*)buffer, (unsigned int)got)) {
+            f.close();
+            out = "";
+            s_ioError = got <= 0 ? "Unexpected end of file" : "Not enough memory";
+            return false;
+        }
+        left -= (size_t)got;
+        yield();
+    }
+    f.close();
+    return true;
+}
 
 static String urlEncode(const String& s) {
     static const char hex[] = "0123456789ABCDEF";
@@ -225,7 +630,6 @@ static int jsonSkipValue(const String& s, int pos) {
         return pos;
     }
     if (c == '{' || c == '[') {
-        char close = (c == '{') ? '}' : ']';
         int depth = 1; pos++;
         bool inStr = false;
         while (pos < len && depth > 0) {
@@ -344,6 +748,38 @@ static int jsonContainerSize(const String& s, int pos) {
 
 // Strip outer quotes and unescape if the value is a JSON string; pass through
 // numbers, booleans, null, objects and arrays as-is.
+static bool jsonHex4(const String& value, int start, uint32_t& codepoint) {
+    if (start < 0 || start + 4 > (int)value.length()) return false;
+    codepoint = 0;
+    for (int i = 0; i < 4; ++i) {
+        char c = value[start + i];
+        if (!isxdigit((unsigned char)c)) return false;
+        codepoint = (codepoint << 4) |
+                    (c >= '0' && c <= '9' ? c - '0' :
+                     c >= 'a' && c <= 'f' ? c - 'a' + 10 : c - 'A' + 10);
+    }
+    return true;
+}
+
+static bool jsonAppendUtf8(String& output, uint32_t codepoint) {
+    char encoded[4]; int count = 0;
+    if (codepoint <= 0x7F) encoded[count++] = (char)codepoint;
+    else if (codepoint <= 0x7FF) {
+        encoded[count++] = (char)(0xC0 | (codepoint >> 6));
+        encoded[count++] = (char)(0x80 | (codepoint & 0x3F));
+    } else if (codepoint <= 0xFFFF) {
+        encoded[count++] = (char)(0xE0 | (codepoint >> 12));
+        encoded[count++] = (char)(0x80 | ((codepoint >> 6) & 0x3F));
+        encoded[count++] = (char)(0x80 | (codepoint & 0x3F));
+    } else if (codepoint <= 0x10FFFF) {
+        encoded[count++] = (char)(0xF0 | (codepoint >> 18));
+        encoded[count++] = (char)(0x80 | ((codepoint >> 12) & 0x3F));
+        encoded[count++] = (char)(0x80 | ((codepoint >> 6) & 0x3F));
+        encoded[count++] = (char)(0x80 | (codepoint & 0x3F));
+    } else return false;
+    return output.concat(encoded, (unsigned int)count);
+}
+
 static String jsonUnquote(const String& v) {
     int len = v.length();
     if (len < 2 || v[0] != '"' || v[len - 1] != '"') return v;
@@ -354,21 +790,29 @@ static String jsonUnquote(const String& v) {
             if      (e == 'n')  out += '\n';
             else if (e == 't')  out += '\t';
             else if (e == 'r')  out += '\r';
+            else if (e == 'b')  out += '\b';
+            else if (e == 'f')  out += '\f';
             else if (e == '"')  out += '"';
             else if (e == '\\') out += '\\';
             else if (e == '/')  out += '/';
             else if (e == 'u' && i + 5 < len - 1) {
-                long cp = strtol(v.substring(i + 2, i + 6).c_str(), nullptr, 16);
-                if (cp > 0 && cp < 0x80)        out += (char)cp;
-                else if (cp < 0x800) {
-                    out += (char)(0xC0 | (cp >> 6));
-                    out += (char)(0x80 | (cp & 0x3F));
-                } else {
-                    out += (char)(0xE0 | (cp >> 12));
-                    out += (char)(0x80 | ((cp >> 6) & 0x3F));
-                    out += (char)(0x80 | (cp & 0x3F));
-                }
+                uint32_t cp = 0;
+                if (!jsonHex4(v, i + 2, cp)) return String("");
                 i += 4;
+                if (cp >= 0xD800 && cp <= 0xDBFF) {
+                    // UTF-16 surrogate pair used by many JSON encoders for
+                    // emoji and code points above U+FFFF.
+                    if (i + 7 >= len - 1 || v[i + 2] != '\\' || v[i + 3] != 'u')
+                        return String("");
+                    uint32_t low = 0;
+                    if (!jsonHex4(v, i + 4, low) || low < 0xDC00 || low > 0xDFFF)
+                        return String("");
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                    i += 6;
+                } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                    return String("");
+                }
+                if (!jsonAppendUtf8(out, cp)) return String("");
             }
             else out += e;
             i++;
@@ -381,7 +825,86 @@ static String jsonUnquote(const String& v) {
 
 // Walk a dotted path through a JSON document. Numeric segments index arrays.
 // Returns raw value text (still in JSON form — caller unquotes if desired).
-static String jsonWalkPath(const String& src, const String& path) {
+struct JsonSpan {
+    int start = -1;
+    int end = -1;
+    JsonSpan() = default;
+    JsonSpan(int spanStart, int spanEnd) : start(spanStart), end(spanEnd) {}
+    bool valid() const { return start >= 0 && end >= start; }
+};
+
+static JsonSpan jsonObjectFieldSpan(const String& source, JsonSpan object,
+                                    const String& name) {
+    int pos = jsonSkipWs(source, object.start);
+    if (!object.valid() || pos >= object.end || source[pos] != '{') return {};
+    pos++;
+    while (pos < object.end) {
+        pos = jsonSkipWs(source, pos);
+        if (pos >= object.end || source[pos] == '}' || source[pos] != '"') return {};
+        int keyStart = ++pos;
+        while (pos < object.end && source[pos] != '"') {
+            if (source[pos] == '\\' && pos + 1 < object.end) pos++;
+            pos++;
+        }
+        if (pos >= object.end) return {};
+        String key = source.substring(keyStart, pos);
+        pos++;
+        pos = jsonSkipWs(source, pos);
+        if (pos >= object.end || source[pos++] != ':') return {};
+        pos = jsonSkipWs(source, pos);
+        int valueStart = pos;
+        int valueEnd = jsonSkipValue(source, pos);
+        if (valueEnd > object.end) return {};
+        if (key == name) return { valueStart, valueEnd };
+        pos = jsonSkipWs(source, valueEnd);
+        if (pos < object.end && source[pos] == ',') { pos++; continue; }
+        return {};
+    }
+    return {};
+}
+
+static JsonSpan jsonArrayElementSpan(const String& source, JsonSpan array, int index) {
+    int pos = jsonSkipWs(source, array.start);
+    if (!array.valid() || index < 0 || pos >= array.end || source[pos] != '[') return {};
+    pos++;
+    int current = 0;
+    while (pos < array.end) {
+        pos = jsonSkipWs(source, pos);
+        if (pos >= array.end || source[pos] == ']') return {};
+        int valueStart = pos;
+        int valueEnd = jsonSkipValue(source, pos);
+        if (valueEnd > array.end) return {};
+        if (current++ == index) return { valueStart, valueEnd };
+        pos = jsonSkipWs(source, valueEnd);
+        if (pos < array.end && source[pos] == ',') { pos++; continue; }
+        return {};
+    }
+    return {};
+}
+
+static JsonSpan jsonWalkSpan(const String& source, const String& path) {
+    int rootStart = jsonSkipWs(source, 0);
+    JsonSpan current { rootStart, jsonSkipValue(source, rootStart) };
+    if (!current.valid() || current.end <= current.start) return {};
+    if (path.length() == 0) return current;
+    int segmentStart = 0;
+    for (int i = 0; i <= (int)path.length(); ++i) {
+        if (i != (int)path.length() && path[i] != '.') continue;
+        String segment = path.substring(segmentStart, i);
+        segmentStart = i + 1;
+        if (segment.length() == 0) continue;
+        bool numeric = true;
+        for (size_t k = 0; k < segment.length(); ++k) {
+            if (!isdigit((unsigned char)segment[k])) { numeric = false; break; }
+        }
+        current = numeric ? jsonArrayElementSpan(source, current, segment.toInt())
+                          : jsonObjectFieldSpan(source, current, segment);
+        if (!current.valid()) return {};
+    }
+    return current;
+}
+
+static String jsonWalkPathLegacy(const String& src, const String& path) {
     String cur = src;
     if (path.length() == 0) return cur;
     int start = 0;
@@ -406,6 +929,11 @@ static String jsonWalkPath(const String& src, const String& path) {
 // ═══════════════════════════════════════════════════════════════════════════════
 // OSAVal helpers
 // ═══════════════════════════════════════════════════════════════════════════════
+
+static String jsonWalkPath(const String& source, const String& path) {
+    JsonSpan span = jsonWalkSpan(source, path);
+    return span.valid() ? source.substring(span.start, span.end) : String("");
+}
 
 static String numToStr(double v) {
     if (v == (long long)v && fabs(v) < 1e15) {
@@ -433,15 +961,18 @@ void OSABytecode::clear() {
     setupEnd = 0;
     loopStart = loopEnd = -1;
     valid = false;
-    // Pool entries dropped — Arduino's String dtor frees the heap backing.
-    for (int i = 0; i < OSA_STR_CONST;  i++) strPool[i]  = "";
-    for (int i = 0; i < OSA_NAME_CONST; i++) namePool[i] = "";
+    buildError = OSA_BCERR_NONE;
+    for (int i = 0; i < OSA_STR_CONST;  i++) releaseStringStorage(strPool[i]);
+    for (int i = 0; i < OSA_NAME_CONST; i++) releaseStringStorage(namePool[i]);
 }
 
 int OSARuntime::bcAddNum(double v) {
     for (int i = 0; i < bc.numPoolLen; i++)
         if (bc.numPool[i] == v) return i;
-    if (bc.numPoolLen >= OSA_NUM_CONST) return -1;
+    if (bc.numPoolLen >= OSA_NUM_CONST) {
+        bc.buildError = OSA_BCERR_NUM_POOL_FULL;
+        return -1;
+    }
     bc.numPool[bc.numPoolLen] = v;
     return bc.numPoolLen++;
 }
@@ -449,7 +980,10 @@ int OSARuntime::bcAddNum(double v) {
 int OSARuntime::bcAddStr(const String& s) {
     for (int i = 0; i < bc.strPoolLen; i++)
         if (bc.strPool[i] == s) return i;
-    if (bc.strPoolLen >= OSA_STR_CONST) return -1;
+    if (bc.strPoolLen >= OSA_STR_CONST) {
+        bc.buildError = OSA_BCERR_STR_POOL_FULL;
+        return -1;
+    }
     bc.strPool[bc.strPoolLen] = s;
     return bc.strPoolLen++;
 }
@@ -457,48 +991,334 @@ int OSARuntime::bcAddStr(const String& s) {
 int OSARuntime::bcAddName(const String& s) {
     for (int i = 0; i < bc.namePoolLen; i++)
         if (bc.namePool[i] == s) return i;
-    if (bc.namePoolLen >= OSA_NAME_CONST) return -1;
+    if (bc.namePoolLen >= OSA_NAME_CONST) {
+        bc.buildError = OSA_BCERR_NAME_POOL_FULL;
+        return -1;
+    }
     bc.namePool[bc.namePoolLen] = s;
     return bc.namePoolLen++;
 }
 
-void OSARuntime::vmPush(const OSAVal& v) {
-    if (vmSp >= OSA_STACK_SIZE) { setError(-1, "VM stack overflow"); return; }
-    vmStack[vmSp++] = v;
+bool OSARuntime::vmPush(OSAVal v) {
+    // Once any VM stack operation fails, never mutate the stack again during
+    // the remainder of the current opcode. exec() observes vmHalted and
+    // unwinds immediately.
+    if (vmHalted) return false;
+    if (vmSp >= OSA_STACK_SIZE) {
+        setError(-1, "VM stack overflow");
+        vmHalted = true;
+        return false;
+    }
+    vmStack[vmSp++] = static_cast<OSAVal&&>(v);
+    return true;
 }
 
 OSAVal OSARuntime::vmPop() {
-    if (vmSp == 0) { setError(-1, "VM stack underflow"); return OSAVal(); }
-    return vmStack[--vmSp];
+    if (vmHalted) return OSAVal();
+    if (vmSp == 0) {
+        setError(-1, "VM stack underflow");
+        vmHalted = true;
+        return OSAVal();
+    }
+    return static_cast<OSAVal&&>(vmStack[--vmSp]);
 }
 
 int OSARuntime::bcFindMatchingEnd(int n) { return findMatchingEnd(n); }
 int OSARuntime::bcFindNextBranch(int n)  { return findNextBranch(n); }
 
+// ─── .osac binary format helpers (used by serializeOsac / loadOsac) ───────
+static const char    OSAC_MAGIC[4] = { 'O', 'S', 'A', 'C' };
+static const uint8_t OSAC_VERSION  = 1;
+static void w8(File& f, uint8_t v)  { f.write(v); }
+static void w16(File& f, uint16_t v){ f.write((uint8_t)(v & 0xFF)); f.write((uint8_t)(v >> 8)); }
+static void wD(File& f, double v) {
+    uint8_t* p = (uint8_t*)&v;
+    for (int i = 0; i < 8; i++) f.write(p[i]);
+}
+static void wS(File& f, const String& s) {
+    uint16_t n = (uint16_t)s.length();
+    w16(f, n);
+    for (uint16_t i = 0; i < n; i++) f.write((uint8_t)s[i]);
+}
+static bool readExact(File& f, void* dst, size_t len) {
+    return len == 0 || f.read((uint8_t*)dst, len) == (int)len;
+}
+static bool readLineLimited(File& f, String& out, size_t maximum) {
+    out = "";
+    while (f.available()) {
+        int value = f.read();
+        if (value < 0 || value == '\n') return true;
+        if (value == '\r') continue;
+        if (out.length() >= maximum || !out.concat((char)value)) {
+            while (f.available()) {
+                int rest = f.read();
+                if (rest < 0 || rest == '\n') break;
+            }
+            out = "";
+            return false;
+        }
+    }
+    return true;
+}
+static bool r8(File& f, uint8_t& out) {
+    int v = f.read();
+    if (v < 0) return false;
+    out = (uint8_t)v;
+    return true;
+}
+static bool r16(File& f, uint16_t& out) {
+    uint8_t a, b;
+    if (!r8(f, a) || !r8(f, b)) return false;
+    out = (uint16_t)a | ((uint16_t)b << 8);
+    return true;
+}
+static bool rD(File& f, double& out) {
+    return readExact(f, &out, sizeof(out));
+}
+static bool rS(File& f, String& out, uint16_t maxLen) {
+    uint16_t n;
+    if (!r16(f, n) || n > maxLen ||
+        (uint32_t)f.position() + n > (uint32_t)f.size()) return false;
+    out = "";
+    if (!out.reserve(n)) return false;
+    char buf[64];
+    uint16_t left = n;
+    while (left > 0) {
+        size_t take = min((size_t)left, sizeof(buf));
+        if (!readExact(f, buf, take) || !out.concat(buf, (unsigned int)take))
+            return false;
+        left -= (uint16_t)take;
+    }
+    return true;
+}
+
+// Extracted from `#appColor "#RRGGBB"` if present; defaults to 0.
+static uint16_t parseAppColor(const String* lines, int lineCount, uint16_t fallback = 0) {
+    for (int i = 0; i < lineCount; i++) {
+        String t = lines[i]; t.trim();
+        if (!t.startsWith("#appColor")) continue;
+        int q1 = t.indexOf('"');
+        int q2 = t.lastIndexOf('"');
+        if (q1 < 0 || q2 <= q1) continue;
+        String hex = t.substring(q1 + 1, q2);
+        if (hex.length() > 0 && hex[0] == '#') hex = hex.substring(1);
+        if (hex.length() != 6) continue;
+        long v = strtol(hex.c_str(), nullptr, 16);
+        uint8_t r = (uint8_t)((v >> 16) & 0xFF);
+        uint8_t g = (uint8_t)((v >> 8) & 0xFF);
+        uint8_t b = (uint8_t)(v & 0xFF);
+        return ((uint16_t)(r & 0xF8) << 8) | ((uint16_t)(g & 0xFC) << 3) | (b >> 3);
+    }
+    return fallback;
+}
+
+bool OSARuntime::serializeOsac(const String& dstPath) {
+    if (!bc.valid) return false;
+    if (!isSdReady) return false;
+    SD.remove(dstPath.c_str());
+    File f = SD.open(dstPath, FILE_WRITE);
+    if (!f) return false;
+
+    // Header
+    for (int i = 0; i < 4; i++) f.write(OSAC_MAGIC[i]);
+    w8(f, OSAC_VERSION);
+    wS(f, appName);
+    w16(f, parseAppColor(lines, lineCount, 0));
+    bool isApp = false;
+    for (int i = 0; i < lineCount; i++) {
+        String t = lines[i]; t.trim();
+        if (t.startsWith("#isApp")) {
+            isApp = (t.indexOf("true") > 0);
+            break;
+        }
+    }
+    w8(f, isApp ? 1 : 0);
+    w8(f, isException ? 1 : 0);
+    w8(f, requiredPerms);
+
+    // Bytecode body
+    w16(f, (uint16_t)bc.codeLen);
+    w16(f, (uint16_t)bc.setupEnd);
+    w16(f, (uint16_t)(bc.loopStart & 0xFFFF));
+    w16(f, (uint16_t)(bc.loopEnd   & 0xFFFF));
+    for (int i = 0; i < bc.codeLen; i++) f.write(bc.code[i]);
+
+    w8(f, (uint8_t)bc.numPoolLen);
+    for (int i = 0; i < bc.numPoolLen; i++) wD(f, bc.numPool[i]);
+
+    w8(f, (uint8_t)bc.strPoolLen);
+    for (int i = 0; i < bc.strPoolLen; i++) wS(f, bc.strPool[i]);
+
+    w8(f, (uint8_t)bc.namePoolLen);
+    for (int i = 0; i < bc.namePoolLen; i++) wS(f, bc.namePool[i]);
+
+    w8(f, (uint8_t)funcCount);
+    for (int i = 0; i < funcCount; i++) {
+        wS(f, funcs[i].name);
+        w16(f, (uint16_t)funcs[i].bcStart);
+        w8(f, (uint8_t)funcs[i].paramCount);
+        for (int j = 0; j < funcs[i].paramCount; j++) wS(f, funcs[i].params[j]);
+    }
+    f.close();
+    return true;
+}
+
+bool OSARuntime::loadOsac(const String& srcPath) {
+    if (!isSdReady) { setError(0, "No SD card"); return false; }
+    File f = SD.open(srcPath);
+    if (!f) { setError(0, "Not found: " + srcPath); return false; }
+    if ((size_t)f.size() > 96 * 1024) {
+        f.close(); setError(0, ".osac exceeds 96 KB"); return false;
+    }
+    char magic[4];
+    if (!readExact(f, magic, sizeof(magic))) {
+        f.close(); setError(0, "Truncated .osac header"); return false;
+    }
+    if (magic[0] != 'O' || magic[1] != 'S' || magic[2] != 'A' || magic[3] != 'C') {
+        f.close(); setError(0, "Bad .osac magic"); return false;
+    }
+    uint8_t ver;
+    if (!r8(f, ver) || ver != OSAC_VERSION) {
+        f.close(); setError(0, "Bad .osac version"); return false;
+    }
+
+    bc.clear();
+    uint16_t ignoredColor, codeLen, setupEnd, loopStartRaw, loopEndRaw;
+    uint8_t ignoredIsApp, serializedException, count;
+    if (!rS(f, appName, 64)) {
+        f.close(); setError(0, "Invalid .osac app name"); return false;
+    }
+    if (!r16(f, ignoredColor) || !r8(f, ignoredIsApp)) {
+        f.close(); setError(0, "Truncated .osac header"); return false;
+    }
+    if (!r8(f, serializedException) || !r8(f, requiredPerms)) {
+        f.close(); setError(0, "Truncated .osac header"); return false;
+    }
+    (void)serializedException;
+
+    if (!r16(f, codeLen) || !r16(f, setupEnd) ||
+        !r16(f, loopStartRaw) || !r16(f, loopEndRaw)) {
+        f.close(); setError(0, "Truncated .osac layout"); return false;
+    }
+    bc.codeLen   = codeLen;
+    bc.setupEnd  = setupEnd;
+    bc.loopStart = (int16_t)loopStartRaw;
+    bc.loopEnd   = (int16_t)loopEndRaw;
+    if (bc.codeLen < 1 || bc.codeLen > OSA_BC_MAX || bc.setupEnd > bc.codeLen ||
+        (bc.loopStart >= 0 && (bc.loopStart >= bc.codeLen ||
+         bc.loopEnd <= bc.loopStart || bc.loopEnd > bc.codeLen))) {
+        f.close(); setError(0, "Invalid .osac layout"); return false;
+    }
+    if (!readExact(f, bc.code, bc.codeLen)) {
+        f.close(); setError(0, "Truncated .osac code"); return false;
+    }
+
+    if (!r8(f, count) || count > OSA_NUM_CONST) {
+        f.close(); setError(0, "Invalid .osac number pool"); return false;
+    }
+    bc.numPoolLen = count;
+    for (int i = 0; i < bc.numPoolLen; i++) {
+        if (!rD(f, bc.numPool[i])) {
+            f.close(); setError(0, "Truncated .osac number pool"); return false;
+        }
+    }
+
+    if (!r8(f, count) || count > OSA_STR_CONST) {
+        f.close(); setError(0, "Invalid .osac string pool"); return false;
+    }
+    bc.strPoolLen = count;
+    size_t totalStringBytes = 0;
+    for (int i = 0; i < bc.strPoolLen; i++) {
+        if (!rS(f, bc.strPool[i], 4096)) {
+            f.close(); setError(0, "Invalid .osac string"); return false;
+        }
+        totalStringBytes += bc.strPool[i].length();
+        if (totalStringBytes > 32 * 1024) {
+            f.close(); setError(0, ".osac string pool exceeds 32 KB"); return false;
+        }
+    }
+
+    if (!r8(f, count) || count > OSA_NAME_CONST) {
+        f.close(); setError(0, "Invalid .osac name pool"); return false;
+    }
+    bc.namePoolLen = count;
+    for (int i = 0; i < bc.namePoolLen; i++) {
+        if (!rS(f, bc.namePool[i], 64)) {
+            f.close(); setError(0, "Invalid .osac identifier"); return false;
+        }
+    }
+
+    if (!r8(f, count) || count > OSA_MAX_FUNCS) {
+        f.close(); setError(0, "Invalid .osac function table"); return false;
+    }
+    funcCount = count;
+    for (int i = 0; i < funcCount; i++) {
+        uint16_t fnStart;
+        uint8_t paramCount;
+        if (!rS(f, funcs[i].name, 64) || !r16(f, fnStart) ||
+            !r8(f, paramCount) || fnStart >= bc.codeLen || paramCount > 8) {
+            f.close(); setError(0, "Invalid .osac function"); return false;
+        }
+        funcs[i].bcStart     = fnStart;
+        funcs[i].paramCount  = paramCount;
+        funcs[i].bodyStart   = funcs[i].bodyEnd = 0;
+        for (int j = 0; j < funcs[i].paramCount; j++) {
+            if (!rS(f, funcs[i].params[j], 64)) {
+                f.close(); setError(0, "Invalid .osac parameter"); return false;
+            }
+        }
+    }
+    f.close();
+    isException = readIsExceptionFromFile(srcPath);
+    bc.valid = true;
+    return true;
+}
+
 // ─── Compiler helpers ────────────────────────────────────────────────────────
 namespace {
 
-static void emit1(OSABytecode& bc, uint8_t op) {
-    if (bc.codeLen + 1 > OSA_BC_MAX) return;
+static bool emit1(OSABytecode& bc, uint8_t op) {
+    if (bc.codeLen > OSA_BC_MAX - 1) {
+        bc.buildError = OSA_BCERR_CODE_FULL;
+        return false;
+    }
     bc.code[bc.codeLen++] = op;
+    return true;
 }
-static void emit3(OSABytecode& bc, uint8_t op, int16_t operand) {
-    if (bc.codeLen + 3 > OSA_BC_MAX) return;
+static bool emit3(OSABytecode& bc, uint8_t op, int16_t operand) {
+    if (bc.codeLen > OSA_BC_MAX - 3) {
+        bc.buildError = OSA_BCERR_CODE_FULL;
+        return false;
+    }
     bc.code[bc.codeLen++] = op;
     bc.code[bc.codeLen++] = (uint8_t)(operand & 0xFF);
     bc.code[bc.codeLen++] = (uint8_t)((operand >> 8) & 0xFF);
+    return true;
 }
-static void emit4(OSABytecode& bc, uint8_t op, int16_t operand, uint8_t b) {
-    emit3(bc, op, operand);
-    if (bc.codeLen + 1 > OSA_BC_MAX) return;
+static bool emit4(OSABytecode& bc, uint8_t op, int16_t operand, uint8_t b) {
+    // Check all four bytes first so a failed call never leaves a partial
+    // instruction at the end of the stream.
+    if (bc.codeLen > OSA_BC_MAX - 4) {
+        bc.buildError = OSA_BCERR_CODE_FULL;
+        return false;
+    }
+    bc.code[bc.codeLen++] = op;
+    bc.code[bc.codeLen++] = (uint8_t)(operand & 0xFF);
+    bc.code[bc.codeLen++] = (uint8_t)((operand >> 8) & 0xFF);
     bc.code[bc.codeLen++] = b;
+    return true;
 }
 static int16_t readI16(const uint8_t* p) {
     return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
 }
-static void patch16(OSABytecode& bc, int at, int16_t v) {
+static bool patch16(OSABytecode& bc, int at, int16_t v) {
+    if (at < 0 || at + 1 >= bc.codeLen || at + 1 >= OSA_BC_MAX) {
+        bc.buildError = OSA_BCERR_BAD_PATCH;
+        return false;
+    }
     bc.code[at]     = (uint8_t)(v & 0xFF);
     bc.code[at + 1] = (uint8_t)((v >> 8) & 0xFF);
+    return true;
 }
 
 // Tokenizer for one source line.
@@ -615,6 +1435,13 @@ static bool compileLineAt(OSARuntime* rt, int& i, int rangeEnd);
 bool OSARuntime::compile() {
     bc.clear();
     g_loopDepth = 0;
+    lastCompileError = OSA_BCERR_NONE;
+    auto failCompile = [&](uint8_t fallback) -> bool {
+        lastCompileError = bc.buildError != OSA_BCERR_NONE
+                         ? bc.buildError : fallback;
+        bc.clear();
+        return false;
+    };
 
     // Find function spans + main loop position the same way loadScript does.
     int topLoopStart = -1, topLoopEnd = -1;
@@ -631,21 +1458,20 @@ bool OSARuntime::compile() {
 
     // Setup section — everything up to the main loop, skipping function defs.
     int setupEnd = (topLoopStart >= 0) ? topLoopStart : lineCount;
-    if (!compileLineRange(this, 0, setupEnd)) { bc.clear(); return false; }
-    emit1(bc, OP_HALT);
+    if (!compileLineRange(this, 0, setupEnd))
+        return failCompile(OSA_BCERR_UNSUPPORTED);
+    if (!emit1(bc, OP_HALT)) return failCompile(OSA_BCERR_CODE_FULL);
     bc.setupEnd = bc.codeLen;
 
     // Main loop body.
     if (topLoopStart >= 0 && topLoopEnd > topLoopStart) {
         bc.loopStart = bc.codeLen;
-        emit1(bc, OP_LOOP_TICK);
+        if (!emit1(bc, OP_LOOP_TICK)) return failCompile(OSA_BCERR_CODE_FULL);
         if (!compileLineRange(this, topLoopStart + 1, topLoopEnd)) {
-            bc.clear(); return false;
+            return failCompile(OSA_BCERR_UNSUPPORTED);
         }
-        int jumpAt = bc.codeLen;
-        emit3(bc, OP_JMP, 0);
-        int16_t back = (int16_t)(bc.loopStart - (jumpAt + 3));
-        patch16(bc, jumpAt + 1, back);
+        // The host calls runUpdate() repeatedly. Do one source-level loop
+        // iteration per call instead of trapping Arduino's loopTask here.
         bc.loopEnd = bc.codeLen;
     }
 
@@ -655,11 +1481,13 @@ bool OSARuntime::compile() {
     for (int f = 0; f < funcCount; f++) {
         funcs[f].bcStart = bc.codeLen;
         if (!compileLineRange(this, funcs[f].bodyStart, funcs[f].bodyEnd)) {
-            bc.clear(); return false;
+            return failCompile(OSA_BCERR_UNSUPPORTED);
         }
-        emit1(bc, OP_RET_VOID);
+        if (!emit1(bc, OP_RET_VOID)) return failCompile(OSA_BCERR_CODE_FULL);
     }
 
+    if (bc.buildError != OSA_BCERR_NONE)
+        return failCompile(bc.buildError);
     bc.valid = true;
     return true;
 }
@@ -668,6 +1496,7 @@ static bool compileLineRange(OSARuntime* rt, int from, int to) {
     int i = from;
     while (i < to) {
         if (!compileLineAt(rt, i, to)) return false;
+        if (rt->bc.buildError != OSA_BCERR_NONE) return false;
     }
     return true;
 }
@@ -685,14 +1514,85 @@ static bool compileLineAt(OSARuntime* rt, int& i, int rangeEnd) {
         return true;
     }
 
+    // Inline control flow: `if X then STMT end` and
+    // `while X do STMT end`. Compiling these avoids retaining every source
+    // line in heap for UI-heavy apps such as OpenStore.
+    if (s.startsWith("if ") && s.endsWith(" end")) {
+        int thenPos = s.indexOf(" then ");
+        if (thenPos <= 3) return false;
+        String cond = s.substring(3, thenPos); cond.trim();
+        String body = s.substring(thenPos + 6, s.length() - 4); body.trim();
+        if (cond.length() == 0 || body.length() == 0) return false;
+
+        Lex lex(cond);
+        if (!compExpr(rt, lex) || !emit3(rt->bc, OP_JMP_IF_FALSE, 0))
+            return false;
+        int skipPatch = rt->bc.codeLen - 2;
+
+        String saved = rt->bcLines()[i];
+        rt->bcLines()[i] = body;
+        int inner = i;
+        bool bodyOk = compileLineAt(rt, inner, i + 1);
+        rt->bcLines()[i] = saved;
+        if (!bodyOk ||
+            !patch16(rt->bc, skipPatch,
+                     (int16_t)(rt->bc.codeLen - (skipPatch + 2))))
+            return false;
+        i++;
+        return true;
+    }
+
+    if (s.startsWith("while ") && s.endsWith(" end")) {
+        int doPos = s.indexOf(" do ");
+        if (doPos <= 6) return false;
+        String cond = s.substring(6, doPos); cond.trim();
+        String body = s.substring(doPos + 4, s.length() - 4); body.trim();
+        if (cond.length() == 0 || body.length() == 0) return false;
+
+        int topPc = rt->bc.codeLen;
+        Lex lex(cond);
+        if (!compExpr(rt, lex) || !emit3(rt->bc, OP_JMP_IF_FALSE, 0))
+            return false;
+        int exitPatch = rt->bc.codeLen - 2;
+        if (g_loopDepth >= OSA_LOOP_DEPTH) return false;
+        { LoopFrame& frame = g_loopStack[g_loopDepth++];
+          frame.startPc = topPc; frame.breakCount = 0; }
+
+        String saved = rt->bcLines()[i];
+        rt->bcLines()[i] = body;
+        int inner = i;
+        bool bodyOk = compileLineAt(rt, inner, i + 1);
+        rt->bcLines()[i] = saved;
+        if (!bodyOk) { g_loopDepth--; return false; }
+
+        int backAt = rt->bc.codeLen;
+        if (!emit3(rt->bc, OP_JMP, 0) ||
+            !patch16(rt->bc, backAt + 1,
+                     (int16_t)(topPc - (backAt + 3))) ||
+            !patch16(rt->bc, exitPatch,
+                     (int16_t)(rt->bc.codeLen - (exitPatch + 2)))) {
+            g_loopDepth--;
+            return false;
+        }
+        LoopFrame& frame = g_loopStack[--g_loopDepth];
+        for (int k = 0; k < frame.breakCount; ++k) {
+            if (!patch16(rt->bc, frame.breaks[k],
+                         (int16_t)(rt->bc.codeLen - (frame.breaks[k] + 2))))
+                return false;
+        }
+        i++;
+        return true;
+    }
+
     // ── if / elif / else / end ──────────────────────────────────────────────
     if (s.startsWith("if ")) {
-        // Bail out on inline-if for now: `if X then stmt end` on one line.
-        // The block form (then-newline-…-newline-end) is supported below.
         int thenPos = s.indexOf("then");
         if (thenPos < 0) return false;
         String tail = s.substring(thenPos + 4); tail.trim();
-        if (tail.length() > 0) return false;  // inline → fall back to tree-walker
+        // Inline form `if X then STMT end` — bail to tree-walker. STMT could
+        // be `return`, `var x = …`, or anything else not safely modeled as a
+        // pure expression statement.
+        if (tail.length() > 0) return false;
 
         int finalEnd = rt->bcFindMatchingEnd(i);
         if (finalEnd < 0 || finalEnd > rangeEnd) return false;
@@ -705,15 +1605,17 @@ static bool compileLineAt(OSARuntime* rt, int& i, int rangeEnd) {
         while (j < finalEnd) {
             String h = rt->bcLines()[j]; h.trim();
             if (h.startsWith("if ") || h.startsWith("elif ")) {
-                if (branchPc >= 0)
-                    patch16(rt->bc, branchPc, (int16_t)(rt->bc.codeLen - (branchPc + 2)));
+                if (branchPc >= 0 &&
+                    !patch16(rt->bc, branchPc,
+                             (int16_t)(rt->bc.codeLen - (branchPc + 2))))
+                    return false;
                 int prefix = h.startsWith("if ") ? 3 : 5;
                 int tp = h.indexOf("then");
                 if (tp < 0) return false;
                 String cond = h.substring(prefix, tp); cond.trim();
                 Lex lex(cond);
                 if (!compExpr(rt, lex)) return false;
-                emit3(rt->bc, OP_JMP_IF_FALSE, 0);
+                if (!emit3(rt->bc, OP_JMP_IF_FALSE, 0)) return false;
                 branchPc = rt->bc.codeLen - 2;
 
                 int next = rt->bcFindNextBranch(j + 1);
@@ -721,12 +1623,14 @@ static bool compileLineAt(OSARuntime* rt, int& i, int rangeEnd) {
                 if (!compileLineRange(rt, j + 1, next)) return false;
 
                 if (forwardCount >= 16) return false;
-                emit3(rt->bc, OP_JMP, 0);
+                if (!emit3(rt->bc, OP_JMP, 0)) return false;
                 forwardJumps[forwardCount++] = rt->bc.codeLen - 2;
                 j = next;
             } else if (h == "else") {
                 if (branchPc >= 0) {
-                    patch16(rt->bc, branchPc, (int16_t)(rt->bc.codeLen - (branchPc + 2)));
+                    if (!patch16(rt->bc, branchPc,
+                                 (int16_t)(rt->bc.codeLen - (branchPc + 2))))
+                        return false;
                     branchPc = -1;
                 }
                 if (!compileLineRange(rt, j + 1, finalEnd)) return false;
@@ -735,11 +1639,15 @@ static bool compileLineAt(OSARuntime* rt, int& i, int rangeEnd) {
                 return false;          // unexpected mid-block content
             }
         }
-        if (branchPc >= 0)
-            patch16(rt->bc, branchPc, (int16_t)(rt->bc.codeLen - (branchPc + 2)));
-        for (int k = 0; k < forwardCount; k++)
-            patch16(rt->bc, forwardJumps[k],
-                    (int16_t)(rt->bc.codeLen - (forwardJumps[k] + 2)));
+        if (branchPc >= 0 &&
+            !patch16(rt->bc, branchPc,
+                     (int16_t)(rt->bc.codeLen - (branchPc + 2))))
+            return false;
+        for (int k = 0; k < forwardCount; k++) {
+            if (!patch16(rt->bc, forwardJumps[k],
+                         (int16_t)(rt->bc.codeLen - (forwardJumps[k] + 2))))
+                return false;
+        }
         i = finalEnd + 1;
         return true;
     }
@@ -749,7 +1657,9 @@ static bool compileLineAt(OSARuntime* rt, int& i, int rangeEnd) {
         int doPos = s.indexOf(" do");
         if (doPos < 0) return false;
         String tail = s.substring(doPos + 3); tail.trim();
-        if (tail.length() > 0) return false;  // inline-while not supported here
+        // Inline-while `while X do STMT end` → bail to tree-walker for the
+        // same reason as inline-if above.
+        if (tail.length() > 0) return false;
         String cond = s.substring(6, doPos); cond.trim();
         int finalEnd = rt->bcFindMatchingEnd(i);
         if (finalEnd < 0 || finalEnd > rangeEnd) return false;
@@ -757,7 +1667,7 @@ static bool compileLineAt(OSARuntime* rt, int& i, int rangeEnd) {
         int topPc = rt->bc.codeLen;
         Lex lex(cond);
         if (!compExpr(rt, lex)) return false;
-        emit3(rt->bc, OP_JMP_IF_FALSE, 0);
+        if (!emit3(rt->bc, OP_JMP_IF_FALSE, 0)) return false;
         int exitPatch = rt->bc.codeLen - 2;
 
         if (g_loopDepth >= OSA_LOOP_DEPTH) return false;
@@ -766,13 +1676,19 @@ static bool compileLineAt(OSARuntime* rt, int& i, int rangeEnd) {
         if (!compileLineRange(rt, i + 1, finalEnd)) { g_loopDepth--; return false; }
 
         int backAt = rt->bc.codeLen;
-        emit3(rt->bc, OP_JMP, 0);
-        patch16(rt->bc, backAt + 1, (int16_t)(topPc - (backAt + 3)));
+        if (!emit3(rt->bc, OP_JMP, 0)) return false;
+        if (!patch16(rt->bc, backAt + 1, (int16_t)(topPc - (backAt + 3))))
+            return false;
 
-        patch16(rt->bc, exitPatch, (int16_t)(rt->bc.codeLen - (exitPatch + 2)));
+        if (!patch16(rt->bc, exitPatch,
+                     (int16_t)(rt->bc.codeLen - (exitPatch + 2))))
+            return false;
         LoopFrame& fr = g_loopStack[--g_loopDepth];
-        for (int k = 0; k < fr.breakCount; k++)
-            patch16(rt->bc, fr.breaks[k], (int16_t)(rt->bc.codeLen - (fr.breaks[k] + 2)));
+        for (int k = 0; k < fr.breakCount; k++) {
+            if (!patch16(rt->bc, fr.breaks[k],
+                         (int16_t)(rt->bc.codeLen - (fr.breaks[k] + 2))))
+                return false;
+        }
 
         i = finalEnd + 1;
         return true;
@@ -792,23 +1708,25 @@ static bool compileLineAt(OSARuntime* rt, int& i, int rangeEnd) {
         int finalEnd = rt->bcFindMatchingEnd(i);
         if (finalEnd < 0 || finalEnd > rangeEnd) return false;
         int nameIdx = rt->bcAddName(var);
+        if (nameIdx < 0) return false;
 
         // i = start
         { Lex lex(startE); if (!compExpr(rt, lex)) return false; }
-        emit3(rt->bc, OP_DECLARE_VAR, (int16_t)nameIdx);
+        if (!emit3(rt->bc, OP_DECLARE_VAR, (int16_t)nameIdx)) return false;
 
         // Compute end once, store in a hidden var.
         String endVar = String("__for_end_") + i;
         int endIdx = rt->bcAddName(endVar);
+        if (endIdx < 0) return false;
         { Lex lex(endE); if (!compExpr(rt, lex)) return false; }
-        emit3(rt->bc, OP_DECLARE_VAR, (int16_t)endIdx);
+        if (!emit3(rt->bc, OP_DECLARE_VAR, (int16_t)endIdx)) return false;
 
         int topPc = rt->bc.codeLen;
         // while i <= __end__ do
-        emit3(rt->bc, OP_LOAD_VAR, (int16_t)nameIdx);
-        emit3(rt->bc, OP_LOAD_VAR, (int16_t)endIdx);
-        emit1(rt->bc, OP_LE);
-        emit3(rt->bc, OP_JMP_IF_FALSE, 0);
+        if (!emit3(rt->bc, OP_LOAD_VAR, (int16_t)nameIdx) ||
+            !emit3(rt->bc, OP_LOAD_VAR, (int16_t)endIdx) ||
+            !emit1(rt->bc, OP_LE) ||
+            !emit3(rt->bc, OP_JMP_IF_FALSE, 0)) return false;
         int exitPatch = rt->bc.codeLen - 2;
 
         if (g_loopDepth >= OSA_LOOP_DEPTH) return false;
@@ -817,19 +1735,25 @@ static bool compileLineAt(OSARuntime* rt, int& i, int rangeEnd) {
         if (!compileLineRange(rt, i + 1, finalEnd)) { g_loopDepth--; return false; }
 
         // i = i + 1
-        emit3(rt->bc, OP_LOAD_VAR, (int16_t)nameIdx);
-        emit1(rt->bc, OP_PUSH_NUM1);
-        emit1(rt->bc, OP_ADD);
-        emit3(rt->bc, OP_STORE_VAR, (int16_t)nameIdx);
+        if (!emit3(rt->bc, OP_LOAD_VAR, (int16_t)nameIdx) ||
+            !emit1(rt->bc, OP_PUSH_NUM1) ||
+            !emit1(rt->bc, OP_ADD) ||
+            !emit3(rt->bc, OP_STORE_VAR, (int16_t)nameIdx)) return false;
 
         int backAt = rt->bc.codeLen;
-        emit3(rt->bc, OP_JMP, 0);
-        patch16(rt->bc, backAt + 1, (int16_t)(topPc - (backAt + 3)));
+        if (!emit3(rt->bc, OP_JMP, 0)) return false;
+        if (!patch16(rt->bc, backAt + 1, (int16_t)(topPc - (backAt + 3))))
+            return false;
 
-        patch16(rt->bc, exitPatch, (int16_t)(rt->bc.codeLen - (exitPatch + 2)));
+        if (!patch16(rt->bc, exitPatch,
+                     (int16_t)(rt->bc.codeLen - (exitPatch + 2))))
+            return false;
         LoopFrame& fr = g_loopStack[--g_loopDepth];
-        for (int k = 0; k < fr.breakCount; k++)
-            patch16(rt->bc, fr.breaks[k], (int16_t)(rt->bc.codeLen - (fr.breaks[k] + 2)));
+        for (int k = 0; k < fr.breakCount; k++) {
+            if (!patch16(rt->bc, fr.breaks[k],
+                         (int16_t)(rt->bc.codeLen - (fr.breaks[k] + 2))))
+                return false;
+        }
 
         i = finalEnd + 1;
         return true;
@@ -840,7 +1764,7 @@ static bool compileLineAt(OSARuntime* rt, int& i, int rangeEnd) {
         if (g_loopDepth == 0) return false;
         LoopFrame& fr = g_loopStack[g_loopDepth - 1];
         if (fr.breakCount >= 16) return false;
-        emit3(rt->bc, OP_JMP, 0);
+        if (!emit3(rt->bc, OP_JMP, 0)) return false;
         fr.breaks[fr.breakCount++] = rt->bc.codeLen - 2;
         i++;
         return true;
@@ -849,24 +1773,29 @@ static bool compileLineAt(OSARuntime* rt, int& i, int rangeEnd) {
         if (g_loopDepth == 0) return false;
         LoopFrame& fr = g_loopStack[g_loopDepth - 1];
         int at = rt->bc.codeLen;
-        emit3(rt->bc, OP_JMP, 0);
-        patch16(rt->bc, at + 1, (int16_t)(fr.startPc - (at + 3)));
+        if (!emit3(rt->bc, OP_JMP, 0)) return false;
+        if (!patch16(rt->bc, at + 1, (int16_t)(fr.startPc - (at + 3))))
+            return false;
         i++;
         return true;
     }
 
     // ── return / exit ──────────────────────────────────────────────────────
     if (s == "exit()" || s == "exit") {
-        emit1(rt->bc, OP_EXIT);
+        if (!emit1(rt->bc, OP_EXIT)) return false;
         i++;
         return true;
     }
     if (s == "return" || s.startsWith("return ")) {
         String rhs = s.length() > 6 ? s.substring(7) : String(""); rhs.trim();
-        if (rhs.length() == 0) { emit1(rt->bc, OP_RET_VOID); i++; return true; }
+        if (rhs.length() == 0) {
+            if (!emit1(rt->bc, OP_RET_VOID)) return false;
+            i++;
+            return true;
+        }
         Lex lex(rhs);
         if (!compExpr(rt, lex)) return false;
-        emit1(rt->bc, OP_RET);
+        if (!emit1(rt->bc, OP_RET)) return false;
         i++;
         return true;
     }
@@ -885,7 +1814,9 @@ static bool compileLineAt(OSARuntime* rt, int& i, int rangeEnd) {
             Tok eq = lex.next();
             if (eq.type != TK_EQ) return false;
             if (!compExpr(rt, lex)) return false;
-            emit3(rt->bc, OP_DECLARE_VAR, (int16_t)rt->bcAddName(name.str));
+            int nameIdx = rt->bcAddName(name.str);
+            if (nameIdx < 0) return false;
+            if (!emit3(rt->bc, OP_DECLARE_VAR, (int16_t)nameIdx)) return false;
             i++;
             return true;
         }
@@ -895,14 +1826,16 @@ static bool compileLineAt(OSARuntime* rt, int& i, int rangeEnd) {
             Tok maybeEq = lex.next();
             if (maybeEq.type == TK_EQ) {
                 if (!compExpr(rt, lex)) return false;
-                emit3(rt->bc, OP_STORE_VAR, (int16_t)rt->bcAddName(first.str));
+                int nameIdx = rt->bcAddName(first.str);
+                if (nameIdx < 0) return false;
+                if (!emit3(rt->bc, OP_STORE_VAR, (int16_t)nameIdx)) return false;
                 i++;
                 return true;
             }
             lex.p = save;
         }
         if (!compExpr(rt, lex)) return false;
-        emit1(rt->bc, OP_POP);
+        if (!emit1(rt->bc, OP_POP)) return false;
         i++;
         return true;
     }
@@ -916,7 +1849,7 @@ static bool compOr(OSARuntime* rt, Lex& lex) {
     if (!compAnd(rt, lex)) return false;
     while (lex.peek().type == TK_OR) { lex.next();
         if (!compAnd(rt, lex)) return false;
-        emit1(rt->bc, OP_OR);
+        if (!emit1(rt->bc, OP_OR)) return false;
     }
     return true;
 }
@@ -924,7 +1857,7 @@ static bool compAnd(OSARuntime* rt, Lex& lex) {
     if (!compCmp(rt, lex)) return false;
     while (lex.peek().type == TK_AND) { lex.next();
         if (!compCmp(rt, lex)) return false;
-        emit1(rt->bc, OP_AND);
+        if (!emit1(rt->bc, OP_AND)) return false;
     }
     return true;
 }
@@ -936,12 +1869,12 @@ static bool compCmp(OSARuntime* rt, Lex& lex) {
         lex.next();
         if (!compSum(rt, lex)) return false;
         switch (t.type) {
-            case TK_EQEQ: emit1(rt->bc, OP_EQ); break;
-            case TK_NE:   emit1(rt->bc, OP_NE); break;
-            case TK_LT:   emit1(rt->bc, OP_LT); break;
-            case TK_LE:   emit1(rt->bc, OP_LE); break;
-            case TK_GT:   emit1(rt->bc, OP_GT); break;
-            case TK_GE:   emit1(rt->bc, OP_GE); break;
+            case TK_EQEQ: if (!emit1(rt->bc, OP_EQ)) return false; break;
+            case TK_NE:   if (!emit1(rt->bc, OP_NE)) return false; break;
+            case TK_LT:   if (!emit1(rt->bc, OP_LT)) return false; break;
+            case TK_LE:   if (!emit1(rt->bc, OP_LE)) return false; break;
+            case TK_GT:   if (!emit1(rt->bc, OP_GT)) return false; break;
+            case TK_GE:   if (!emit1(rt->bc, OP_GE)) return false; break;
             default: break;
         }
     }
@@ -951,8 +1884,8 @@ static bool compSum(OSARuntime* rt, Lex& lex) {
     if (!compMul(rt, lex)) return false;
     while (true) {
         Tok t = lex.peek();
-        if (t.type == TK_PLUS)       { lex.next(); if (!compMul(rt, lex)) return false; emit1(rt->bc, OP_ADD); }
-        else if (t.type == TK_MINUS) { lex.next(); if (!compMul(rt, lex)) return false; emit1(rt->bc, OP_SUB); }
+        if (t.type == TK_PLUS)       { lex.next(); if (!compMul(rt, lex) || !emit1(rt->bc, OP_ADD)) return false; }
+        else if (t.type == TK_MINUS) { lex.next(); if (!compMul(rt, lex) || !emit1(rt->bc, OP_SUB)) return false; }
         else break;
     }
     return true;
@@ -961,29 +1894,35 @@ static bool compMul(OSARuntime* rt, Lex& lex) {
     if (!compUny(rt, lex)) return false;
     while (true) {
         Tok t = lex.peek();
-        if      (t.type == TK_STAR)    { lex.next(); if (!compUny(rt, lex)) return false; emit1(rt->bc, OP_MUL); }
-        else if (t.type == TK_SLASH)   { lex.next(); if (!compUny(rt, lex)) return false; emit1(rt->bc, OP_DIV); }
-        else if (t.type == TK_PERCENT) { lex.next(); if (!compUny(rt, lex)) return false; emit1(rt->bc, OP_MOD); }
+        if      (t.type == TK_STAR)    { lex.next(); if (!compUny(rt, lex) || !emit1(rt->bc, OP_MUL)) return false; }
+        else if (t.type == TK_SLASH)   { lex.next(); if (!compUny(rt, lex) || !emit1(rt->bc, OP_DIV)) return false; }
+        else if (t.type == TK_PERCENT) { lex.next(); if (!compUny(rt, lex) || !emit1(rt->bc, OP_MOD)) return false; }
         else break;
     }
     return true;
 }
 static bool compUny(OSARuntime* rt, Lex& lex) {
     Tok t = lex.peek();
-    if (t.type == TK_MINUS) { lex.next(); if (!compUny(rt, lex)) return false; emit1(rt->bc, OP_NEG); return true; }
-    if (t.type == TK_NOT)   { lex.next(); if (!compUny(rt, lex)) return false; emit1(rt->bc, OP_NOT); return true; }
+    if (t.type == TK_MINUS) { lex.next(); return compUny(rt, lex) && emit1(rt->bc, OP_NEG); }
+    if (t.type == TK_NOT)   { lex.next(); return compUny(rt, lex) && emit1(rt->bc, OP_NOT); }
     return compPri(rt, lex);
 }
 static bool compPri(OSARuntime* rt, Lex& lex) {
     Tok t = lex.next();
     if (t.type == TK_NUM) {
-        if      (t.num == 0.0) emit1(rt->bc, OP_PUSH_NUM0);
-        else if (t.num == 1.0) emit1(rt->bc, OP_PUSH_NUM1);
-        else                   emit3(rt->bc, OP_PUSH_NUM, (int16_t)rt->bcAddNum(t.num));
+        if      (t.num == 0.0) { if (!emit1(rt->bc, OP_PUSH_NUM0)) return false; }
+        else if (t.num == 1.0) { if (!emit1(rt->bc, OP_PUSH_NUM1)) return false; }
+        else {
+            int idx = rt->bcAddNum(t.num);
+            if (idx < 0) return false;
+            if (!emit3(rt->bc, OP_PUSH_NUM, (int16_t)idx)) return false;
+        }
         return true;
     }
     if (t.type == TK_STR) {
-        emit3(rt->bc, OP_PUSH_STR, (int16_t)rt->bcAddStr(t.str));
+        int idx = rt->bcAddStr(t.str);
+        if (idx < 0) return false;
+        if (!emit3(rt->bc, OP_PUSH_STR, (int16_t)idx)) return false;
         return true;
     }
     if (t.type == TK_LP) {
@@ -1000,6 +1939,7 @@ static bool compPri(OSARuntime* rt, Lex& lex) {
                 while (true) {
                     if (!compExpr(rt, lex)) return false;
                     argc++;
+                    if (argc > 12) return false;
                     Tok next = lex.peek();
                     if (next.type == TK_COMMA) { lex.next(); continue; }
                     break;
@@ -1011,110 +1951,245 @@ static bool compPri(OSARuntime* rt, Lex& lex) {
             for (int k = 0; k < rt->bcFuncCount(); k++)
                 if (rt->bcFuncName(k) == t.str) { userIdx = k; break; }
             if (userIdx >= 0) {
-                emit4(rt->bc, OP_CALL_USER, (int16_t)userIdx, (uint8_t)argc);
+                if (argc > 8) return false;
+                if (!emit4(rt->bc, OP_CALL_USER, (int16_t)userIdx, (uint8_t)argc)) return false;
             } else {
-                emit4(rt->bc, OP_CALL_BUILTIN,
-                      (int16_t)rt->bcAddName(t.str), (uint8_t)argc);
+                int idx = rt->bcAddName(t.str);
+                if (idx < 0) return false;
+                if (!emit4(rt->bc, OP_CALL_BUILTIN, (int16_t)idx, (uint8_t)argc)) return false;
             }
             return true;
         }
         // Plain variable read.
-        emit3(rt->bc, OP_LOAD_VAR, (int16_t)rt->bcAddName(t.str));
-        return true;
+        int idx = rt->bcAddName(t.str);
+        if (idx < 0) return false;
+        return emit3(rt->bc, OP_LOAD_VAR, (int16_t)idx);
     }
     return false;
 }
 
 // ─── VM exec ────────────────────────────────────────────────────────────────
 bool OSARuntime::exec(int pcStart, int pcEnd) {
-    if (!bc.valid) return false;
+    if (!bc.valid || pcStart < 0 || pcEnd < pcStart || pcEnd > bc.codeLen) {
+        setError(-1, "VM: invalid execution range");
+        return false;
+    }
+
     int pc = pcStart;
     vmSp = 0;
-    while (pc < pcEnd && !exitFlag && errLine < 0) {
+    vmCallDepth = 0;
+    vmHalted = false;
+    uint32_t computeStarted = millis();
+    uint16_t instructions = 0;
+    uint32_t totalInstructions = 0;
+
+    auto failVm = [&](const String& message) -> bool {
+        vmHalted = true;
+        setError(-1, message);
+        return false;
+    };
+    auto pushStringCopy = [&](const String& source) -> bool {
+        if (vmSp >= OSA_STACK_SIZE) return failVm("VM stack overflow");
+        OSAVal copy;
+        copy.isNum = false;
+        if (source.length() > 0 &&
+            (!copy.str.reserve(source.length()) ||
+             !copy.str.concat(source.c_str(), source.length())))
+            return failVm("VM: not enough memory for string copy");
+        return vmPush(static_cast<OSAVal&&>(copy));
+    };
+    auto pushCopy = [&](const OSAVal& source) -> bool {
+        return source.isNum ? vmPush(OSAVal(source.num))
+                            : pushStringCopy(source.str);
+    };
+    auto readOperand16 = [&](uint16_t& value) -> bool {
+        if (pc < 0 || pc > bc.codeLen - 2) return failVm("VM: truncated operand");
+        value = (uint16_t)readI16(bc.code + pc);
+        pc += 2;
+        return true;
+    };
+    auto readArgCount = [&](uint8_t& value) -> bool {
+        if (pc < 0 || pc >= bc.codeLen) return failVm("VM: truncated call");
+        value = bc.code[pc++];
+        return true;
+    };
+
+    while (!exitFlag && errLine < 0 && !vmHalted) {
+        const int currentEnd = vmCallDepth > 0 ? bc.codeLen : pcEnd;
+        if (pc == currentEnd && vmCallDepth == 0) break;
+        if (pc < 0 || pc >= currentEnd || pc >= bc.codeLen)
+            return failVm(vmCallDepth > 0 ? "VM: function ran past bytecode"
+                                          : "VM: instruction outside section");
+
+        // Keep pure bytecode loops cooperative. Calls that intentionally block
+        // (widgets, delay, HTTP) reset this window after they return, so only
+        // uninterrupted script computation is limited.
+        // The wall-clock budget catches tight pure-bytecode loops. The hard
+        // instruction budget also catches loops that repeatedly call tiny SDK
+        // builtins (those calls reset the wall-clock compute window).
+        if (++totalInstructions > 100000)
+            return failVm("VM instruction limit exceeded");
+        if (++instructions >= 512) {
+            instructions = 0;
+            yield();
+            if (checkExitGesture() || checkOverlayGesture()) {
+                exitFlag = true;
+                return false;
+            }
+            if ((uint32_t)(millis() - computeStarted) > 75)
+                return failVm("VM execution budget exceeded");
+        }
+
         uint8_t op = bc.code[pc++];
+        int stackNeeded = 0;
+        switch (op) {
+            case OP_POP: case OP_DUP: case OP_STORE_VAR: case OP_DECLARE_VAR:
+            case OP_NEG: case OP_NOT: case OP_JMP_IF_FALSE:
+            case OP_JMP_IF_TRUE: case OP_RET:
+                stackNeeded = 1;
+                break;
+            case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_MOD:
+            case OP_EQ: case OP_NE: case OP_LT: case OP_LE: case OP_GT:
+            case OP_GE: case OP_AND: case OP_OR:
+                stackNeeded = 2;
+                break;
+            default:
+                break;
+        }
+        if (vmSp < stackNeeded) return failVm("VM stack underflow");
         switch (op) {
             case OP_NOP: break;
             case OP_PUSH_NUM: {
-                int idx = (uint16_t)readI16(bc.code + pc); pc += 2;
-                vmPush(OSAVal(bc.numPool[idx]));
+                uint16_t idx;
+                if (!readOperand16(idx)) return false;
+                if (idx >= (uint16_t)bc.numPoolLen) return failVm("VM: bad number index");
+                if (!vmPush(OSAVal(bc.numPool[idx]))) return false;
                 break;
             }
             case OP_PUSH_STR: {
-                int idx = (uint16_t)readI16(bc.code + pc); pc += 2;
-                vmPush(OSAVal(bc.strPool[idx]));
+                uint16_t idx;
+                if (!readOperand16(idx)) return false;
+                if (idx >= (uint16_t)bc.strPoolLen) return failVm("VM: bad string index");
+                if (!pushStringCopy(bc.strPool[idx])) return false;
                 break;
             }
-            case OP_PUSH_NUM0: vmPush(OSAVal(0.0)); break;
-            case OP_PUSH_NUM1: vmPush(OSAVal(1.0)); break;
+            case OP_PUSH_NUM0: if (!vmPush(OSAVal(0.0))) return false; break;
+            case OP_PUSH_NUM1: if (!vmPush(OSAVal(1.0))) return false; break;
             case OP_POP:       (void)vmPop(); break;
-            case OP_DUP:       if (vmSp > 0) vmStack[vmSp] = vmStack[vmSp-1], vmSp++; break;
+            case OP_DUP:
+                if (vmSp <= 0) return failVm("VM stack underflow");
+                if (!pushCopy(vmStack[vmSp - 1])) return false;
+                break;
             case OP_LOAD_VAR: {
-                int idx = (uint16_t)readI16(bc.code + pc); pc += 2;
-                vmPush(getVar(bc.namePool[idx]));
+                uint16_t idx;
+                if (!readOperand16(idx)) return false;
+                if (idx >= (uint16_t)bc.namePoolLen) return failVm("VM: bad name index");
+                const OSAVal* value = nullptr;
+                for (int i = varCount - 1; i >= 0; --i) {
+                    if (vars[i].name == bc.namePool[idx]) {
+                        value = &vars[i].val;
+                        break;
+                    }
+                }
+                if (value) {
+                    if (!pushCopy(*value)) return false;
+                } else if (!vmPush(OSAVal())) return false;
                 break;
             }
             case OP_STORE_VAR: {
-                int idx = (uint16_t)readI16(bc.code + pc); pc += 2;
+                uint16_t idx;
+                if (!readOperand16(idx)) return false;
+                if (idx >= (uint16_t)bc.namePoolLen) return failVm("VM: bad name index");
                 setVar(bc.namePool[idx], vmPop());
                 break;
             }
             case OP_DECLARE_VAR: {
-                int idx = (uint16_t)readI16(bc.code + pc); pc += 2;
+                uint16_t idx;
+                if (!readOperand16(idx)) return false;
+                if (idx >= (uint16_t)bc.namePoolLen) return failVm("VM: bad name index");
                 declareVar(bc.namePool[idx], vmPop());
                 break;
             }
             case OP_ADD: { OSAVal b = vmPop(), a = vmPop();
-                if (a.isNum && b.isNum) vmPush(OSAVal(a.num + b.num));
-                else                    vmPush(OSAVal(a.toString() + b.toString()));
+                if (a.isNum && b.isNum) {
+                    if (!vmPush(OSAVal(a.num + b.num))) return false;
+                } else {
+                    String left = a.isNum ? a.toString() : static_cast<String&&>(a.str);
+                    String right = b.isNum ? b.toString() : static_cast<String&&>(b.str);
+                    size_t total = left.length() + right.length();
+                    if (total < left.length() || total > OSA_MAX_FILE_READ)
+                        return failVm("VM: string exceeds 32768 byte limit");
+                    if ((total > 0 && !left.reserve(total)) ||
+                        (right.length() > 0 &&
+                         !left.concat(right.c_str(), right.length())))
+                        return failVm("VM: not enough memory for string concat");
+                    if (!vmPush(OSAVal(static_cast<String&&>(left)))) return false;
+                }
                 break;
             }
-            case OP_SUB: { OSAVal b = vmPop(), a = vmPop(); vmPush(OSAVal(a.toNum() - b.toNum())); break; }
-            case OP_MUL: { OSAVal b = vmPop(), a = vmPop(); vmPush(OSAVal(a.toNum() * b.toNum())); break; }
+            case OP_SUB: { OSAVal b = vmPop(), a = vmPop(); if (!vmPush(OSAVal(a.toNum() - b.toNum()))) return false; break; }
+            case OP_MUL: { OSAVal b = vmPop(), a = vmPop(); if (!vmPush(OSAVal(a.toNum() * b.toNum()))) return false; break; }
             case OP_DIV: { OSAVal b = vmPop(), a = vmPop();
                 double db = b.toNum();
-                vmPush(OSAVal(db == 0.0 ? 0.0 : a.toNum() / db));
+                if (!vmPush(OSAVal(db == 0.0 ? 0.0 : a.toNum() / db))) return false;
                 break;
             }
             case OP_MOD: { OSAVal b = vmPop(), a = vmPop();
                 double db = b.toNum();
-                vmPush(OSAVal(db == 0.0 ? 0.0 : fmod(a.toNum(), db)));
+                if (!vmPush(OSAVal(db == 0.0 ? 0.0 : fmod(a.toNum(), db)))) return false;
                 break;
             }
-            case OP_NEG: { OSAVal a = vmPop(); vmPush(OSAVal(-a.toNum())); break; }
+            case OP_NEG: { OSAVal a = vmPop(); if (!vmPush(OSAVal(-a.toNum()))) return false; break; }
             case OP_EQ:  { OSAVal b = vmPop(), a = vmPop();
                 bool eq = (a.isNum && b.isNum) ? (a.num == b.num)
                                                 : (a.toString() == b.toString());
-                vmPush(OSAVal(eq ? 1.0 : 0.0));
+                if (!vmPush(OSAVal(eq ? 1.0 : 0.0))) return false;
                 break;
             }
             case OP_NE:  { OSAVal b = vmPop(), a = vmPop();
                 bool eq = (a.isNum && b.isNum) ? (a.num == b.num)
                                                 : (a.toString() == b.toString());
-                vmPush(OSAVal(eq ? 0.0 : 1.0));
+                if (!vmPush(OSAVal(eq ? 0.0 : 1.0))) return false;
                 break;
             }
-            case OP_LT:  { OSAVal b = vmPop(), a = vmPop(); vmPush(OSAVal(a.toNum() <  b.toNum() ? 1.0 : 0.0)); break; }
-            case OP_LE:  { OSAVal b = vmPop(), a = vmPop(); vmPush(OSAVal(a.toNum() <= b.toNum() ? 1.0 : 0.0)); break; }
-            case OP_GT:  { OSAVal b = vmPop(), a = vmPop(); vmPush(OSAVal(a.toNum() >  b.toNum() ? 1.0 : 0.0)); break; }
-            case OP_GE:  { OSAVal b = vmPop(), a = vmPop(); vmPush(OSAVal(a.toNum() >= b.toNum() ? 1.0 : 0.0)); break; }
-            case OP_AND: { OSAVal b = vmPop(), a = vmPop(); vmPush(OSAVal(a.truthy() && b.truthy() ? 1.0 : 0.0)); break; }
-            case OP_OR:  { OSAVal b = vmPop(), a = vmPop(); vmPush(OSAVal(a.truthy() || b.truthy() ? 1.0 : 0.0)); break; }
-            case OP_NOT: { OSAVal a = vmPop(); vmPush(OSAVal(a.truthy() ? 0.0 : 1.0)); break; }
+            case OP_LT:  { OSAVal b = vmPop(), a = vmPop(); if (!vmPush(OSAVal(a.toNum() <  b.toNum() ? 1.0 : 0.0))) return false; break; }
+            case OP_LE:  { OSAVal b = vmPop(), a = vmPop(); if (!vmPush(OSAVal(a.toNum() <= b.toNum() ? 1.0 : 0.0))) return false; break; }
+            case OP_GT:  { OSAVal b = vmPop(), a = vmPop(); if (!vmPush(OSAVal(a.toNum() >  b.toNum() ? 1.0 : 0.0))) return false; break; }
+            case OP_GE:  { OSAVal b = vmPop(), a = vmPop(); if (!vmPush(OSAVal(a.toNum() >= b.toNum() ? 1.0 : 0.0))) return false; break; }
+            case OP_AND: { OSAVal b = vmPop(), a = vmPop(); if (!vmPush(OSAVal(a.truthy() && b.truthy() ? 1.0 : 0.0))) return false; break; }
+            case OP_OR:  { OSAVal b = vmPop(), a = vmPop(); if (!vmPush(OSAVal(a.truthy() || b.truthy() ? 1.0 : 0.0))) return false; break; }
+            case OP_NOT: { OSAVal a = vmPop(); if (!vmPush(OSAVal(a.truthy() ? 0.0 : 1.0))) return false; break; }
             case OP_JMP: {
-                int16_t off = readI16(bc.code + pc); pc += 2;
-                pc += off;
+                uint16_t raw;
+                if (!readOperand16(raw)) return false;
+                int target = pc + (int16_t)raw;
+                int targetEnd = vmCallDepth > 0 ? bc.codeLen : pcEnd;
+                if (target < 0 || target > targetEnd) return failVm("VM: bad jump target");
+                pc = target;
                 break;
             }
             case OP_JMP_IF_FALSE: {
-                int16_t off = readI16(bc.code + pc); pc += 2;
+                uint16_t raw;
+                if (!readOperand16(raw)) return false;
                 OSAVal v = vmPop();
-                if (!v.truthy()) pc += off;
+                if (!v.truthy()) {
+                    int target = pc + (int16_t)raw;
+                    int targetEnd = vmCallDepth > 0 ? bc.codeLen : pcEnd;
+                    if (target < 0 || target > targetEnd) return failVm("VM: bad jump target");
+                    pc = target;
+                }
                 break;
             }
             case OP_JMP_IF_TRUE: {
-                int16_t off = readI16(bc.code + pc); pc += 2;
+                uint16_t raw;
+                if (!readOperand16(raw)) return false;
                 OSAVal v = vmPop();
-                if (v.truthy()) pc += off;
+                if (v.truthy()) {
+                    int target = pc + (int16_t)raw;
+                    int targetEnd = vmCallDepth > 0 ? bc.codeLen : pcEnd;
+                    if (target < 0 || target > targetEnd) return failVm("VM: bad jump target");
+                    pc = target;
+                }
                 break;
             }
             case OP_LOOP_TICK:
@@ -1125,34 +2200,44 @@ bool OSARuntime::exec(int pcStart, int pcEnd) {
                 }
                 break;
             case OP_CALL_BUILTIN: {
-                int nameIdx = (uint16_t)readI16(bc.code + pc); pc += 2;
-                int argc    = bc.code[pc++];
-                OSAVal args[8];
-                if (argc > 8) argc = 8;
+                uint16_t nameIdx;
+                uint8_t argc;
+                if (!readOperand16(nameIdx) || !readArgCount(argc)) return false;
+                if (nameIdx >= (uint16_t)bc.namePoolLen || argc > 12)
+                    return failVm("VM: invalid builtin call");
+                if (vmSp < argc) return failVm("VM stack underflow");
+                if (vmSp - argc >= OSA_STACK_SIZE) return failVm("VM stack overflow");
+                OSAVal args[12];
                 for (int i = argc - 1; i >= 0; i--) args[i] = vmPop();
-                // Rebuild a source-level argsStr so callBuiltin (which still
-                // parses its own arguments) sees the same shape it expects.
-                String argsStr;
-                for (int i = 0; i < argc; i++) {
-                    if (i) argsStr += ',';
-                    if (args[i].isNum) argsStr += String(args[i].num, 6);
-                    else { argsStr += '"'; argsStr += args[i].str; argsStr += '"'; }
-                }
-                OSAVal r = callBuiltin(bc.namePool[nameIdx], argsStr);
-                vmPush(r);
+                // Pass already-evaluated values directly. Re-serializing a
+                // 24 KB JSON response into source text used to duplicate it,
+                // escape it and parse it again, causing avoidable RAM spikes.
+                directBuiltinArgs = args;
+                directBuiltinArgc = argc;
+                OSAVal r = callBuiltin(bc.namePool[nameIdx], "");
+                directBuiltinArgs = nullptr;
+                directBuiltinArgc = 0;
+                // Do not count time spent inside a blocking native SDK call as
+                // runaway bytecode time.
+                computeStarted = millis();
+                if (errLine >= 0 || exitFlag || vmHalted) return false;
+                if (!vmPush(static_cast<OSAVal&&>(r))) return false;
                 break;
             }
             case OP_CALL_USER: {
-                int funcIdx = (uint16_t)readI16(bc.code + pc); pc += 2;
-                int argc    = bc.code[pc++];
-                if (funcIdx < 0 || funcIdx >= funcCount ||
-                    vmCallDepth >= OSA_STACK_MAX) {
-                    setError(-1, "VM: bad CALL_USER");
-                    return false;
-                }
+                uint16_t funcIdx;
+                uint8_t argc;
+                if (!readOperand16(funcIdx) || !readArgCount(argc)) return false;
+                if (funcIdx >= (uint16_t)funcCount || argc > 8 ||
+                    vmCallDepth >= OSA_STACK_MAX)
+                    return failVm("VM: invalid user call");
+                if (vmSp < argc) return failVm("VM stack underflow");
+                if (vmSp - argc >= OSA_STACK_SIZE) return failVm("VM stack overflow");
                 Func& fn = funcs[funcIdx];
+                if (fn.bcStart < 0 || fn.bcStart >= bc.codeLen)
+                    return failVm("VM: bad function entry");
                 OSAVal args[8];
-                int n = argc < 8 ? argc : 8;
+                int n = argc;
                 for (int i = n - 1; i >= 0; i--) args[i] = vmPop();
                 // Save resume point + scope size so locals don't leak.
                 vmCallStack[vmCallDepth].returnPc       = pc;
@@ -1160,35 +2245,38 @@ bool OSARuntime::exec(int pcStart, int pcEnd) {
                 vmCallDepth++;
                 // Bind params as locals in the callee's scope.
                 for (int i = 0; i < n && i < fn.paramCount; i++)
-                    declareVar(fn.params[i], args[i]);
+                    declareVar(fn.params[i], static_cast<OSAVal&&>(args[i]));
                 pc = fn.bcStart;
                 break;
             }
             case OP_RET: {
                 OSAVal retval = vmPop();
-                if (vmCallDepth == 0) { setError(-1, "VM: RET at top"); return false; }
+                if (vmHalted) return false;
+                if (vmCallDepth == 0) return failVm("VM: RET at top");
                 VMFrame& fr = vmCallStack[--vmCallDepth];
                 varCount = fr.savedVarCount;
                 pc = fr.returnPc;
-                vmPush(retval);
+                if (!vmPush(static_cast<OSAVal&&>(retval))) return false;
                 break;
             }
             case OP_RET_VOID: {
-                if (vmCallDepth == 0) { setError(-1, "VM: RET at top"); return false; }
+                if (vmCallDepth == 0) return failVm("VM: RET at top");
                 VMFrame& fr = vmCallStack[--vmCallDepth];
                 varCount = fr.savedVarCount;
                 pc = fr.returnPc;
-                vmPush(OSAVal());
+                if (!vmPush(OSAVal())) return false;
                 break;
             }
-            case OP_HALT: return true;
+            case OP_HALT:
+                if (vmCallDepth != 0) return failVm("VM: HALT inside function");
+                return true;
             case OP_EXIT: exitFlag = true; return true;
             default:
-                setError(-1, String("VM: unhandled op ") + (int)op);
-                return false;
+                return failVm(String("VM: invalid opcode ") + (int)op);
         }
+        if (vmHalted || errLine >= 0) return false;
     }
-    return errLine < 0;
+    return !vmHalted && errLine < 0;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1198,9 +2286,16 @@ bool OSARuntime::exec(int pcStart, int pcEnd) {
 OSARuntime::OSARuntime(TFT_eSPI* t, XPT2046_Touchscreen* ts_)
     : tft(t), ts(ts_) {}
 
+OSARuntime::~OSARuntime() {
+    reset();
+}
+
 void OSARuntime::setError(int line, const String& msg) {
     if (errLine >= 0) return; // keep first error
-    errLine = line;
+    // Internal VM errors use -1 because they do not map to a source line.
+    // Store them as line zero so hasError()/runUpdate() cannot mistake the
+    // error sentinel for "no error".
+    errLine = line < 0 ? 0 : line;
     errMsg  = msg;
     exitFlag = true;
 }
@@ -1209,22 +2304,28 @@ void OSARuntime::reset() {
     // Walk every slot that *might* hold heap-allocated String content from the
     // previous script and release it. Counters get zeroed too so the next
     // loadScript starts clean.
-    for (int i = 0; i < OSA_MAX_LINES; i++) lines[i] = "";
+    for (int i = 0; i < OSA_MAX_LINES; i++) releaseStringStorage(lines[i]);
     for (int i = 0; i < OSA_MAX_VARS; i++) {
-        vars[i].name = "";
-        vars[i].val  = OSAVal();
+        releaseStringStorage(vars[i].name);
+        releaseValueStorage(vars[i].val);
     }
     for (int i = 0; i < OSA_MAX_FUNCS; i++) {
-        funcs[i].name = "";
-        for (int j = 0; j < 8; j++) funcs[i].params[j] = "";
+        releaseStringStorage(funcs[i].name);
+        for (int j = 0; j < 8; j++) releaseStringStorage(funcs[i].params[j]);
     }
+    for (int i = 0; i < OSA_STACK_SIZE; i++) releaseValueStorage(vmStack[i]);
     lineCount = varCount = funcCount = stackDepth = 0;
     loopStart = loopEnd = -1;
     exitFlag = returnFlag = breakFlag = continueFlag = false;
-    appName = "";
-    errMsg = "";
+    releaseValueStorage(returnValue);
+    releaseStringStorage(appName);
+    releaseStringStorage(loadedScriptPath);
+    releaseStringStorage(packageRoot);
+    releaseStringStorage(errMsg);
     errLine = -1;
-    pendingLaunch = "";
+    releaseStringStorage(pendingLaunch);
+    clearRichMenuCache();
+    clearAppsScanCache();
     if (activeSprite) {
         activeSprite->deleteSprite();
         delete activeSprite;
@@ -1237,6 +2338,25 @@ void OSARuntime::reset() {
     }
     bc.clear();
     vmSp = 0;
+    vmCallDepth = 0;
+    vmHalted = false;
+    directBuiltinArgs = nullptr;
+    directBuiltinArgc = 0;
+    lastCompileError = OSA_BCERR_NONE;
+    scriptSliceStarted = 0;
+    scriptOpsSinceYield = 0;
+    scriptLoopOpsTotal = 0;
+    requiredPerms = 0;
+    isException = false;
+    wantsOverlay = false;
+    swipeHomeStartY = -1;
+    swipeOverlayStartY = -1;
+    touchSampleMs = UINT32_MAX;
+    touchSampleDown = false;
+    touchSampleX = touchSampleY = -1;
+    releaseStringStorage(s_httpBearer);
+    releaseStringStorage(s_httpError);
+    releaseStringStorage(s_ioError);
 }
 
 // Waits until the touch panel has reported "not touched" for N consecutive
@@ -1277,10 +2397,27 @@ static void markTapAccepted() {
     s_lastTapMs = millis();
 }
 
-bool OSARuntime::checkExitGesture() {
-    if (!ts->touched()) { swipeHomeStartY = -1; return false; }
+void OSARuntime::sampleTouch() {
+    uint32_t now = millis();
+    // touch.down(), touch.x() and touch.y() are normally called together.
+    // One XPT2046 transaction is enough for the whole group; repeated SPI
+    // reads caused uneven frame times while scrolling.
+    if (touchSampleMs != UINT32_MAX && now - touchSampleMs < 6) return;
+    touchSampleMs = now;
+    touchSampleDown = ts->touched();
+    if (!touchSampleDown) {
+        touchSampleX = touchSampleY = -1;
+        return;
+    }
     TS_Point p = ts->getPoint();
-    int ty = map(p.y, 300, 3800, 0, 320);
+    touchSampleX = constrain((int)map(p.x, 300, 3800, 0, 240), 0, 239);
+    touchSampleY = constrain((int)map(p.y, 300, 3800, 0, 320), 0, 319);
+}
+
+bool OSARuntime::checkExitGesture() {
+    sampleTouch();
+    if (!touchSampleDown) { swipeHomeStartY = -1; return false; }
+    int ty = touchSampleY;
     if (ty > 290) {
         if (swipeHomeStartY < 0) swipeHomeStartY = ty;
         return false;
@@ -1299,11 +2436,11 @@ bool OSARuntime::checkExitGesture() {
 // gesture.swipe*. Called lazily from each consumer so callers never miss a
 // frame, and the swipe one-shot is reset only on first read.
 void OSARuntime::pollGesture() {
-    bool now = ts->touched();
+    sampleTouch();
+    bool now = touchSampleDown;
     if (now) {
-        TS_Point p = ts->getPoint();
-        int cx = map(p.x, 300, 3800, 0, 240);
-        int cy = map(p.y, 300, 3800, 0, 320);
+        int cx = touchSampleX;
+        int cy = touchSampleY;
         if (!touchWasDown) {
             gestureStartX = cx;
             gestureStartY = cy;
@@ -1335,9 +2472,9 @@ bool OSARuntime::checkOverlayGesture() {
     // Swipe-down from the top edge → request Control Center. Same shape as
     // checkExitGesture but inverted. main.cpp inspects `wantsOverlay` after
     // the script unwinds and opens the overlay runtime instead of going home.
-    if (!ts->touched()) { swipeOverlayStartY = -1; return false; }
-    TS_Point p = ts->getPoint();
-    int ty = map(p.y, 300, 3800, 0, 320);
+    sampleTouch();
+    if (!touchSampleDown) { swipeOverlayStartY = -1; return false; }
+    int ty = touchSampleY;
     if (ty < 22) {
         if (swipeOverlayStartY < 0) swipeOverlayStartY = ty;
         return false;
@@ -1356,20 +2493,31 @@ bool OSARuntime::checkOverlayGesture() {
 // Script loading
 // ═══════════════════════════════════════════════════════════════════════════════
 
-bool OSARuntime::loadScript(const String& path) {
+bool OSARuntime::loadScript(String path) {
+    Serial.printf("[RT] loadScript path='%s' free=%u\n", path.c_str(),
+                  (unsigned)ESP.getFreeHeap());
+    reset();
     lineCount = varCount = funcCount = stackDepth = 0;
     loopStart = loopEnd = -1;
     exitFlag = returnFlag = false;
     breakFlag = continueFlag = false;
+    returnValue = OSAVal();
     errLine = -1; errMsg = "";
     execDepth = 0;
     appName = "";
+    loadedScriptPath = path;
+    packageRoot = "";
     requiredPerms = 0;
     isException = false;
     pendingLaunch = "";
     swipeHomeStartY = -1;
     swipeOverlayStartY = -1;
     wantsOverlay = false;
+    vmHalted = false;
+    vmCallDepth = 0;
+    directBuiltinArgs = nullptr;
+    directBuiltinArgc = 0;
+    lastCompileError = OSA_BCERR_NONE;
     // Tear down any sprite the previous script left allocated so we don't
     // leak the 10s of KB of pixel buffer between launches.
     if (activeSprite) {
@@ -1382,13 +2530,103 @@ bool OSARuntime::loadScript(const String& path) {
     // Per-script HTTP state — never leak bearer tokens or status between apps.
     s_httpBearer = "";
     s_httpStatus = 0;
+    s_httpError = "";
+    s_ioError = "";
+
+    // Package assets are readable only relative to this exact installed OPK.
+    const String userPrefix = "/packages/";
+    const String systemPrefix = "/system/packages/";
+    int idStart = -1;
+    if (path.startsWith(userPrefix)) idStart = userPrefix.length();
+    else if (path.startsWith(systemPrefix)) idStart = systemPrefix.length();
+    if (idStart >= 0) {
+        int slash = path.indexOf('/', idStart);
+        if (slash > idStart) packageRoot = path.substring(0, slash);
+    }
 
     if (!isSdReady) { setError(0, "No SD card"); return false; }
+
+    // .osac path: load the binary directly, skip the parser entirely. Source
+    // is not on the device — the only readable form is the opcode pool, which
+    // is enough to run but not to recover the .osa text.
+    String lower = path; lower.toLowerCase();
+    if (lower.endsWith(".osac")) {
+        if (!loadOsac(path)) return false;
+        // sandbox path uses appName so any sandboxed fread/fwrite/kv still work.
+        if (isSdReady) {
+            SD.mkdir("/apps");
+            SD.mkdir(sandboxDir().c_str());
+        }
+        return true;
+    }
+
     File f = SD.open(path);
     if (!f) { setError(0, "Not found: " + path); return false; }
 
-    while (f.available() && lineCount < OSA_MAX_LINES) {
-        String raw = f.readStringUntil('\n');
+    if ((size_t)f.size() > OSA_MAX_SOURCE_BYTES) {
+        f.close();
+        setError(0, "OSA source exceeds 128 KB");
+        return false;
+    }
+
+    // Validate the physical line layout before allocating one String per
+    // source line. Besides producing an exact error, this detects files that
+    // were copied through an editor/tool which removed every newline.
+    size_t longestBytes = 0;
+    size_t currentBytes = 0;
+    size_t newlineCount = 0;
+    int physicalLine = 1;
+    int longestLine = 1;
+    while (f.available()) {
+        int value = f.read();
+        if (value < 0) break;
+        if (value == '\n') {
+            if (currentBytes > longestBytes) {
+                longestBytes = currentBytes;
+                longestLine = physicalLine;
+            }
+            currentBytes = 0;
+            newlineCount++;
+            physicalLine++;
+        } else if (value != '\r') {
+            currentBytes++;
+        }
+    }
+    if (currentBytes > longestBytes) {
+        longestBytes = currentBytes;
+        longestLine = physicalLine;
+    }
+    Serial.printf("[RT] source bytes=%u newlines=%u longest=L%d/%u\n",
+                  (unsigned)f.size(), (unsigned)newlineCount, longestLine,
+                  (unsigned)longestBytes);
+    if (longestBytes > OSA_MAX_LINE_BYTES) {
+        f.close();
+        String reason = String("Line ") + longestLine + " has " +
+                        (unsigned)longestBytes + " bytes (limit " +
+                        OSA_MAX_LINE_BYTES + ")";
+        if (newlineCount == 0)
+            reason += ". File has no line breaks";
+        setError(longestLine - 1, reason);
+        return false;
+    }
+    if (!f.seek(0)) {
+        f.close();
+        setError(0, "Could not rewind OSA source");
+        return false;
+    }
+    while (f.available()) {
+        if (lineCount >= OSA_MAX_LINES) {
+            f.close();
+            setError(0, "OSA source exceeds 512 lines");
+            return false;
+        }
+        String raw;
+        if (!readLineLimited(f, raw, OSA_MAX_LINE_BYTES)) {
+            f.close();
+            setError(lineCount, String("Not enough RAM reading OSA line ") +
+                                (lineCount + 1));
+            return false;
+        }
         raw.trim();
         lines[lineCount++] = raw;
     }
@@ -1419,7 +2657,38 @@ bool OSARuntime::loadScript(const String& path) {
     // Try to compile the script into bytecode. On success, runShow/runUpdate
     // use the VM. On failure (any unsupported language feature, currently
     // including `def` functions) the tree-walking interpreter is the fallback.
-    compile();
+    bool compiled = compile();
+    if (compiled) {
+        Serial.printf("[RT] bytecode=%d nums=%d strings=%d names=%d lines=%d free=%u\n",
+                      bc.codeLen, bc.numPoolLen, bc.strPoolLen, bc.namePoolLen,
+                      lineCount, (unsigned)ESP.getFreeHeap());
+    } else {
+        Serial.printf("[RT] compile fallback/error=%u lines=%d free=%u\n",
+                      (unsigned)lastCompileError, lineCount,
+                      (unsigned)ESP.getFreeHeap());
+    }
+    if (!compiled && lastCompileError != OSA_BCERR_NONE &&
+        lastCompileError != OSA_BCERR_UNSUPPORTED) {
+        const char* reason = "Bytecode compilation failed";
+        if (lastCompileError == OSA_BCERR_CODE_FULL)          reason = "Bytecode limit exceeded";
+        else if (lastCompileError == OSA_BCERR_NUM_POOL_FULL) reason = "Too many numeric constants";
+        else if (lastCompileError == OSA_BCERR_STR_POOL_FULL) reason = "Too many string constants";
+        else if (lastCompileError == OSA_BCERR_NAME_POOL_FULL)reason = "Too many identifiers";
+        else if (lastCompileError == OSA_BCERR_BAD_PATCH)     reason = "Invalid bytecode jump";
+        setError(0, reason);
+        return false;
+    }
+
+    // A successfully compiled app no longer needs its source text at runtime.
+    // Releasing the per-line buffers here is especially important before TLS
+    // work in OpenStore on ESP32 boards without PSRAM.
+    if (compiled) {
+        for (int i = 0; i < OSA_MAX_LINES; i++) releaseStringStorage(lines[i]);
+        lineCount = 0;
+        loopStart = loopEnd = -1;
+        Serial.printf("[RT] released source lines free=%u\n",
+                      (unsigned)ESP.getFreeHeap());
+    }
 
     // Create per-app sandbox directory
     if (isSdReady) {
@@ -1437,6 +2706,9 @@ bool OSARuntime::loadScript(const String& path) {
 void OSARuntime::runShow() {
     exitFlag = returnFlag = breakFlag = continueFlag = false;
     execDepth = 0;
+    scriptSliceStarted = millis();
+    scriptOpsSinceYield = 0;
+    scriptLoopOpsTotal = 0;
     if (bc.valid) {
         exec(0, bc.setupEnd);
         return;
@@ -1449,6 +2721,9 @@ bool OSARuntime::runUpdate() {
     if (exitFlag || errLine >= 0) return false;
     returnFlag = breakFlag = continueFlag = false;
     execDepth = 0;
+    scriptSliceStarted = millis();
+    scriptOpsSinceYield = 0;
+    scriptLoopOpsTotal = 0;
     if (bc.valid && bc.loopStart >= 0) {
         exec(bc.loopStart, bc.loopEnd);
         return !(exitFlag || errLine >= 0);
@@ -1551,6 +2826,30 @@ void OSARuntime::execRange(int from, int to) {
     execDepth--;
 }
 
+bool OSARuntime::cooperativeTick(uint32_t interval) {
+    if (++scriptLoopOpsTotal > 100000) {
+        Serial.printf("[RT] tree loop limit total=%u\n",
+                      (unsigned)scriptLoopOpsTotal);
+        setError(-1, "Script instruction limit exceeded");
+        return false;
+    }
+    if (++scriptOpsSinceYield < interval) return true;
+    scriptOpsSinceYield = 0;
+    yield();
+    if (checkExitGesture() || checkOverlayGesture()) {
+        exitFlag = true;
+        return false;
+    }
+    if ((uint32_t)(millis() - scriptSliceStarted) > 75) {
+        Serial.printf("[RT] tree budget elapsed=%u total=%u\n",
+                      (unsigned)(millis() - scriptSliceStarted),
+                      (unsigned)scriptLoopOpsTotal);
+        setError(-1, "Script execution budget exceeded");
+        return false;
+    }
+    return true;
+}
+
 void OSARuntime::execLine(int lineNo, int& pc) {
     const String& raw = lines[lineNo];
 
@@ -1586,7 +2885,7 @@ void OSARuntime::execLine(int lineNo, int& pc) {
             String cond = raw.substring(6, doPos); cond.trim();
             String body = raw.substring(doPos + 4, raw.length() - 4); body.trim();
             while (eval(cond).truthy() && !exitFlag && !returnFlag && errLine < 0) {
-                yield();
+                if (!cooperativeTick()) break;
                 if (body.length() > 0) {
                     String saved = lines[lineNo];
                     lines[lineNo] = body;
@@ -1712,6 +3011,7 @@ void OSARuntime::processWhile(int lineNo, int& pc) {
 
     int matchEnd = findMatchingEnd(lineNo);
     while (eval(cond).truthy() && !exitFlag && !returnFlag && errLine < 0) {
+        if (!cooperativeTick()) break;
         execRange(lineNo + 1, matchEnd);
         if (continueFlag) { continueFlag = false; continue; }
         if (breakFlag)    { breakFlag = false; break; }
@@ -1739,6 +3039,7 @@ void OSARuntime::processFor(int lineNo, int& pc) {
 
     int matchEnd = findMatchingEnd(lineNo);
     for (int i = startV; i <= endV && !exitFlag && !returnFlag && errLine < 0; i++) {
+        if (!cooperativeTick()) break;
         setVar(varNm, OSAVal((double)i));
         execRange(lineNo + 1, matchEnd);
         if (continueFlag) { continueFlag = false; continue; }
@@ -1757,29 +3058,37 @@ OSAVal OSARuntime::getVar(const String& name) const {
     return OSAVal(); // default 0
 }
 
-void OSARuntime::setVar(const String& name, const OSAVal& val) {
+void OSARuntime::setVar(const String& name, OSAVal val) {
     for (int i = varCount - 1; i >= 0; i--) {
-        if (vars[i].name == name) { vars[i].val = val; return; }
+        if (vars[i].name == name) {
+            vars[i].val = static_cast<OSAVal&&>(val);
+            return;
+        }
     }
     if (varCount < OSA_MAX_VARS) {
         vars[varCount].name = name;
-        vars[varCount].val  = val;
+        vars[varCount].val  = static_cast<OSAVal&&>(val);
         varCount++;
     }
 }
 
-void OSARuntime::declareVar(const String& name, const OSAVal& val) {
+void OSARuntime::declareVar(const String& name, OSAVal val) {
     // Limit the lookup to the current scope so `var pick = ...` inside a
     // user function doesn't reach into the caller and clobber its `pick`.
     // (Found this when SysDemo's wifiScreen() was overwriting the main loop's
     // `pick` variable and re-entering wallpapersScreen on Back.)
-    int scopeStart = (stackDepth > 0) ? callStack[stackDepth - 1].retVarCount : 0;
+    int scopeStart = 0;
+    if (vmCallDepth > 0) scopeStart = vmCallStack[vmCallDepth - 1].savedVarCount;
+    else if (stackDepth > 0) scopeStart = callStack[stackDepth - 1].retVarCount;
     for (int i = varCount - 1; i >= scopeStart; i--) {
-        if (vars[i].name == name) { vars[i].val = val; return; }
+        if (vars[i].name == name) {
+            vars[i].val = static_cast<OSAVal&&>(val);
+            return;
+        }
     }
     if (varCount < OSA_MAX_VARS) {
         vars[varCount].name = name;
-        vars[varCount].val  = val;
+        vars[varCount].val  = static_cast<OSAVal&&>(val);
         varCount++;
     }
 }
@@ -1795,7 +3104,7 @@ OSAVal OSARuntime::callUser(const String& name, const String& argsStr) {
     if (fi < 0) { setError(-1, "Undefined: " + name); return OSAVal(); }
 
     // Parse + evaluate arguments
-    String argTokens[6]; int argc = 0;
+    String argTokens[12]; int argc = 0;
     splitArgs(argsStr, argTokens, argc);
 
     if (stackDepth >= OSA_STACK_MAX) { setError(-1, "Stack overflow"); return OSAVal(); }
@@ -1806,7 +3115,7 @@ OSAVal OSARuntime::callUser(const String& name, const String& argsStr) {
 
     // Bind parameters
     for (int i = 0; i < funcs[fi].paramCount && i < argc; i++)
-        setVar(funcs[fi].params[i], eval(argTokens[i]));
+        declareVar(funcs[fi].params[i], eval(argTokens[i]));
 
     // Execute body
     returnFlag = false;
@@ -1845,7 +3154,7 @@ void OSARuntime::splitArgs(const String& s, String* out, int& count) {
         } else if (c == ')' || c == ']') {
             depth--;
         } else if (c == ',' && depth == 0) {
-            if (count < 6) {
+            if (count < 12) {
                 out[count] = s.substring(start, i);
                 out[count].trim();
                 count++;
@@ -2092,9 +3401,16 @@ OSAVal OSARuntime::evalPrimary(const String& s, int& p) {
 
 String OSARuntime::sandboxDir() const {
     String dir = "/apps/";
-    for (int i = 0; i < (int)appName.length() && dir.length() < 28; i++) {
-        char c = appName[i];
-        dir += isalnum(c) ? (char)tolower(c) : '_';
+    String identity = appName;
+    bool packaged = packageRoot.length() > 0;
+    if (packaged) {
+        int slash = packageRoot.lastIndexOf('/');
+        identity = "pkg_" + packageRoot.substring(slash + 1);
+    }
+    for (int i = 0; i < (int)identity.length() && dir.length() < 60; i++) {
+        char c = identity[i];
+        bool safePackageChar = packaged && (c == '.' || c == '-' || c == '_');
+        dir += (isalnum((unsigned char)c) || safePackageChar) ? (char)tolower(c) : '_';
     }
     return dir;
 }
@@ -2106,13 +3422,31 @@ String OSARuntime::sandboxPath(const String& rel) const {
     safe.replace("./",  "");
     safe.replace("..",  "");
     while (safe.startsWith("/")) safe.remove(0, 1);
+    safe.replace("\\", "_");
+    safe.replace(":", "_");
     return sandboxDir() + "/" + safe;
+}
+
+String OSARuntime::packageAssetPath(const String& rel) const {
+    if (packageRoot.length() == 0 || rel.length() == 0 || rel.length() > 160 ||
+        rel.startsWith("/") || rel.indexOf('\\') >= 0 || rel.indexOf(':') >= 0)
+        return "";
+    int start = 0;
+    while (start <= (int)rel.length()) {
+        int slash = rel.indexOf('/', start);
+        if (slash < 0) slash = rel.length();
+        String part = rel.substring(start, slash);
+        if (part.length() == 0 || part == "." || part == "..") return "";
+        start = slash + 1;
+        if (slash == (int)rel.length()) break;
+    }
+    return packageRoot + "/" + rel;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 
 String OSARuntime::permKey() const {
-    return permKeyForName(appName);
+    return permKeyForPath(loadedScriptPath);
 }
 
 // ─── Shared helpers (single source of truth) ────────────────────────────────
@@ -2126,10 +3460,71 @@ String OSARuntime::permKeyForName(const String& appName) {
     return k;
 }
 
+String OSARuntime::permKeyForPath(const String& scriptPath) {
+    // Permission identity must not depend on the user-visible #app name. Two
+    // unrelated store packages are free to use the same display name, but may
+    // never inherit one another's grants. OPKs use the stable package root;
+    // loose .osac binaries normalize to their source path.
+    String normalized = scriptPath;
+    normalized.toLowerCase();
+    String packagePrefix = normalized.startsWith("/system/packages/")
+                         ? "/system/packages/"
+                         : (normalized.startsWith("/packages/") ? "/packages/" : "");
+    if (packagePrefix.length() > 0) {
+        int afterId = normalized.indexOf('/', packagePrefix.length());
+        if (afterId > 0) normalized = normalized.substring(0, afterId);
+    } else if (normalized.endsWith(".osac")) {
+        normalized.remove(normalized.length() - 1);
+    }
+
+    uint64_t hash = 14695981039346656037ULL; // FNV-1a 64-bit
+    for (size_t i = 0; i < normalized.length(); ++i) {
+        hash ^= (uint8_t)normalized[i];
+        hash *= 1099511628211ULL;
+    }
+    char key[22];
+    snprintf(key, sizeof(key), "perm_%08lx%08lx",
+             (unsigned long)(hash >> 32), (unsigned long)(hash & 0xFFFFFFFFULL));
+    return String(key);
+}
+
+// Reads the .osac header into out params. Returns true on success. Fields
+// not present in the file (e.g. file truncated) are left at the input value.
+static bool readOsacHeader(const String& path, String& appName,
+                            uint16_t& appColor, bool& isApp,
+                            bool& isException, uint8_t& perms) {
+    if (!isSdReady) return false;
+    File f = SD.open(path);
+    if (!f) return false;
+    char magic[4];
+    if (!readExact(f, magic, sizeof(magic))) { f.close(); return false; }
+    if (magic[0] != 'O' || magic[1] != 'S' || magic[2] != 'A' || magic[3] != 'C') {
+        f.close(); return false;
+    }
+    uint8_t version, appFlag, serializedException;
+    if (!r8(f, version) || version != OSAC_VERSION ||
+        !rS(f, appName, 64) || !r16(f, appColor) ||
+        !r8(f, appFlag) || !r8(f, serializedException) || !r8(f, perms)) {
+        f.close(); return false;
+    }
+    isApp = appFlag != 0;
+    (void)serializedException;
+    isException = OSARuntime::readIsExceptionFromFile(path);
+    f.close();
+    return true;
+}
+
 String OSARuntime::readAppNameFromFile(const String& path) {
     String fallback;
     int slash = path.lastIndexOf('/');
     fallback = (slash >= 0) ? path.substring(slash + 1) : path;
+
+    String lower = path; lower.toLowerCase();
+    if (lower.endsWith(".osac")) {
+        String name; uint16_t c; bool isApp, isE; uint8_t p;
+        if (readOsacHeader(path, name, c, isApp, isE, p) && name.length() > 0) return name;
+        return fallback;
+    }
 
     if (!isSdReady) return fallback;
     File f = SD.open(path);
@@ -2137,7 +3532,8 @@ String OSARuntime::readAppNameFromFile(const String& path) {
 
     // Scan the whole file — #app may not be the first line (comments, blanks).
     while (f.available()) {
-        String raw = f.readStringUntil('\n');
+        String raw;
+        if (!readLineLimited(f, raw, OSA_MAX_LINE_BYTES)) { f.close(); return fallback; }
         raw.trim();
         if (raw.startsWith("#app ")) {
             String nm = raw.substring(5); nm.trim();
@@ -2152,13 +3548,20 @@ String OSARuntime::readAppNameFromFile(const String& path) {
 }
 
 uint8_t OSARuntime::readRequiredPermsFromFile(const String& path) {
+    String lower = path; lower.toLowerCase();
+    if (lower.endsWith(".osac")) {
+        String n; uint16_t c; bool isApp, isE; uint8_t p = 0;
+        if (readOsacHeader(path, n, c, isApp, isE, p)) return p;
+        return 0;
+    }
     if (!isSdReady) return 0;
     File f = SD.open(path);
     if (!f) return 0;
 
     uint8_t mask = 0;
     while (f.available()) {
-        String raw = f.readStringUntil('\n');
+        String raw;
+        if (!readLineLimited(f, raw, OSA_MAX_LINE_BYTES)) { f.close(); return 0; }
         raw.trim();
         if (!raw.startsWith("#perm ") && raw != "#perm") continue;
         if (raw.length() <= 6) continue;
@@ -2177,11 +3580,19 @@ uint8_t OSARuntime::readRequiredPermsFromFile(const String& path) {
 }
 
 bool OSARuntime::readIsAppFromFile(const String& path) {
+    String lower = path; lower.toLowerCase();
+    if (lower.endsWith(".osac")) {
+        String n; uint16_t c; bool isApp = false, isE; uint8_t p;
+        if (readOsacHeader(path, n, c, isApp, isE, p)) return isApp;
+        return false;
+    }
     if (!isSdReady) return false;
     File f = SD.open(path);
     if (!f) return false;
     while (f.available()) {
-        String raw = f.readStringUntil('\n'); raw.trim();
+        String raw;
+        if (!readLineLimited(f, raw, OSA_MAX_LINE_BYTES)) { f.close(); return false; }
+        raw.trim();
         if (!raw.startsWith("#isApp")) continue;
         String v = raw.substring(6); v.trim(); v.toLowerCase();
         f.close();
@@ -2192,22 +3603,44 @@ bool OSARuntime::readIsAppFromFile(const String& path) {
 }
 
 bool OSARuntime::readIsExceptionFromFile(const String& path) {
-    // The privileged SDK is reserved for system apps in /system/apps/. The
-    // directory is wiped at boot of anything not in the firmware manifest
-    // (see installBuiltinExceptions in main.cpp), so a third-party script
-    // cannot escalate to privileged just by being copied onto the SD card.
-    //
+    // A #exception header or serialized flag is never enough on its own.
+    // Privilege is derived from a fixed legacy allowlist or the recognized
+    // entry point of an allowlisted system OPK. Remote authenticity still
+    // requires the future signed-catalog layer described in store/README.md.
     // A `#exception true` header in a user-supplied script is intentionally
     // ignored — that would let anyone with an SD reader grant themselves root.
-    return path.startsWith("/system/apps/");
+    String lower = path;
+    lower.toLowerCase();
+    static const char* legacy[] = {
+        "/system/apps/home.osa",          "/system/apps/home.osac",
+        "/system/apps/lockscreen.osa",    "/system/apps/lockscreen.osac",
+        "/system/apps/controlcenter.osa", "/system/apps/controlcenter.osac",
+        "/system/apps/settings.osa",      "/system/apps/settings.osac",
+        "/system/apps/files.osa",         "/system/apps/files.osac",
+        "/system/apps/clock.osa",         "/system/apps/clock.osac",
+        "/system/apps/calculator.osa",    "/system/apps/calculator.osac",
+        "/system/apps/notes.osa",         "/system/apps/notes.osac",
+        "/system/apps/compiler.osa",      "/system/apps/compiler.osac",
+        "/system/apps/openstore.osa",     "/system/apps/openstore.osac"
+    };
+    for (const char* trusted : legacy) if (lower == trusted) return true;
+    return PackageManager::isTrustedSystemEntry(path);
 }
 
 uint16_t OSARuntime::readIconColorFromFile(const String& path, uint16_t fallback) {
+    String lower = path; lower.toLowerCase();
+    if (lower.endsWith(".osac")) {
+        String n; uint16_t c = 0; bool isApp, isE; uint8_t p;
+        if (readOsacHeader(path, n, c, isApp, isE, p) && c != 0) return c;
+        return fallback;
+    }
     if (!isSdReady) return fallback;
     File f = SD.open(path);
     if (!f) return fallback;
     while (f.available()) {
-        String raw = f.readStringUntil('\n'); raw.trim();
+        String raw;
+        if (!readLineLimited(f, raw, OSA_MAX_LINE_BYTES)) { f.close(); return fallback; }
+        raw.trim();
         if (!raw.startsWith("#appColor")) continue;
         String v = raw.substring(9); v.trim();
         // Accept "#RRGGBB", #RRGGBB, RRGGBB, with optional quotes.
@@ -2251,9 +3684,18 @@ bool OSARuntime::checkPerm(uint8_t bit, const String& label, const String& detai
 
 bool OSARuntime::showSystemPopup(const String& title, const String& body1, const String& body2,
                                   const String& leftBtn, const String& rightBtn, bool rightDanger) {
-    const int cx = 20, cy = 88, cw = 200, cr = 14;
-    const int bodyLines = (body2.length() > 0) ? 2 : 1;
-    const int ch = 56 + bodyLines * 18 + 52; // title+padding + body + buttons
+    const int cx = 20, cw = 200, cr = 14;
+    const int bodyMaxWidth = cw - 28;
+    const int maxBodyLines = 8;
+    const int bodyLineHeight = 14;
+
+    String bodyLines[maxBodyLines];
+    tft->setTextFont(1); tft->setTextSize(1);
+    int bodyLineCount = popupWrapBody(tft, body1, body2, bodyLines,
+                                      maxBodyLines, bodyMaxWidth);
+    const int contentHeight = 91 + bodyLineCount * bodyLineHeight;
+    const int ch = max(126, contentHeight);
+    const int cy = (320 - ch) / 2;
 
     // Snapshot the popup region so we can restore the underlying script UI on dismiss.
     // (~60 KB for a 200x150 area — well under the heap budget.) Falls back to redraw
@@ -2266,12 +3708,12 @@ bool OSARuntime::showSystemPopup(const String& title, const String& body1, const
 
     tft->setTextFont(2); tft->setTextSize(1); tft->setTextDatum(MC_DATUM);
     tft->setTextColor(tft->color565(20, 20, 22));
-    tft->drawString(title, 120, cy + 24);
+    tft->drawString(popupFitLine(tft, title, cw - 24), 120, cy + 24);
 
     tft->setTextFont(1);
     tft->setTextColor(tft->color565(110, 110, 118));
-    tft->drawString(body1, 120, cy + 46);
-    if (body2.length() > 0) tft->drawString(body2, 120, cy + 62);
+    for (int i = 0; i < bodyLineCount; ++i)
+        tft->drawString(bodyLines[i], 120, cy + 48 + i * bodyLineHeight);
 
     const int divY = cy + ch - 44;
     tft->drawFastHLine(cx, divY, cw, tft->color565(218, 218, 222));
@@ -2279,10 +3721,12 @@ bool OSARuntime::showSystemPopup(const String& title, const String& body1, const
 
     tft->setTextFont(2);
     tft->setTextColor(tft->color565(0, 122, 255));
-    tft->drawString(leftBtn,  cx + cw / 4,     cy + ch - 22);
+    tft->drawString(popupFitLine(tft, leftBtn, cw / 2 - 16),
+                    cx + cw / 4, cy + ch - 22);
     uint16_t rCol = rightDanger ? tft->color565(255, 59, 48) : tft->color565(52, 199, 89);
     tft->setTextColor(rCol);
-    tft->drawString(rightBtn, cx + cw * 3 / 4, cy + ch - 22);
+    tft->drawString(popupFitLine(tft, rightBtn, cw / 2 - 16),
+                    cx + cw * 3 / 4, cy + ch - 22);
 
     delay(180);
     bool right = false;
@@ -2324,12 +3768,22 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         if (funcs[i].name == name) return callUser(name, argsStr);
     }
 
-    String argT[6]; int argc = 0;
-    splitArgs(argsStr, argT, argc);
+    BuiltinBudgetGuard builtinBudget(scriptSliceStarted);
 
-    // Evaluate arguments eagerly
-    OSAVal a[6];
-    for (int i = 0; i < argc; i++) a[i] = eval(argT[i]);
+    String argT[12];
+    OSAVal a[12];
+    int argc = 0;
+    if (directBuiltinArgs) {
+        argc = min(directBuiltinArgc, 12);
+        for (int i = 0; i < argc; ++i)
+            a[i] = static_cast<OSAVal&&>(directBuiltinArgs[i]);
+        directBuiltinArgs = nullptr;
+        directBuiltinArgc = 0;
+    } else {
+        splitArgs(argsStr, argT, argc);
+        // Tree-walker path evaluates source arguments eagerly.
+        for (int i = 0; i < argc; i++) a[i] = eval(argT[i]);
+    }
 
     auto N = [&](int i, double def = 0) -> double {
         return (i < argc) ? a[i].toNum() : def;
@@ -2418,6 +3872,42 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         else              textFont = 1;
         return OSAVal();
     }
+    // textfit(text, width) returns a single line shortened with "...".
+    if (name == "textfit") {
+        tft->setTextFont(textFont); tft->setTextSize(1);
+        return OSAVal(popupFitLine(tft, S(0), max(1, iN(1))));
+    }
+    // textblock(x, y, width, text, lineHeight, scroll, clipTop, clipBottom,
+    //           [maxLines]) draws word-wrapped text and returns content height.
+    // Only visible complete lines are painted, so a fixed header can be drawn
+    // independently while the block scrolls underneath it.
+    if (name == "textblock") {
+        int x = iN(0), y = iN(1), width = max(1, iN(2));
+        String numericText;
+        const String* blockText = nullptr;
+        if (argc > 3 && !a[3].isNum) blockText = &a[3].str;
+        else {
+            numericText = argc > 3 ? a[3].toString() : String("");
+            blockText = &numericText;
+        }
+        tft->setTextFont(textFont); tft->setTextSize(1);
+        if (activeSprite) {
+            activeSprite->setTextFont(textFont); activeSprite->setTextSize(1);
+            activeSprite->setTextColor(txtColor); activeSprite->setTextDatum(TL_DATUM);
+        } else {
+            tft->setTextColor(txtColor); tft->setTextDatum(TL_DATUM);
+        }
+        int fontHeight = tft->fontHeight();
+        int lineHeight = max(fontHeight, iN(4, fontHeight + 2));
+        int clipTop = max(0, iN(6, 0));
+        int clipBottom = min(320, iN(7, 320));
+        WrappedDrawContext context = { tft, activeSprite, x, y, lineHeight,
+                                       max(0, iN(5, 0)), clipTop, clipBottom,
+                                       fontHeight };
+        int lineCount = visitWrappedText(tft, *blockText, width, iN(8, 0),
+                                         drawWrappedLine, &context);
+        return OSAVal((double)(lineCount * lineHeight));
+    }
     if (name == "screenw") return OSAVal(240.0);
     if (name == "screenh") return OSAVal(320.0);
 
@@ -2451,6 +3941,23 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     if (name == "gfx.push") {
         if (!activeSprite) return OSAVal(0.0);
         activeSprite->pushSprite(iN(0), iN(1));
+        return OSAVal(1.0);
+    }
+    if (name == "gfx.pushClip") {
+        if (!activeSprite) return OSAVal(0.0);
+        int clipX = iN(2), clipY = iN(3);
+        int clipW = iN(4), clipH = iN(5);
+        if (clipW <= 0 || clipH <= 0) return OSAVal(0.0);
+        tft->setViewport(clipX, clipY, clipW, clipH, false);
+        activeSprite->pushSprite(iN(0), iN(1));
+        tft->resetViewport();
+        return OSAVal(1.0);
+    }
+    if (name == "gfx.origin") {
+        if (!activeSprite) return OSAVal(0.0);
+        // Drawing coordinates are translated before sprite clipping. This
+        // lets a small reusable stripe render a window of a much taller UI.
+        activeSprite->setOrigin(iN(0), iN(1));
         return OSAVal(1.0);
     }
     if (name == "gfx.end") {
@@ -2500,16 +4007,17 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
 
     // ── Touch ─────────────────────────────────────────────────────────────────
 
-    if (name == "touch.down") return OSAVal(ts->touched() ? 1.0 : 0.0);
+    if (name == "touch.down") {
+        sampleTouch();
+        return OSAVal(touchSampleDown ? 1.0 : 0.0);
+    }
     if (name == "touch.x") {
-        if (!ts->touched()) return OSAVal(-1.0);
-        TS_Point p = ts->getPoint();
-        return OSAVal((double)map(p.x, 300, 3800, 0, 240));
+        sampleTouch();
+        return OSAVal((double)touchSampleX);
     }
     if (name == "touch.y") {
-        if (!ts->touched()) return OSAVal(-1.0);
-        TS_Point p = ts->getPoint();
-        return OSAVal((double)map(p.y, 300, 3800, 0, 320));
+        sampleTouch();
+        return OSAVal((double)touchSampleY);
     }
 
     // ── System ────────────────────────────────────────────────────────────────
@@ -2521,10 +4029,23 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         if (ms <= 0) return OSAVal();
         unsigned long start = millis();
         while ((long)(millis() - start) < ms) {
-            if (checkExitGesture() || checkOverlayGesture()) return OSAVal();
+            if (checkExitGesture() || checkOverlayGesture()) {
+                // Waiting is an explicit cooperative yield, not script CPU time.
+                // Start a fresh compute slice before returning to the script.
+                scriptSliceStarted = millis();
+                scriptOpsSinceYield = 0;
+                scriptLoopOpsTotal = 0;
+                return OSAVal();
+            }
             yield();
             delay(5);
         }
+        // Long-running UI/event loops intentionally call wait() every frame.
+        // Without resetting the slice here, a one-second hold is mistaken for
+        // an unresponsive script even though it continuously feeds the WDT.
+        scriptSliceStarted = millis();
+        scriptOpsSinceYield = 0;
+        scriptLoopOpsTotal = 0;
         return OSAVal();
     }
     if (name == "exit")   { exitFlag = true; return OSAVal(); }
@@ -2599,72 +4120,169 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     //   json.get(body, "choices.0.message.content") → "Hello"
     //   json.has(body, "error")                     → 1 / 0
     //   json.size(body, "choices")                  → element count
+    static const String emptyJson;
+    const String& jsonSource = (argc > 0 && !a[0].isNum) ? a[0].str : emptyJson;
     if (name == "json.get") {
-        String raw = jsonWalkPath(S(0), S(1));
+        String raw = jsonWalkPath(jsonSource, S(1));
         return OSAVal(jsonUnquote(raw));
     }
     if (name == "json.raw") {
         // Returns the raw JSON fragment without unquoting — useful for nested
         // objects you want to feed back into json.get later.
-        return OSAVal(jsonWalkPath(S(0), S(1)));
+        return OSAVal(jsonWalkPath(jsonSource, S(1)));
     }
     if (name == "json.has") {
-        return OSAVal(jsonWalkPath(S(0), S(1)).length() > 0 ? 1.0 : 0.0);
+        return OSAVal(jsonWalkSpan(jsonSource, S(1)).valid() ? 1.0 : 0.0);
     }
     if (name == "json.size") {
-        String frag = (S(1).length() > 0) ? jsonWalkPath(S(0), S(1)) : S(0);
-        return OSAVal((double)jsonContainerSize(frag, 0));
+        JsonSpan span = jsonWalkSpan(jsonSource, S(1));
+        return OSAVal(span.valid() ? (double)jsonContainerSize(jsonSource, span.start) : 0.0);
     }
 
     // ── HTTP (network permission) ────────────────────────────────────────────
     if (name == "url_encode") return OSAVal(urlEncode(S(0)));
     if (name == "http.status") return OSAVal((double)s_httpStatus);
+    if (name == "http.error") return OSAVal(s_httpError);
     if (name == "http.bearer") {
         if (!checkPerm(OSA_PERM_NETWORK, "Network",
                        "Send authenticated requests"))
             return OSAVal();
-        s_httpBearer = S(0);
+        if (argc < 1 || a[0].isNum || a[0].str.length() > 4096 ||
+            a[0].str.indexOf('\r') >= 0 || a[0].str.indexOf('\n') >= 0) {
+            s_httpError = "Bearer token exceeds 4096 byte limit";
+            return OSAVal(0.0);
+        }
+        s_httpBearer = static_cast<String&&>(a[0].str);
         return OSAVal();
     }
     if (name == "http.get" || name == "http.post") {
+        s_httpError = "";
         if (!checkPerm(OSA_PERM_NETWORK, "Network",
                        "Make HTTP requests over Wi-Fi"))
             return OSAVal("");
         if (WiFi.status() != WL_CONNECTED) {
             s_httpStatus = -1;
+            s_httpError = "Wi-Fi is not connected";
             return OSAVal("");
         }
-        String url = S(0);
+        String url = (argc > 0 && !a[0].isNum)
+                   ? static_cast<String&&>(a[0].str) : S(0);
+        if (url.length() == 0 || url.length() > 2048 ||
+            url.indexOf('\r') >= 0 || url.indexOf('\n') >= 0) {
+            s_httpStatus = -2;
+            s_httpError = "HTTP URL exceeds 2048 byte limit";
+            return OSAVal("");
+        }
+        if (!url.startsWith("https://") && !url.startsWith("http://")) {
+            s_httpStatus = -2;
+            s_httpError = "Invalid URL scheme";
+            return OSAVal("");
+        }
+        size_t requestLength = 0;
+        if (name == "http.post" && argc >= 2) {
+            requestLength = a[1].isNum ? a[1].toString().length()
+                                       : a[1].str.length();
+        }
+        if (name == "http.post" && requestLength > OSA_HTTP_MAX_SEND) {
+            s_httpStatus = -3;
+            s_httpError = "HTTP request body too large";
+            return OSAVal("");
+        }
+        if (ESP.getFreeHeap() < OSA_HTTP_MAX_BODY + 12 * 1024) {
+            s_httpStatus = -4;
+            s_httpError = "Not enough memory for HTTP response";
+            return OSAVal("");
+        }
         // HTTPS requires a secure client; HTTP uses the default client.
         bool secure = url.startsWith("https://");
+        if (!secure && s_httpBearer.length() > 0) {
+            s_httpBearer = "";
+            s_httpStatus = -2;
+            s_httpError = "Bearer credentials require HTTPS";
+            return OSAVal("");
+        }
         HTTPClient http;
+        http.setConnectTimeout(8000);
+        http.setTimeout(10000);
         WiFiClientSecure secureClient;
         bool ok = false;
         if (secure) {
-            secureClient.setInsecure(); // no CA bundle on-device — trust on first use
+            secureClient.setInsecure(); // encrypted, but no server identity verification
             ok = http.begin(secureClient, url);
         } else {
             ok = http.begin(url);
         }
-        if (!ok) { s_httpStatus = -2; return OSAVal(""); }
+        if (!ok) {
+            s_httpStatus = -2;
+            s_httpError = "Could not open HTTP connection";
+            return OSAVal("");
+        }
 
-        if (s_httpBearer.length() > 0)
-            http.addHeader("Authorization", "Bearer " + s_httpBearer);
+        // Credentials apply to one request only. Reusing them automatically
+        // for a later, unrelated host could leak an API key.
+        String bearer = static_cast<String&&>(s_httpBearer);
+        s_httpBearer = "";
+        if (bearer.length() > 0)
+            http.addHeader("Authorization", "Bearer " + bearer);
 
         int code;
         if (name == "http.get") {
             code = http.GET();
         } else {
-            String body = S(1);
+            String body = (argc >= 2 && !a[1].isNum)
+                        ? static_cast<String&&>(a[1].str) : S(1);
             String ctype = (argc >= 3) ? S(2) : "application/json";
+            if (ctype.length() > 128 || ctype.indexOf('\r') >= 0 ||
+                ctype.indexOf('\n') >= 0) {
+                s_httpStatus = -3;
+                s_httpError = "Content-Type exceeds 128 byte limit";
+                http.end();
+                return OSAVal("");
+            }
             http.addHeader("Content-Type", ctype);
             code = http.POST(body);
         }
         s_httpStatus = code;
-        String resp;
-        if (code > 0) resp = http.getString();
+        if (code <= 0) {
+            s_httpError = HTTPClient::errorToString(code);
+            http.end();
+            return OSAVal("");
+        }
+
+        int declaredLength = http.getSize();
+        if (declaredLength > (int)OSA_HTTP_MAX_BODY) {
+            s_httpStatus = -3;
+            s_httpError = "HTTP response exceeds 24576 byte limit";
+            http.end();
+            return OSAVal("");
+        }
+
+        BoundedStringStream sink(OSA_HTTP_MAX_BODY);
+        size_t reserveHint = declaredLength > 0 ? (size_t)declaredLength : 1024;
+        if (!sink.begin(reserveHint)) {
+            s_httpStatus = -4;
+            s_httpError = "Not enough memory for HTTP response";
+            http.end();
+            return OSAVal("");
+        }
+        int received = http.writeToStream(&sink);
         http.end();
-        return OSAVal(resp);
+        if (sink.tooLarge()) {
+            s_httpStatus = -3;
+            s_httpError = "HTTP response exceeds 24576 byte limit";
+            return OSAVal("");
+        }
+        if (sink.outOfMemory()) {
+            s_httpStatus = -4;
+            s_httpError = "Not enough memory for HTTP response";
+            return OSAVal("");
+        }
+        if (received < 0) {
+            s_httpStatus = -5;
+            s_httpError = "HTTP response read failed";
+            return OSAVal("");
+        }
+        return OSAVal(sink.take());
     }
 
     // ── Math ─────────────────────────────────────────────────────────────────
@@ -2723,19 +4341,83 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
 
     // ── File I/O (sandboxed to /apps/<appname>/) ──────────────────────────────
 
-    if (name == "fread") {
-        if (!isSdReady) return OSAVal("");
+    if (name == "io.error") return OSAVal(s_ioError);
+    if (name == "asset.path") {
+        s_ioError = "";
+        String path = packageAssetPath(S(0));
+        if (path.length() == 0 || !SD.exists(path.c_str())) {
+            s_ioError = "Package asset not found";
+            return OSAVal("");
+        }
+        return OSAVal(static_cast<String&&>(path));
+    }
+    if (name == "asset.exists") {
+        String path = packageAssetPath(S(0));
+        return OSAVal(path.length() > 0 && SD.exists(path.c_str()) ? 1.0 : 0.0);
+    }
+    if (name == "asset.size") {
+        s_ioError = "";
+        String path = packageAssetPath(S(0));
+        File f = path.length() > 0 ? SD.open(path) : File();
+        if (!f || f.isDirectory()) {
+            if (f) f.close();
+            s_ioError = "Package asset not found";
+            return OSAVal(-1.0);
+        }
+        double size = (double)f.size();
+        f.close();
+        return OSAVal(size);
+    }
+    if (name == "asset.read") {
+        String path = packageAssetPath(S(0));
+        if (path.length() == 0) { s_ioError = "Invalid package asset path"; return OSAVal(""); }
+        size_t offset = (size_t)max(0, iN(1));
+        bool explicitLength = argc >= 3;
+        size_t requested = explicitLength ? (size_t)max(0, iN(2)) : 0;
+        String content;
+        if (!readFileBounded(path, offset, requested, explicitLength, content))
+            return OSAVal("");
+        return OSAVal(static_cast<String&&>(content));
+    }
+    if (name == "fsize") {
+        s_ioError = "";
+        if (!isSdReady) { s_ioError = "No SD card"; return OSAVal(-1.0); }
         File f = SD.open(sandboxPath(S(0)));
-        if (!f) return OSAVal("");
-        String c = f.readString(); f.close(); return OSAVal(c);
+        if (!f || f.isDirectory()) {
+            if (f) f.close();
+            s_ioError = "File not found";
+            return OSAVal(-1.0);
+        }
+        double size = (double)f.size();
+        f.close();
+        return OSAVal(size);
+    }
+    if (name == "fread") {
+        if (!isSdReady) { s_ioError = "No SD card"; return OSAVal(""); }
+        size_t offset = (size_t)max(0, iN(1));
+        bool explicitLength = argc >= 3;
+        size_t requested = explicitLength ? (size_t)max(0, iN(2)) : 0;
+        String content;
+        if (!readFileBounded(sandboxPath(S(0)), offset, requested,
+                             explicitLength, content)) return OSAVal("");
+        return OSAVal(static_cast<String&&>(content));
     }
     if (name == "freadline") {
-        if (!isSdReady) return OSAVal("");
-        File f = SD.open(sandboxPath(S(0))); if (!f) return OSAVal("");
+        s_ioError = "";
+        if (!isSdReady) { s_ioError = "No SD card"; return OSAVal(""); }
+        File f = SD.open(sandboxPath(S(0)));
+        if (!f) { s_ioError = "File not found"; return OSAVal(""); }
         int target = iN(1);
+        if (target < 0) { f.close(); s_ioError = "Invalid line number"; return OSAVal(""); }
         for (int i = 0; i <= target; i++) {
-            String line = f.readStringUntil('\n');
-            if (i == target) { f.close(); line.trim(); return OSAVal(line); }
+            String line;
+            if (!readLineLimited(f, line, OSA_MAX_FILE_READ)) {
+                f.close(); s_ioError = "Line exceeds 32768 byte limit"; return OSAVal("");
+            }
+            if (i == target) {
+                f.close(); line.trim(); return OSAVal(static_cast<String&&>(line));
+            }
+            if (!f.available()) break;
         }
         f.close(); return OSAVal("");
     }
@@ -2765,12 +4447,17 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     if (name == "repeat") {
         String src = S(0); int n = iN(1);
         if (n <= 0) return OSAVal("");
-        String out; out.reserve(src.length() * n);
+        size_t wanted = (size_t)src.length() * (size_t)n;
+        if (src.length() > 0 && (wanted / src.length() != (size_t)n || wanted > 32768))
+            return OSAVal("");
+        String out;
+        if (!out.reserve(wanted)) return OSAVal("");
         for (int i = 0; i < n; i++) out += src;
         return OSAVal(out);
     }
     if (name == "padleft" || name == "padright") {
         String src = S(0); int n = iN(1);
+        if (n < 0 || n > 32768) return OSAVal("");
         String chS = (argc >= 3) ? S(2) : " ";
         char ch = chS.length() > 0 ? chS[0] : ' ';
         if ((int)src.length() >= n) return OSAVal(src);
@@ -2793,7 +4480,9 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         File rf = SD.open(kvPath);
         if (rf) {
             while (rf.available() && kvCount < 24) {
-                String ln = rf.readStringUntil('\n'); ln.trim();
+                String ln;
+                if (!readLineLimited(rf, ln, 2048)) break;
+                ln.trim();
                 int eq = ln.indexOf('=');
                 if (eq < 1) continue;
                 keys[kvCount] = ln.substring(0, eq);
@@ -3198,18 +4887,10 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     //   ui.menuRow("Bluetooth", "B",  0, 122, 255, "OFF >")
     //   var pick = ui.menuShow()
     {
-        static const int RICH_MAX_ROWS = 16;
-        static String   s_rmTitle;
-        static String   s_rmTitles[RICH_MAX_ROWS];
-        static String   s_rmLetters[RICH_MAX_ROWS];
-        static uint16_t s_rmColors[RICH_MAX_ROWS];
-        static String   s_rmValues[RICH_MAX_ROWS];
-        static int      s_rmCount = 0;
-        static bool     s_rmShowBack = false;
-
         if (name == "ui.menuStart") {
             // Optional second arg: showBack (1 = draw "< Back" in header).
             // Defaults to 0 so the root menu doesn't get an unwanted button.
+            clearRichMenuCache();
             s_rmTitle    = S(0);
             s_rmShowBack = (argc >= 2) ? (iN(1) != 0) : false;
             s_rmCount    = 0;
@@ -3556,6 +5237,163 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         return false;
     };
 
+    // OpenStore package API. Installation is restricted to a trusted system
+    // app and still requires an explicit confirmation on the device.
+    if (name == "store.catalog") {
+        if (!needException("store.catalog")) return OSAVal("");
+        return OSAVal(PackageManager::fetchCatalog());
+    }
+    if (name == "store.source") {
+        if (!needException("store.source")) return OSAVal("");
+        return OSAVal(PackageManager::catalogSourceUrl());
+    }
+    if (name == "store.setSource") {
+        if (!needException("store.setSource")) return OSAVal(0.0);
+        return OSAVal(PackageManager::setCatalogSourceUrl(S(0)) ? 1.0 : 0.0);
+    }
+    if (name == "store.systemSource") {
+        if (!needException("store.systemSource")) return OSAVal("");
+        return OSAVal(PackageManager::systemPackageSourcePrefix());
+    }
+    if (name == "store.setSystemSource") {
+        if (!needException("store.setSystemSource")) return OSAVal(0.0);
+        String prefix = S(0);
+        if (!showSystemPopup("System package source", prefix,
+                             "Changes privileged update origin",
+                             "Cancel", "Change", true)) return OSAVal(0.0);
+        return OSAVal(PackageManager::setSystemPackageSourcePrefix(prefix) ? 1.0 : 0.0);
+    }
+    if (name == "store.refresh") {
+        if (!needException("store.refresh")) return OSAVal(-1.0);
+        return OSAVal(PackageManager::refreshCatalog()
+                    ? (double)PackageManager::catalogCount() : -1.0);
+    }
+    if (name == "store.count") {
+        if (!needException("store.count")) return OSAVal(0.0);
+        return OSAVal((double)PackageManager::catalogCount());
+    }
+    if (name == "store.visibleCount") {
+        if (!needException("store.visibleCount")) return OSAVal(0.0);
+        return OSAVal((double)PackageManager::catalogVisibleCount(iN(0) != 0));
+    }
+    if (name == "store.visibleItem") {
+        if (!needException("store.visibleItem")) return OSAVal(-1.0);
+        return OSAVal((double)PackageManager::catalogVisibleIndex(
+            iN(0) != 0, iN(1)));
+    }
+    if (name == "store.state") {
+        if (!needException("store.state")) return OSAVal(0.0);
+        return OSAVal((double)PackageManager::catalogItemState(iN(0)));
+    }
+    if (name == "store.canUninstall") {
+        if (!needException("store.canUninstall")) return OSAVal(0.0);
+        return OSAVal(PackageManager::catalogCanUninstall(iN(0)) ? 1.0 : 0.0);
+    }
+    if (name == "store.id") {
+        if (!needException("store.id")) return OSAVal("");
+        return OSAVal(PackageManager::catalogId(iN(0)));
+    }
+    if (name == "store.name") {
+        if (!needException("store.name")) return OSAVal("");
+        return OSAVal(PackageManager::catalogName(iN(0)));
+    }
+    if (name == "store.remoteVersion") {
+        if (!needException("store.remoteVersion")) return OSAVal("");
+        return OSAVal(PackageManager::catalogVersion(iN(0)));
+    }
+    if (name == "store.remoteVersionCode") {
+        if (!needException("store.remoteVersionCode")) return OSAVal(0.0);
+        return OSAVal((double)PackageManager::catalogVersionCode(iN(0)));
+    }
+    if (name == "store.scope") {
+        if (!needException("store.scope")) return OSAVal("");
+        return OSAVal(PackageManager::catalogScope(iN(0)));
+    }
+    if (name == "store.summary") {
+        if (!needException("store.summary")) return OSAVal("");
+        return OSAVal(PackageManager::catalogSummary(iN(0)));
+    }
+    if (name == "store.developer" || name == "store.owner") {
+        if (!needException("store.developer")) return OSAVal("");
+        return OSAVal(PackageManager::catalogDeveloper(iN(0)));
+    }
+    if (name == "store.description") {
+        if (!needException("store.description")) return OSAVal("");
+        return OSAVal(PackageManager::catalogDescription(iN(0)));
+    }
+    if (name == "store.color") {
+        if (!needException("store.color")) return OSAVal(0.0);
+        return OSAVal((double)PackageManager::catalogColor(iN(0)));
+    }
+    if (name == "store.url") {
+        if (!needException("store.url")) return OSAVal("");
+        return OSAVal(PackageManager::catalogUrl(iN(0)));
+    }
+    if (name == "store.sha256") {
+        if (!needException("store.sha256")) return OSAVal("");
+        return OSAVal(PackageManager::catalogSha256(iN(0)));
+    }
+    if (name == "store.error") {
+        if (!needException("store.error")) return OSAVal("");
+        return OSAVal(PackageManager::lastError());
+    }
+    if (name == "store.versionCode") {
+        if (!needException("store.versionCode")) return OSAVal(0.0);
+        return OSAVal((double)PackageManager::installedVersionCode(S(0)));
+    }
+    if (name == "store.version") {
+        if (!needException("store.version")) return OSAVal("");
+        return OSAVal(PackageManager::installedVersion(S(0)));
+    }
+    if (name == "store.restartRequired") {
+        if (!needException("store.restartRequired")) return OSAVal(0.0);
+        return OSAVal(PackageManager::restartRequired() ? 1.0 : 0.0);
+    }
+    if (name == "store.install") {
+        if (!needException("store.install")) return OSAVal(0.0);
+        String id = S(2);
+        String scope = argc >= 4 ? S(3) : "user";
+        if (scope != "user" && scope != "system") {
+            setError(-1, "store.install: invalid package scope");
+            return OSAVal(0.0);
+        }
+        int current = PackageManager::installedVersionCode(id);
+        bool directUserInstall = argc >= 5 && iN(4) != 0 && scope == "user";
+        String action;
+        if (scope == "system") action = "Full system privileges";
+        else action = current > 0 ? "Update installed package?" : "Install this package?";
+        String title = scope == "system" ? "System update" : "OpenStore";
+        String button = (scope == "system" || current > 0) ? "Update" : "Install";
+        if (!directUserInstall &&
+            !showSystemPopup(title, id, action, "Cancel", button, scope == "system"))
+            return OSAVal(0.0);
+        tft->fillScreen(Theme::bg());
+        tft->fillRect(0, 0, 240, 44, Theme::header());
+        tft->drawFastHLine(0, 44, 240, Theme::divider());
+        tft->setTextDatum(MC_DATUM);
+        tft->setTextFont(2);
+        tft->setTextColor(Theme::text());
+        tft->drawString("OpenStore", 120, 22);
+        tft->drawString((scope == "system" || current > 0)
+                        ? "Updating package..." : "Installing package...", 120, 138);
+        tft->setTextFont(1);
+        tft->setTextColor(Theme::hint());
+        tft->drawString("Downloading, verifying and extracting", 120, 166);
+        tft->drawString("Do not remove the SD card", 120, 184);
+        bool ok = PackageManager::installFromUrl(S(0), S(1), id, scope);
+        return OSAVal(ok ? 1.0 : 0.0);
+    }
+    if (name == "store.remove") {
+        if (!needException("store.remove")) return OSAVal(0.0);
+        String id = S(0);
+        String label = argc >= 2 ? S(1) : id;
+        if (!showSystemPopup("Remove app?", label, "App data is kept", "Cancel", "Remove", true))
+            return OSAVal(0.0);
+        bool removed = PackageManager::removeUserPackage(id);
+        if (removed) home.removeScriptsUnder("/packages/" + id + "/");
+        return OSAVal(removed ? 1.0 : 0.0);
+    }
+
     // sys.* — system mutation
     if (name == "sys.brightness") {
         if (!needException("sys.brightness")) return OSAVal();
@@ -3620,13 +5458,30 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     }
 
     // fs.* — file system access *outside* the per-app sandbox
+    if (name == "fs.size") {
+        if (!needException("fs.size")) return OSAVal(-1.0);
+        s_ioError = "";
+        if (!isSdReady) { s_ioError = "No SD card"; return OSAVal(-1.0); }
+        File f = SD.open(S(0));
+        if (!f || f.isDirectory()) {
+            if (f) f.close();
+            s_ioError = "File not found";
+            return OSAVal(-1.0);
+        }
+        double size = (double)f.size();
+        f.close();
+        return OSAVal(size);
+    }
     if (name == "fs.read") {
         if (!needException("fs.read")) return OSAVal("");
-        if (!isSdReady) return OSAVal("");
-        File f = SD.open(S(0));
-        if (!f) return OSAVal("");
-        String c = f.readString(); f.close();
-        return OSAVal(c);
+        if (!isSdReady) { s_ioError = "No SD card"; return OSAVal(""); }
+        size_t offset = (size_t)max(0, iN(1));
+        bool explicitLength = argc >= 3;
+        size_t requested = explicitLength ? (size_t)max(0, iN(2)) : 0;
+        String content;
+        if (!readFileBounded(S(0), offset, requested, explicitLength, content))
+            return OSAVal("");
+        return OSAVal(static_cast<String&&>(content));
     }
     if (name == "fs.write") {
         if (!needException("fs.write")) return OSAVal(0.0);
@@ -3774,19 +5629,22 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     // ── Bluetooth control (privileged) ───────────────────────────────────────
     if (name == "bt.enable") {
         if (!needException("bt.enable")) return OSAVal();
-        sysBTEnabled = true;
-        SerialBT.begin("OpenOS");
+        if (!osaSetBluetoothEnabled(true)) {
+            showSystemPopup("Bluetooth", osaBluetoothLastError(),
+                            "Bluetooth remains off", "", "OK", false);
+            return OSAVal(0.0);
+        }
         Config::setInt("bluetooth", 1); Config::save();
-        return OSAVal();
+        return OSAVal(1.0);
     }
     if (name == "bt.disable") {
         if (!needException("bt.disable")) return OSAVal();
-        sysBTEnabled = false;
-        SerialBT.end();
+        osaSetBluetoothEnabled(false);
         Config::setInt("bluetooth", 0); Config::save();
-        return OSAVal();
+        return OSAVal(1.0);
     }
     if (name == "bt.enabled") return OSAVal(sysBTEnabled ? 1.0 : 0.0);
+    if (name == "bt.error") return OSAVal(String(osaBluetoothLastError()));
 
     // ── sys.setTime(h, m, s, day, mon, year) — sets RTC ─────────────────────
     if (name == "sys.setTime") {
@@ -3818,33 +5676,65 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
 
     // ── apps.* — manage every .osa app's metadata + permissions ─────────────
     {
-        static const int APPS_MAX_SLOTS = 16;
-        static String s_appsPaths[APPS_MAX_SLOTS];
-        static String s_appsNames[APPS_MAX_SLOTS];
-        static int    s_appsCount = 0;
-
-        // Recursive helper — same shape as Settings::scanOsaDir.
+        // Recursive helper plus explicit OPK-root handling. Package entry
+        // scripts live two levels below /packages, so a generic one-level SD
+        // walk would otherwise omit them from Settings -> Applications.
         struct ScanCtx {
+            static void add(const String& full) {
+                if (s_appsCount >= APPS_MAX_SLOTS) return;
+                String lower = full; lower.toLowerCase();
+                if (!lower.endsWith(".osa") && !lower.endsWith(".osac")) return;
+                for (int i = 0; i < s_appsCount; ++i)
+                    if (s_appsPaths[i] == full) return;
+                s_appsPaths[s_appsCount] = full;
+                s_appsNames[s_appsCount] = OSARuntime::readAppNameFromFile(full);
+                s_appsCount++;
+            }
+
             static void walk(const String& dirPath, int depth) {
                 if (s_appsCount >= APPS_MAX_SLOTS || depth > 1) return;
                 File dir = SD.open(dirPath);
-                if (!dir || !dir.isDirectory()) return;
+                if (!dir || !dir.isDirectory()) {
+                    if (dir) dir.close();
+                    return;
+                }
                 File f = dir.openNextFile();
                 while (f && s_appsCount < APPS_MAX_SLOTS) {
                     String full = f.name();
                     if (!full.startsWith("/")) full = "/" + full;
-                    if (full.startsWith("/apps/")) { f = dir.openNextFile(); continue; }
-                    if (f.isDirectory()) {
-                        if (depth == 0) walk(full, 1);
-                    } else {
-                        String lower = full; lower.toLowerCase();
-                        if (lower.endsWith(".osa")) {
-                            s_appsPaths[s_appsCount] = full;
-                            s_appsNames[s_appsCount] = OSARuntime::readAppNameFromFile(full);
-                            s_appsCount++;
-                        }
+                    bool directoryEntry = f.isDirectory();
+                    f.close();
+                    if (full == "/apps" || full.startsWith("/apps/")) {
+                        f = dir.openNextFile();
+                        continue;
                     }
+                    if (directoryEntry) {
+                        if (depth == 0) walk(full, 1);
+                    } else add(full);
                     f = dir.openNextFile();
+                }
+                dir.close();
+            }
+
+            static void packages(const String& root, bool systemPackages) {
+                File dir = SD.open(root);
+                if (!dir || !dir.isDirectory()) {
+                    if (dir) dir.close();
+                    return;
+                }
+                File item = dir.openNextFile();
+                while (item && s_appsCount < APPS_MAX_SLOTS) {
+                    String id = item.name();
+                    int slash = id.lastIndexOf('/');
+                    if (slash >= 0) id = id.substring(slash + 1);
+                    bool directoryEntry = item.isDirectory();
+                    item.close();
+                    if (directoryEntry && !id.startsWith(".") &&
+                        (!systemPackages || PackageManager::isOfficialSystemId(id))) {
+                        String entry = PackageManager::installedEntry(id, systemPackages);
+                        if (entry.length() > 0) add(entry);
+                    }
+                    item = dir.openNextFile();
                 }
                 dir.close();
             }
@@ -3852,21 +5742,31 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
 
         if (name == "apps.scan") {
             if (!needException("apps.scan")) return OSAVal(0.0);
-            s_appsCount = 0;
-            if (isSdReady) ScanCtx::walk("/", 0);
+            clearAppsScanCache();
+            if (isSdReady) {
+                // User OPKs first: they are the entries whose grants the user
+                // most often needs to inspect, and the UI has a finite row cap.
+                ScanCtx::packages("/packages", false);
+                ScanCtx::walk("/", 0);
+                ScanCtx::walk("/system/apps", 1);
+                ScanCtx::packages("/system/packages", true);
+            }
             return OSAVal((double)s_appsCount);
         }
         if (name == "apps.name") {
+            if (!needException("apps.name")) return OSAVal("");
             int i = iN(0);
             if (i < 0 || i >= s_appsCount) return OSAVal("");
             return OSAVal(s_appsNames[i]);
         }
         if (name == "apps.path") {
+            if (!needException("apps.path")) return OSAVal("");
             int i = iN(0);
             if (i < 0 || i >= s_appsCount) return OSAVal("");
             return OSAVal(s_appsPaths[i]);
         }
         if (name == "apps.needsPerm") {
+            if (!needException("apps.needsPerm")) return OSAVal(0.0);
             int i = iN(0);
             int bit = iN(1);
             if (i < 0 || i >= s_appsCount) return OSAVal(0.0);
@@ -3874,10 +5774,11 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
             return OSAVal((mask & bit) ? 1.0 : 0.0);
         }
         if (name == "apps.hasPerm") {
+            if (!needException("apps.hasPerm")) return OSAVal(0.0);
             int i = iN(0);
             int bit = iN(1);
             if (i < 0 || i >= s_appsCount) return OSAVal(0.0);
-            int stored = Config::getInt(OSARuntime::permKeyForName(s_appsNames[i]), 0);
+            int stored = Config::getInt(OSARuntime::permKeyForPath(s_appsPaths[i]), 0);
             return OSAVal((stored & 0x0F & bit) ? 1.0 : 0.0);
         }
         if (name == "apps.togglePerm") {
@@ -3885,7 +5786,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
             int i = iN(0);
             int bit = iN(1);
             if (i < 0 || i >= s_appsCount) return OSAVal();
-            String key   = OSARuntime::permKeyForName(s_appsNames[i]);
+            String key   = OSARuntime::permKeyForPath(s_appsPaths[i]);
             int stored   = Config::getInt(key, 0);
             uint8_t gr   = stored & 0x0F;
             if (gr & bit) {
@@ -3963,6 +5864,32 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     }
 
     // ── fs.list(absPath) → pipe-separated entries, directories suffixed "/" ──
+    // osa.compile(srcPath, dstPath) — returns diagnostic codes so a UI can
+    // tell *why* it failed: 1 ok, -1 perm denied, -2 alloc, -3 load fail,
+    // -4 unsupported feature, -5 write fail, -6 bytecode full,
+    // -7 number pool full, -8 string pool full, -9 identifier pool full,
+    // -10 invalid jump patch.
+    if (name == "osa.compile") {
+        if (!needException("osa.compile")) return OSAVal(-1.0);
+        String src = S(0), dst = S(1);
+        OSARuntime* tmp = new OSARuntime(tft, ts);
+        if (!tmp) return OSAVal(-2.0);
+        if (!tmp->loadScript(src)) {
+            uint8_t buildError = tmp->bytecodeError();
+            delete tmp;
+            if (buildError == OSA_BCERR_CODE_FULL) return OSAVal(-6.0);
+            if (buildError == OSA_BCERR_NUM_POOL_FULL) return OSAVal(-7.0);
+            if (buildError == OSA_BCERR_STR_POOL_FULL) return OSAVal(-8.0);
+            if (buildError == OSA_BCERR_NAME_POOL_FULL) return OSAVal(-9.0);
+            if (buildError == OSA_BCERR_BAD_PATCH) return OSAVal(-10.0);
+            return OSAVal(-3.0);
+        }
+        if (!tmp->bc.valid)        { delete tmp; return OSAVal(-4.0); }
+        bool wrote = tmp->serializeOsac(dst);
+        delete tmp;
+        return OSAVal(wrote ? 1.0 : -5.0);
+    }
+
     if (name == "fs.list") {
         if (!needException("fs.list")) return OSAVal("");
         if (!isSdReady) return OSAVal("");
@@ -4153,6 +6080,16 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         if (i < 0 || i >= home.appCount) return OSAVal("");
         return OSAVal(home.tiles[i].scriptPath);
     }
+    if (name == "home.canUninstall") {
+        int i = iN(0);
+        if (i < 0 || i >= home.appCount || home.tiles[i].isFolder)
+            return OSAVal(0.0);
+        String packageId;
+        const String& path = home.tiles[i].scriptPath;
+        bool allowed = userPackageFromEntry(path, packageId) ||
+                       isLooseUserScript(path);
+        return OSAVal(allowed ? 1.0 : 0.0);
+    }
     if (name == "home.folderCount") {
         int i = iN(0);
         if (i < 0 || i >= home.appCount || !home.tiles[i].isFolder) return OSAVal(0.0);
@@ -4177,23 +6114,66 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         if (!isException) return OSAVal(0.0);
         int i = iN(0), j = iN(1);
         if (i < 0 || j < 0 || i >= home.appCount || j >= home.appCount) return OSAVal(0.0);
-        HomeTile tmp = home.tiles[i]; home.tiles[i] = home.tiles[j]; home.tiles[j] = tmp;
+        HomeTile tmp = static_cast<HomeTile&&>(home.tiles[i]);
+        home.tiles[i] = static_cast<HomeTile&&>(home.tiles[j]);
+        home.tiles[j] = static_cast<HomeTile&&>(tmp);
         return OSAVal(1.0);
     }
     if (name == "home.makeFolder") {
         if (!isException) return OSAVal(0.0);
-        osaMakeFolder(iN(0));
-        return OSAVal(1.0);
+        return OSAVal(osaMakeFolder(iN(0)) ? 1.0 : 0.0);
     }
     if (name == "home.deleteFolder") {
         if (!isException) return OSAVal(0.0);
-        osaDeleteFolder(iN(0));
+        return OSAVal(osaDeleteFolder(iN(0)) ? 1.0 : 0.0);
+    }
+    if (name == "home.uninstall") {
+        if (!isException) return OSAVal(0.0);
+        int i = iN(0);
+        if (i < 0 || i >= home.appCount || home.tiles[i].isFolder)
+            return OSAVal(0.0);
+
+        String appTitle = home.tiles[i].name;
+        String path = home.tiles[i].scriptPath;
+        String packageId, packagePrefix;
+        bool packaged = userPackageFromEntry(path, packageId, &packagePrefix);
+        if (!packaged && !isLooseUserScript(path)) {
+            showSystemPopup("Protected app", appTitle,
+                            "System apps cannot be uninstalled", "", "OK", false);
+            return OSAVal(0.0);
+        }
+        if (!showSystemPopup("Uninstall app?", appTitle, "App data is kept",
+                             "Cancel", "Uninstall", true))
+            return OSAVal(0.0);
+
+        bool removed = false;
+        String why;
+        if (packaged) {
+            removed = PackageManager::removeUserPackage(packageId);
+            if (!removed) why = PackageManager::lastError();
+        } else if (!isSdReady) {
+            why = "SD card is not available";
+        } else if (!SD.exists(path.c_str())) {
+            // A stale shortcut is already effectively uninstalled.
+            removed = true;
+        } else {
+            removed = SD.remove(path.c_str());
+            if (!removed) why = "Could not remove app file";
+        }
+
+        if (!removed) {
+            if (why.length() == 0) why = "Could not remove app";
+            showSystemPopup("Uninstall failed", appTitle, why, "", "OK", false);
+            return OSAVal(0.0);
+        }
+
+        if (packaged) home.removeScriptsUnder(packagePrefix);
+        else          home.removeScriptPath(path);
         return OSAVal(1.0);
     }
     if (name == "home.addToFolder") {
         if (!isException) return OSAVal(0.0);
-        osaAddToFolder(iN(0), iN(1));
-        return OSAVal(1.0);
+        return OSAVal(osaAddToFolder(iN(0), iN(1)) ? 1.0 : 0.0);
     }
     if (name == "home.saveOrder") {
         if (!isException) return OSAVal();

@@ -13,9 +13,18 @@ OSAApp::OSAApp(TFT_eSPI* t, XPT2046_Touchscreen* touchscreen)
 
 bool OSAApp::loadScript(const String& path) {
     scriptLoaded = showDone = wantsExit = false;
-    if (!runtime.loadScript(path)) return false;
+    Serial.printf("[APP] load '%s' free=%u\n", path.c_str(),
+                  (unsigned)ESP.getFreeHeap());
+    if (!runtime.loadScript(path)) {
+        name = runtime.appName.length() > 0 ? runtime.appName : "App";
+        Serial.printf("[APP] load failed '%s': %s free=%u\n", path.c_str(),
+                      runtime.getError().c_str(), (unsigned)ESP.getFreeHeap());
+        return false;
+    }
     name = runtime.appName.length() > 0 ? runtime.appName : "App";
     scriptLoaded = true;
+    Serial.printf("[APP] loaded '%s' as '%s' free=%u\n", path.c_str(),
+                  name.c_str(), (unsigned)ESP.getFreeHeap());
     return true;
 }
 
@@ -47,6 +56,10 @@ void OSAApp::drawErrorScreen() {
     }
 }
 
+void OSAApp::showLoadError() {
+    drawErrorScreen();
+}
+
 void OSAApp::show() {
     if (!scriptLoaded) {
         tft->fillScreen(Theme::bg());
@@ -58,7 +71,12 @@ void OSAApp::show() {
     showDone = false;
     tft->fillScreen(Theme::bg());
     runtime.runShow();
-    if (runtime.hasError()) { drawErrorScreen(); return; }
+    if (runtime.hasError()) {
+        Serial.printf("[APP] setup error in '%s': %s free=%u\n", name.c_str(),
+                      runtime.getError().c_str(), (unsigned)ESP.getFreeHeap());
+        drawErrorScreen();
+        return;
+    }
     showDone = true;
 }
 
