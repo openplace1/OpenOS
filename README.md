@@ -44,7 +44,6 @@ live. No reflash.
   - [Misc](#misc)
 - [Sandbox vs privileged](#sandbox-vs-privileged)
 - [Building from source](#building-from-source)
-- [Specs](#specs)
 - [Dependencies](#dependencies)
 - [License](#license)
 
@@ -555,20 +554,6 @@ pio run --target upload
 The C++ sources live under `src/`. The runtime is in `src/Runtime/`; the
 host kernel in `src/main.cpp` plus a small `Applications/` layer for the
 data store (home grid, wallpaper cache, theme palette).
-
----
-
-## Specs
-
-| Metric | Value |
-|---|---|
-| C++ source | ~5 000 lines |
-| OSA scripts (sample) | ~1 100 lines |
-| Flash | 1.91 MB / 3 MB partition |
-| RAM (static) | 82 KB |
-| Heap headroom at boot | ~60 KB |
-| Wallpaper cache | 150 KB (lazy) |
-| Per-runtime overhead | ~25 KB (vars + lines + funcs arrays) |
 
 ---
 
