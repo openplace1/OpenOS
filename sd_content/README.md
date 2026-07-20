@@ -1,3 +1,8 @@
+# NOTE
+
+Download **openstore.osa** from **openplace1/OpenStore**!!
+Everything below is unnecessary, kept for when needed
+
 # OpenOS — SD card contents
 
 Drag the **contents** of this folder onto the root of your SD card so the
