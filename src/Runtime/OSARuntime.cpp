@@ -1,6 +1,7 @@
 #include "OSARuntime.h"
 #include "PackageManager.h"
 #include "../Config.h"
+#include "../OpenOSVersion.h"
 #include "../Applications/Theme.h"
 #include "../Applications/Crypto.h"
 #include "../Applications/Wallpaper.h"
@@ -4571,16 +4572,23 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     }
     if (name == "millis") return OSAVal((double)millis());
     if (name == "micros") return OSAVal((double)micros());
-    if (name == "sdk.version") return OSAVal(2.0);
+    if (name == "sdk.version")
+        return OSAVal((double)OpenOSBuild::OSA_SDK_VERSION);
     if (name == "sdk.has") {
         String feature = S(0);
         feature.toLowerCase();
         bool available = feature == "d3" || feature == "sprite" ||
                          feature == "touch" || feature == "perf" ||
                          feature == "http" || feature == "json" ||
-                         feature == "opk";
+                         feature == "opk" ||
+                         feature == "store.compatibility" ||
+                         feature == "store.updateall";
         return OSAVal(available ? 1.0 : 0.0);
     }
+    if (name == "openos.version")
+        return OSAVal(OpenOSBuild::VERSION_NAME);
+    if (name == "openos.versionCode")
+        return OSAVal((double)OpenOSBuild::VERSION_CODE);
     if (name == "elapsed")
         return OSAVal((double)((uint32_t)millis() - (uint32_t)N(0)));
     if (name == "yield") {
@@ -6107,6 +6115,77 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     if (name == "store.state") {
         if (!needException("store.state")) return OSAVal(0.0);
         return OSAVal((double)PackageManager::catalogItemState(iN(0)));
+    }
+    if (name == "store.minSdk") {
+        if (!needException("store.minSdk")) return OSAVal(1.0);
+        return OSAVal((double)PackageManager::catalogMinSdk(iN(0)));
+    }
+    if (name == "store.minOpenOS") {
+        if (!needException("store.minOpenOS")) return OSAVal(1.0);
+        return OSAVal((double)PackageManager::catalogMinOpenOS(iN(0)));
+    }
+    if (name == "store.compatible") {
+        if (!needException("store.compatible")) return OSAVal(0.0);
+        return OSAVal(PackageManager::catalogCompatible(iN(0)) ? 1.0 : 0.0);
+    }
+    if (name == "store.requirement") {
+        if (!needException("store.requirement")) return OSAVal("");
+        return OSAVal(PackageManager::catalogRequirement(iN(0)));
+    }
+    if (name == "store.updateCount") {
+        if (!needException("store.updateCount")) return OSAVal(0.0);
+        return OSAVal((double)PackageManager::catalogUpdateCount());
+    }
+    if (name == "store.updateAll") {
+        if (!needException("store.updateAll")) return OSAVal(-1.0);
+        int total = PackageManager::catalogUpdateCount();
+        if (total <= 0) return OSAVal(0.0);
+        String packageCount = String(total) + (total == 1 ? " update" : " updates");
+        if (!showSystemPopup("Update all?", packageCount,
+                             "Installs every compatible update",
+                             "Cancel", "Update", true))
+            return OSAVal(0.0);
+
+        int completed = 0;
+        while (completed < total) {
+            int item = -1;
+            for (int i = 0; i < PackageManager::catalogCount(); ++i) {
+                if (PackageManager::catalogCompatible(i) &&
+                    PackageManager::catalogItemState(i) == 1) {
+                    item = i;
+                    break;
+                }
+            }
+            if (item < 0) break;
+
+            String id = PackageManager::catalogId(item);
+            String label = PackageManager::catalogName(item);
+            String scope = PackageManager::catalogScope(item);
+            String url = PackageManager::catalogUrl(item);
+            String sha = PackageManager::catalogSha256(item);
+
+            tft->fillScreen(Theme::bg());
+            tft->fillRect(0, 0, 240, 44, Theme::header());
+            tft->drawFastHLine(0, 44, 240, Theme::divider());
+            tft->setTextDatum(MC_DATUM);
+            tft->setTextFont(2);
+            tft->setTextColor(Theme::text());
+            tft->drawString("OpenStore", 120, 22);
+            tft->drawString(String("Updating ") + (completed + 1) +
+                            " of " + total, 120, 132);
+            tft->setTextFont(1);
+            tft->setTextColor(Theme::hint());
+            tft->drawString(label, 120, 158);
+            tft->drawString("Do not remove the SD card", 120, 181);
+
+            if (!PackageManager::installFromUrl(url, sha, id, scope))
+                return OSAVal(-1.0);
+            ++completed;
+            yield();
+            if (completed < total && !PackageManager::refreshCatalog())
+                return OSAVal(-1.0);
+        }
+        return OSAVal((double)completed);
     }
     if (name == "store.canUninstall") {
         if (!needException("store.canUninstall")) return OSAVal(0.0);

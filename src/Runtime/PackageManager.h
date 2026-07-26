@@ -8,6 +8,8 @@ struct OPKManifest {
     String name;
     String version;
     int versionCode = 0;
+    int minSdk = 1;
+    int minOpenOS = 1;
     String entry;
     String scope;
     bool isApp = true;
@@ -39,6 +41,10 @@ String catalogId(int index);
 String catalogName(int index);
 String catalogVersion(int index);
 int catalogVersionCode(int index);
+int catalogMinSdk(int index);
+int catalogMinOpenOS(int index);
+bool catalogCompatible(int index);
+String catalogRequirement(int index);
 String catalogScope(int index);
 String catalogSummary(int index);
 String catalogDeveloper(int index);
@@ -51,6 +57,7 @@ String catalogSha256(int index);
 int catalogVisibleCount(bool systemTab);
 int catalogVisibleIndex(bool systemTab, int slot);
 int catalogItemState(int index);       // 0=GET, 1=UPDATE, 2=INSTALLED, 3=NEWER
+int catalogUpdateCount();              // compatible entries in UPDATE state
 bool catalogCanUninstall(int index);
 bool installFromUrl(const String& url, const String& expectedSha256,
                     const String& expectedId, const String& expectedScope);

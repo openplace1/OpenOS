@@ -144,6 +144,9 @@ web server or CDN. The compiled fallback points at `openplace1/OpenStore`, and
 `store_catalog_url` in `/user/config.ini` can override it without rebuilding
 the kernel. An `.opk` file is an ordinary ZIP renamed to `.opk`; it contains a
 root `manifest.json`, one `.osa` or `.osac` entry point and optional assets.
+The optional integer fields `minSdk` and `minOpenOS` declare the oldest
+supported OSA SDK and OpenOS version code. Missing fields mean `1` for
+compatibility with existing packages.
 
 The bottom navigation separates normal `Apps` from `System Apps`. System
 updates require an official `openos.*` package, a `system` manifest scope and a
@@ -217,7 +220,7 @@ Optional, must be near the top of the file.
 
 Limits per script: 128 KB source, 512 lines, 768 bytes per source line,
 96 variables, 24 user functions and 10 nested calls. Compiled bytecode is
-limited to 8192 bytes, 64 numeric constants, 48 string constants, 64 names and
+limited to 8192 bytes, 96 numeric constants, 160 string constants, 192 names and
 a 48-value operand stack. Exceeding a compiler pool is a hard compile error;
 it never falls through to an invalid `-1` bytecode index.
 
@@ -593,7 +596,9 @@ swiped away.
 | `micros()` | µs counter since boot |
 | `elapsed(startMs)` | Wrap-safe milliseconds elapsed since `startMs` |
 | `sdk.version()` | Numeric SDK compatibility level (currently `2`) |
-| `sdk.has(feature)` | Capability check: `d3`, `sprite`, `touch`, `perf`, `http`, `json`, `opk` |
+| `sdk.has(feature)` | Capability check, including `d3`, `sprite`, `touch`, `perf`, `http`, `json`, `opk`, `store.compatibility` and `store.updateAll` |
+| `openos.version()` | Display version (currently `1.0b`) |
+| `openos.versionCode()` | Numeric OpenOS compatibility level (currently `1`) |
 
 ### Privileged — system
 
@@ -651,6 +656,11 @@ allocation failures.
 | `store.visibleCount(tab)` | Fast count for `tab`: `0` user apps, `1` system apps |
 | `store.visibleItem(tab, slot)` | Catalog index for a visible slot, or `-1` |
 | `store.state(i)` | `0` GET, `1` UPDATE, `2` INSTALLED, `3` local version is newer |
+| `store.minSdk(i)` / `store.minOpenOS(i)` | Minimum package compatibility levels |
+| `store.compatible(i)` | `1` when the current kernel can run the package |
+| `store.requirement(i)` | Human-readable compatibility requirement |
+| `store.updateCount()` | Number of compatible updates currently available |
+| `store.updateAll()` | Confirm once and install every compatible update; returns count or `-1` |
 | `store.canUninstall(i)` | `1` for an installed user package |
 | `store.id(i)` / `store.name(i)` | Catalog identity/display name |
 | `store.remoteVersion(i)` / `store.remoteVersionCode(i)` | Published version |

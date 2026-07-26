@@ -1,5 +1,6 @@
 #include "PackageManager.h"
 #include "../Config.h"
+#include "../OpenOSVersion.h"
 
 #include <SD.h>
 #include <WiFi.h>
@@ -433,6 +434,16 @@ static bool parseManifest(const String& json, OPKManifest& manifest) {
     if (!catalogRangeInt(json, uniqueObjectField(json, root, "versionCode"),
                          manifest.versionCode) || manifest.versionCode < 1)
         return fail("Invalid OPK versionCode");
+    JsonRange minSdkRange = uniqueObjectField(json, root, "minSdk");
+    if (minSdkRange.valid() &&
+        (!catalogRangeInt(json, minSdkRange, manifest.minSdk) ||
+         manifest.minSdk < 1 || manifest.minSdk > 32767))
+        return fail("Invalid OPK minSdk");
+    JsonRange minOpenOSRange = uniqueObjectField(json, root, "minOpenOS");
+    if (minOpenOSRange.valid() &&
+        (!catalogRangeInt(json, minOpenOSRange, manifest.minOpenOS) ||
+         manifest.minOpenOS < 1 || manifest.minOpenOS > 32767))
+        return fail("Invalid OPK minOpenOS");
     manifest.entry = manifestString(json, root, "entry", 160);
     if (!safeRelativePath(manifest.entry, false))
         return fail("Invalid OPK entry path");
@@ -564,6 +575,8 @@ static bool validateCatalogDocument(String& document, int& count) {
     for (int i = 0; valid && i < count; ++i) {
         JsonRange item = catalogItemRange(i);
         int versionCode = 0;
+        int minSdk = 1;
+        int minOpenOS = 1;
         String id = catalogStringField(i, "id", 48);
         String name = catalogStringField(i, "name", 48);
         String version = catalogStringField(i, "version", 24);
@@ -583,12 +596,20 @@ static bool validateCatalogDocument(String& document, int& count) {
         String color = colorRange.valid()
                      ? catalogDecodeString(s_catalog, colorRange, 7) : "";
         JsonRange versionRange = catalogObjectField(s_catalog, item, "versionCode");
+        JsonRange minSdkRange = catalogObjectField(s_catalog, item, "minSdk");
+        JsonRange minOpenOSRange = catalogObjectField(s_catalog, item, "minOpenOS");
         valid = item.valid() && s_catalog[item.start] == '{' && validId(id) &&
                 name.length() > 0 && version.length() > 0 &&
                 (scope == "user" || scope == "system") && url.startsWith("https://") &&
                 url.indexOf('\r') < 0 && url.indexOf('\n') < 0 &&
                 hash.length() == 64 && catalogRangeInt(s_catalog, versionRange, versionCode) &&
                 versionCode > 0;
+        if (valid && minSdkRange.valid())
+            valid = catalogRangeInt(s_catalog, minSdkRange, minSdk) &&
+                    minSdk >= 1 && minSdk <= 32767;
+        if (valid && minOpenOSRange.valid())
+            valid = catalogRangeInt(s_catalog, minOpenOSRange, minOpenOS) &&
+                    minOpenOS >= 1 && minOpenOS <= 32767;
         if (valid && developerRange.valid()) valid = developer.length() > 0;
         if (valid && summaryRange.valid() && summary.length() == 0 &&
             summaryRange.end - summaryRange.start > 2) valid = false;
@@ -1044,7 +1065,10 @@ static bool extractArchive(const String& archivePath, const String& stage,
     OPKManifest verified;
     if (!readManifest(stage, verified)) return false;
     if (verified.id != expected.id || verified.entry != expected.entry ||
-        verified.scope != expected.scope || verified.versionCode != expected.versionCode)
+        verified.scope != expected.scope ||
+        verified.versionCode != expected.versionCode ||
+        verified.minSdk != expected.minSdk ||
+        verified.minOpenOS != expected.minOpenOS)
         return fail("OPK manifest changed during extraction");
     String entryPath = stage + "/" + verified.entry;
     File entry = SD.open(entryPath);
@@ -1310,6 +1334,40 @@ int catalogVersionCode(int index) {
     return catalogRangeInt(s_catalog, range, value) ? value : 0;
 }
 
+static int catalogPositiveIntOrDefault(int index, const char* field,
+                                       int fallback) {
+    int value = fallback;
+    JsonRange range = catalogObjectField(s_catalog, catalogItemRange(index), field);
+    if (!range.valid()) return fallback;
+    return catalogRangeInt(s_catalog, range, value) && value > 0 ? value : fallback;
+}
+
+int catalogMinSdk(int index) {
+    return catalogPositiveIntOrDefault(index, "minSdk", 1);
+}
+
+int catalogMinOpenOS(int index) {
+    return catalogPositiveIntOrDefault(index, "minOpenOS", 1);
+}
+
+bool catalogCompatible(int index) {
+    return index >= 0 && index < s_catalogCount &&
+           catalogMinSdk(index) <= OpenOSBuild::OSA_SDK_VERSION &&
+           catalogMinOpenOS(index) <= OpenOSBuild::VERSION_CODE;
+}
+
+String catalogRequirement(int index) {
+    if (index < 0 || index >= s_catalogCount)
+        return "Package compatibility information is unavailable";
+    int sdk = catalogMinSdk(index);
+    if (sdk > OpenOSBuild::OSA_SDK_VERSION)
+        return String("Requires OSA SDK ") + sdk + " or newer";
+    int openos = catalogMinOpenOS(index);
+    if (openos > OpenOSBuild::VERSION_CODE)
+        return String("Requires OpenOS version code ") + openos + " or newer";
+    return "Compatible";
+}
+
 bool installFromUrl(const String& url, const String& expectedSha256,
                     const String& expectedId, const String& expectedScope) {
     s_error = "";
@@ -1328,6 +1386,8 @@ bool installFromUrl(const String& url, const String& expectedSha256,
     // callers cannot mix an ID from one row with a URL/hash from elsewhere.
     bool catalogMatch = false;
     int catalogVersionCodeExpected = 0;
+    int catalogMinSdkExpected = 1;
+    int catalogMinOpenOSExpected = 1;
     String catalogDisplayName;
     String catalogDisplayVersion;
     for (int i = 0; i < s_catalogCount && !catalogMatch; ++i) {
@@ -1336,11 +1396,18 @@ bool installFromUrl(const String& url, const String& expectedSha256,
                        catalogUrl(i) == url && rowHash == expectedHash;
         if (catalogMatch) {
             catalogVersionCodeExpected = catalogVersionCode(i);
+            catalogMinSdkExpected = catalogMinSdk(i);
+            catalogMinOpenOSExpected = catalogMinOpenOS(i);
             catalogDisplayName = catalogName(i);
             catalogDisplayVersion = catalogVersion(i);
         }
     }
     if (!catalogMatch) return fail("Package is not present in the active catalog");
+    if (catalogMinSdkExpected > OpenOSBuild::OSA_SDK_VERSION)
+        return fail(String("Requires OSA SDK ") + catalogMinSdkExpected + " or newer");
+    if (catalogMinOpenOSExpected > OpenOSBuild::VERSION_CODE)
+        return fail(String("Requires OpenOS version code ") +
+                    catalogMinOpenOSExpected + " or newer");
 
     // The caller has copied the selected item's small fields. Release the
     // potentially 24 KB catalog before TLS and ZIP extraction need RAM.
@@ -1367,6 +1434,20 @@ bool installFromUrl(const String& url, const String& expectedSha256,
     }
     if (manifest.versionCode != catalogVersionCodeExpected) {
         SD.remove(DOWNLOAD_PATH); return fail("OPK versionCode does not match catalog");
+    }
+    if (manifest.minSdk != catalogMinSdkExpected ||
+        manifest.minOpenOS != catalogMinOpenOSExpected) {
+        SD.remove(DOWNLOAD_PATH);
+        return fail("OPK compatibility does not match catalog");
+    }
+    if (manifest.minSdk > OpenOSBuild::OSA_SDK_VERSION) {
+        SD.remove(DOWNLOAD_PATH);
+        return fail(String("Requires OSA SDK ") + manifest.minSdk + " or newer");
+    }
+    if (manifest.minOpenOS > OpenOSBuild::VERSION_CODE) {
+        SD.remove(DOWNLOAD_PATH);
+        return fail(String("Requires OpenOS version code ") +
+                    manifest.minOpenOS + " or newer");
     }
     if (manifest.name != catalogDisplayName || manifest.version != catalogDisplayVersion) {
         SD.remove(DOWNLOAD_PATH); return fail("OPK name/version does not match catalog");
@@ -1510,6 +1591,13 @@ int catalogItemState(int index) {
     if (local < remote) return 1;
     if (local == remote) return 2;
     return 3;
+}
+
+int catalogUpdateCount() {
+    int updates = 0;
+    for (int i = 0; i < s_catalogCount; ++i)
+        if (catalogCompatible(i) && catalogItemState(i) == 1) ++updates;
+    return updates;
 }
 
 bool catalogCanUninstall(int index) {
