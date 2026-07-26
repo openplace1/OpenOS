@@ -433,6 +433,77 @@ const int OSA_PERM_TABLE_COUNT = sizeof(OSA_PERM_TABLE) / sizeof(OSA_PERM_TABLE[
     else              tft->call; \
 } while (0)
 
+static uint16_t osaRgb565(int red, int green, int blue) {
+    red = constrain(red, 0, 255);
+    green = constrain(green, 0, 255);
+    blue = constrain(blue, 0, 255);
+    return ((uint16_t)(red & 0xF8) << 8) |
+           ((uint16_t)(green & 0xFC) << 3) |
+           ((uint16_t)blue >> 3);
+}
+
+static void osaUnpack565(uint16_t color, int& red, int& green, int& blue) {
+    red = ((color >> 11) & 0x1F) * 255 / 31;
+    green = ((color >> 5) & 0x3F) * 255 / 63;
+    blue = (color & 0x1F) * 255 / 31;
+}
+
+static uint16_t osaMix565(uint16_t first, uint16_t second, float amount) {
+    if (!isfinite(amount)) amount = 0.0f;
+    if (amount < 0.0f) amount = 0.0f;
+    if (amount > 1.0f) amount = 1.0f;
+    int r1, g1, b1, r2, g2, b2;
+    osaUnpack565(first, r1, g1, b1);
+    osaUnpack565(second, r2, g2, b2);
+    return osaRgb565((int)lroundf(r1 + (r2 - r1) * amount),
+                     (int)lroundf(g1 + (g2 - g1) * amount),
+                     (int)lroundf(b1 + (b2 - b1) * amount));
+}
+
+static uint16_t osaHsv565(float hue, float saturation, float value) {
+    if (!isfinite(hue)) hue = 0.0f;
+    if (!isfinite(saturation)) saturation = 0.0f;
+    if (!isfinite(value)) value = 0.0f;
+    hue = fmodf(hue, 360.0f);
+    if (hue < 0.0f) hue += 360.0f;
+    saturation = min(1.0f, max(0.0f, saturation));
+    value = min(1.0f, max(0.0f, value));
+
+    float chroma = value * saturation;
+    float section = hue / 60.0f;
+    float second = chroma * (1.0f - fabsf(fmodf(section, 2.0f) - 1.0f));
+    float red = 0.0f, green = 0.0f, blue = 0.0f;
+    if      (section < 1.0f) { red = chroma; green = second; }
+    else if (section < 2.0f) { red = second; green = chroma; }
+    else if (section < 3.0f) { green = chroma; blue = second; }
+    else if (section < 4.0f) { green = second; blue = chroma; }
+    else if (section < 5.0f) { red = second; blue = chroma; }
+    else                     { red = chroma; blue = second; }
+    float match = value - chroma;
+    return osaRgb565((int)lroundf((red + match) * 255.0f),
+                     (int)lroundf((green + match) * 255.0f),
+                     (int)lroundf((blue + match) * 255.0f));
+}
+
+static size_t osaSpriteBytes(int width, int height, int depth) {
+    if (width <= 0 || height <= 0) return 0;
+    uint64_t pixels = (uint64_t)(uint32_t)width * (uint32_t)height;
+    uint64_t bytes = depth == 16 ? pixels * 2ULL :
+                     depth == 8  ? pixels :
+                     ((uint64_t)((width + 7) / 8) * (uint32_t)height);
+    return bytes > SIZE_MAX ? SIZE_MAX : (size_t)bytes;
+}
+
+static bool osaCanAllocateSprite(int width, int height, int depth) {
+    size_t bytes = osaSpriteBytes(width, height, depth);
+    if (bytes == 0 || bytes == SIZE_MAX) return false;
+    // Leave enough heap for touch, VM values and an app exit path. Requiring
+    // one contiguous block also avoids asking the allocator for an impossible
+    // sprite after String-heavy apps have fragmented the heap.
+    return bytes + 8192U <= ESP.getFreeHeap() &&
+           bytes + 1024U <= ESP.getMaxAllocHeap();
+}
+
 // Map keyword in #perm header to a bit. Returns 0 if unknown.
 static uint8_t permBitFromKeyword(const String& kw) {
     String k = kw; k.toLowerCase(); k.trim();
@@ -585,7 +656,24 @@ static bool readFileBounded(const String& path, size_t offset, size_t requested,
 
 static String urlEncode(const String& s) {
     static const char hex[] = "0123456789ABCDEF";
-    String out; out.reserve(s.length() * 3);
+    size_t required = 0;
+    for (size_t i = 0; i < s.length(); ++i) {
+        unsigned char c = (unsigned char)s[i];
+        bool safe = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                    (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+                    c == '.' || c == '~';
+        size_t add = safe ? 1 : 3;
+        if (required > OSA_MAX_FILE_READ - add) {
+            s_ioError = "Encoded URL exceeds 32768 byte limit";
+            return "";
+        }
+        required += add;
+    }
+    String out;
+    if (!out.reserve(required)) {
+        s_ioError = "Not enough memory for URL encoding";
+        return "";
+    }
     for (size_t i = 0; i < s.length(); i++) {
         unsigned char c = (unsigned char)s[i];
         bool safe = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
@@ -606,6 +694,45 @@ static String urlEncode(const String& s) {
 // with json.get(body, "choices.0.message.content"). Handles strings (with the
 // common \" \\ \n \t \r escapes), numbers, booleans, null, nested objects and
 // arrays. Numeric path segments index into arrays.
+
+static int urlHexNibble(char value) {
+    if (value >= '0' && value <= '9') return value - '0';
+    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+    if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+    return -1;
+}
+
+static String urlDecode(const String& source) {
+    String output;
+    if (!output.reserve(source.length())) {
+        s_ioError = "Not enough memory for URL decoding";
+        return "";
+    }
+    for (unsigned int i = 0; i < source.length(); ++i) {
+        char value = source[i];
+        if (value == '+') {
+            output += ' ';
+            continue;
+        }
+        if (value != '%') {
+            output += value;
+            continue;
+        }
+        if (i + 2 >= source.length()) {
+            s_ioError = "Invalid URL escape";
+            return "";
+        }
+        int high = urlHexNibble(source[i + 1]);
+        int low = urlHexNibble(source[i + 2]);
+        if (high < 0 || low < 0) {
+            s_ioError = "Invalid URL escape";
+            return "";
+        }
+        output += (char)((high << 4) | low);
+        i += 2;
+    }
+    return output;
+}
 
 static int jsonSkipWs(const String& s, int p) {
     int len = s.length();
@@ -2354,6 +2481,20 @@ void OSARuntime::reset() {
     touchSampleMs = UINT32_MAX;
     touchSampleDown = false;
     touchSampleX = touchSampleY = -1;
+    touchWasDown = false;
+    gestureActive = false;
+    pressedOneShot = false;
+    releasedOneShot = false;
+    tapOneShot = false;
+    swipeOneShot = 0;
+    gestureEndX = gestureEndY = -1;
+    frameLastMs = 0;
+    frameDeltaMs = 50;
+    frameFps = 20.0f;
+    d3SlowFrames = d3FastFrames = 0;
+    d3ReducedQuality = false;
+    d3AdaptiveQuality = true;
+    d3.reset();
     releaseStringStorage(s_httpBearer);
     releaseStringStorage(s_httpError);
     releaseStringStorage(s_ioError);
@@ -2446,6 +2587,8 @@ void OSARuntime::pollGesture() {
             gestureStartY = cy;
             gestureStartT = millis();
             gestureActive = true;
+            pressedOneShot = true;
+            tapOneShot = false;
             swipeOneShot  = 0;
         }
         gestureLastX = cx;
@@ -2453,14 +2596,18 @@ void OSARuntime::pollGesture() {
         releasedOneShot = false;
     } else {
         if (touchWasDown && gestureActive) {
+            pressedOneShot = false;
             int dx = gestureLastX - gestureStartX;
             int dy = gestureLastY - gestureStartY;
             int absX = abs(dx), absY = abs(dy);
+            gestureEndX = gestureLastX;
+            gestureEndY = gestureLastY;
             const int swipeThresh = 40;
             if (absX > swipeThresh || absY > swipeThresh) {
                 if (absY > absX) swipeOneShot = (dy < 0) ? 1 : 2;
                 else             swipeOneShot = (dx < 0) ? 3 : 4;
             }
+            tapOneShot = absX <= 14 && absY <= 14;
             releasedOneShot = true;
             gestureActive   = false;
         }
@@ -3770,16 +3917,22 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
 
     BuiltinBudgetGuard builtinBudget(scriptSliceStarted);
 
-    String argT[12];
-    OSAVal a[12];
+    OSAVal localArgs[12];
+    OSAVal* a = localArgs;
     int argc = 0;
     if (directBuiltinArgs) {
         argc = min(directBuiltinArgc, 12);
-        for (int i = 0; i < argc; ++i)
-            a[i] = static_cast<OSAVal&&>(directBuiltinArgs[i]);
+        // The VM-owned argument array remains alive until this call returns.
+        // Read it in place instead of moving every value through a second
+        // twelve-element array; this matters for per-frame drawing calls.
+        a = directBuiltinArgs;
         directBuiltinArgs = nullptr;
         directBuiltinArgc = 0;
     } else {
+        // Source-token strings are needed only by the tree-walker fallback.
+        // Keeping them out of the normal bytecode path avoids constructing
+        // twelve Arduino String objects for every SDK call.
+        String argT[12];
         splitArgs(argsStr, argT, argc);
         // Tree-walker path evaluates source arguments eagerly.
         for (int i = 0; i < argc; i++) a[i] = eval(argT[i]);
@@ -3803,6 +3956,12 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     }
     if (name == "bg") {
         uint16_t c = tft->color565(iN(0), iN(1), iN(2));
+        if (activeSprite) activeSprite->fillSprite(c);
+        else              tft->fillScreen(c);
+        return OSAVal();
+    }
+    if (name == "bg565") {
+        uint16_t c = (uint16_t)iN(0);
         if (activeSprite) activeSprite->fillSprite(c);
         else              tft->fillScreen(c);
         return OSAVal();
@@ -3847,20 +4006,104 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         CV(drawLine(iN(0), iN(1), iN(2), iN(3), drawColor));
         return OSAVal();
     }
+    if (name == "hline") {
+        CV(drawFastHLine(iN(0), iN(1), max(0, iN(2)), drawColor));
+        return OSAVal();
+    }
+    if (name == "vline") {
+        CV(drawFastVLine(iN(0), iN(1), max(0, iN(2)), drawColor));
+        return OSAVal();
+    }
+    if (name == "thickline") {
+        float width = max(1.0f, (float)N(4, 1));
+        CV(drawWideLine((float)N(0), (float)N(1), (float)N(2), (float)N(3),
+                        width, drawColor));
+        return OSAVal();
+    }
     if (name == "pixel") {
         CV(drawPixel(iN(0), iN(1), drawColor));
         return OSAVal();
     }
+    if (name == "ellipse") {
+        CV(fillEllipse(iN(0), iN(1), max(0, iN(2)), max(0, iN(3)),
+                       drawColor));
+        return OSAVal();
+    }
+    if (name == "eframe") {
+        CV(drawEllipse(iN(0), iN(1), max(0, iN(2)), max(0, iN(3)),
+                       drawColor));
+        return OSAVal();
+    }
+    if (name == "quad" || name == "qframe") {
+        int x1 = iN(0), y1 = iN(1), x2 = iN(2), y2 = iN(3);
+        int x3 = iN(4), y3 = iN(5), x4 = iN(6), y4 = iN(7);
+        if (name == "quad") {
+            CV(fillTriangle(x1, y1, x2, y2, x3, y3, drawColor));
+            CV(fillTriangle(x1, y1, x3, y3, x4, y4, drawColor));
+        } else {
+            CV(drawLine(x1, y1, x2, y2, drawColor));
+            CV(drawLine(x2, y2, x3, y3, drawColor));
+            CV(drawLine(x3, y3, x4, y4, drawColor));
+            CV(drawLine(x4, y4, x1, y1, drawColor));
+        }
+        return OSAVal();
+    }
+    if (name == "arc") {
+        int radius = max(1, iN(2));
+        int thickness = constrain(iN(3, 1), 1, radius);
+        int start = iN(4) % 360; if (start < 0) start += 360;
+        int end = iN(5) % 360; if (end < 0) end += 360;
+        uint16_t background = (uint16_t)iN(6, 0);
+        CV(drawArc(iN(0), iN(1), radius, radius - thickness,
+                   start, end, drawColor, background, false));
+        return OSAVal();
+    }
     if (name == "setcolor") {
-        drawColor = tft->color565(iN(0), iN(1), iN(2));
+        drawColor = osaRgb565(iN(0), iN(1), iN(2));
         return OSAVal();
     }
     if (name == "setcolor565")  { drawColor = (uint16_t)iN(0); return OSAVal(); }
     if (name == "textcolor") {
-        txtColor = tft->color565(iN(0), iN(1), iN(2));
+        txtColor = osaRgb565(iN(0), iN(1), iN(2));
         return OSAVal();
     }
     if (name == "textcolor565") { txtColor  = (uint16_t)iN(0); return OSAVal(); }
+    if (name == "color.rgb") {
+        return OSAVal((double)osaRgb565(iN(0), iN(1), iN(2)));
+    }
+    if (name == "color.gray") {
+        int level = iN(0);
+        return OSAVal((double)osaRgb565(level, level, level));
+    }
+    if (name == "color.r" || name == "color.g" || name == "color.b") {
+        int red, green, blue;
+        osaUnpack565((uint16_t)iN(0), red, green, blue);
+        if (name == "color.r") return OSAVal((double)red);
+        if (name == "color.g") return OSAVal((double)green);
+        return OSAVal((double)blue);
+    }
+    if (name == "color.lerp") {
+        return OSAVal((double)osaMix565((uint16_t)iN(0), (uint16_t)iN(1),
+                                        (float)N(2)));
+    }
+    if (name == "color.lighten") {
+        return OSAVal((double)osaMix565((uint16_t)iN(0), TFT_WHITE,
+                                        (float)N(1)));
+    }
+    if (name == "color.darken") {
+        return OSAVal((double)osaMix565((uint16_t)iN(0), TFT_BLACK,
+                                        (float)N(1)));
+    }
+    if (name == "color.hsv") {
+        return OSAVal((double)osaHsv565((float)N(0), (float)N(1),
+                                        (float)N(2)));
+    }
+    if (name == "color.contrast") {
+        int red, green, blue;
+        osaUnpack565((uint16_t)iN(0), red, green, blue);
+        int luminance = red * 299 + green * 587 + blue * 114;
+        return OSAVal((double)(luminance >= 150000 ? TFT_BLACK : TFT_WHITE));
+    }
     if (name == "fontsize") {
         // TFT_eSPI ships fonts 1, 2, 4, 6, 7 — 6 is digits-only (big clock
         // glyphs), 7 is 7-segment. Anything in between rounds down.
@@ -3915,27 +4158,42 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     //   ok = gfx.begin(w, h)   — allocate; subsequent draws go to the sprite
     //   gfx.push(x, y)         — blit sprite to TFT at (x, y)
     //   gfx.end()              — release sprite, drawing returns to direct TFT
-    if (name == "gfx.begin") {
+    if (name == "gfx.begin" || name == "gfx.auto") {
         // Optional 3rd arg: depth 1/8/16 (default 16). 8-bit halves memory
         // (256-color palette) — perfect for solid-color sprites.
         int w = iN(0), h = iN(1);
-        int depth = (argc >= 3) ? iN(2) : 16;
-        if (depth != 1 && depth != 8 && depth != 16) depth = 16;
-        if (w <= 0 || h <= 0) return OSAVal(0.0);
+        int requestedDepth = (argc >= 3) ? iN(2) : 16;
+        if (requestedDepth != 1 && requestedDepth != 8 &&
+            requestedDepth != 16) requestedDepth = 16;
+        if (w <= 0 || h <= 0 || w > 4096 || h > 4096)
+            return OSAVal(0.0);
         if (activeSprite) {
             activeSprite->deleteSprite();
             delete activeSprite;
             activeSprite = nullptr;
         }
-        activeSprite = new TFT_eSprite(tft);
-        if (!activeSprite) return OSAVal(0.0);
-        activeSprite->setColorDepth(depth);
-        if (!activeSprite->createSprite(w, h)) {
-            delete activeSprite;
-            activeSprite = nullptr;
+        auto tryDepth = [&](int depth) -> bool {
+            if (!osaCanAllocateSprite(w, h, depth)) return false;
+            activeSprite = new (std::nothrow) TFT_eSprite(tft);
+            if (!activeSprite) return false;
+            activeSprite->setColorDepth(depth);
+            if (!activeSprite->createSprite(w, h)) {
+                delete activeSprite;
+                activeSprite = nullptr;
+                return false;
+            }
+            activeSprite->fillSprite(TFT_BLACK);
+            return true;
+        };
+        if (name == "gfx.auto") {
+            const int candidates[3] = {16, 8, 1};
+            for (int candidate : candidates) {
+                if (candidate > requestedDepth) continue;
+                if (tryDepth(candidate)) return OSAVal((double)candidate);
+            }
             return OSAVal(0.0);
         }
-        activeSprite->fillSprite(TFT_BLACK);
+        if (!tryDepth(requestedDepth)) return OSAVal(0.0);
         return OSAVal(1.0);
     }
     if (name == "gfx.push") {
@@ -3974,6 +4232,18 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         return OSAVal();
     }
     if (name == "gfx.active") return OSAVal(activeSprite ? 1.0 : 0.0);
+    if (name == "gfx.width")
+        return OSAVal(activeSprite ? (double)activeSprite->width() : 240.0);
+    if (name == "gfx.height")
+        return OSAVal(activeSprite ? (double)activeSprite->height() : 320.0);
+    if (name == "gfx.depth")
+        return OSAVal(activeSprite ? (double)activeSprite->getColorDepth() : 16.0);
+    if (name == "gfx.bytes") {
+        if (!activeSprite) return OSAVal(0.0);
+        return OSAVal((double)osaSpriteBytes(activeSprite->width(),
+                                             activeSprite->height(),
+                                             activeSprite->getColorDepth()));
+    }
     // ── gfx.stash / gfx.show / gfx.unstash ────────────────────────────────
     // "Build once, blit many" pattern: build a sprite with gfx.begin + draws,
     // call gfx.stash() to detach it (drawing returns to screen but the buffer
@@ -4007,6 +4277,151 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
 
     // ── Touch ─────────────────────────────────────────────────────────────────
 
+    // Lightweight pseudo-3D. Complex primitives stay inside one native call so
+    // script bytecode does not pay a VM transition for every vertex and edge.
+    if (name.startsWith("d3.")) {
+        if (name == "d3.reset") {
+            d3.reset();
+            frameLastMs = 0;
+            frameDeltaMs = 50;
+            frameFps = 20.0f;
+            d3SlowFrames = d3FastFrames = 0;
+            d3ReducedQuality = false;
+            d3AdaptiveQuality = true;
+            return OSAVal();
+        }
+        if (name == "d3.camera") {
+            d3.setCamera((float)N(0, 120), (float)N(1, 160),
+                         (float)N(2, 110), (float)N(3, 5));
+            return OSAVal();
+        }
+        if (name == "d3.cameraX") return OSAVal((double)d3.centerX());
+        if (name == "d3.cameraY") return OSAVal((double)d3.centerY());
+        if (name == "d3.focal") return OSAVal((double)d3.focal());
+        if (name == "d3.distance") return OSAVal((double)d3.distance());
+        if (name == "d3.visible" || name == "d3.projectX" ||
+            name == "d3.projectY") {
+            int16_t projectedX = 0, projectedY = 0;
+            bool visible = d3.project((float)N(0), (float)N(1), (float)N(2),
+                                      projectedX, projectedY);
+            if (name == "d3.visible") return OSAVal(visible ? 1.0 : 0.0);
+            if (!visible) return OSAVal(-32768.0);
+            return OSAVal((double)(name == "d3.projectX"
+                                   ? projectedX : projectedY));
+        }
+        if (name == "d3.line") {
+            bool ok = d3.drawLine(tft, activeSprite,
+                                  (float)N(0), (float)N(1), (float)N(2),
+                                  (float)N(3), (float)N(4), (float)N(5),
+                                  drawColor);
+            return OSAVal(ok ? 1.0 : 0.0);
+        }
+        if (name == "d3.point") {
+            bool ok = d3.drawPoint(tft, activeSprite,
+                                   (float)N(0), (float)N(1), (float)N(2),
+                                   iN(3, 1), drawColor);
+            return OSAVal(ok ? 1.0 : 0.0);
+        }
+        if (name == "d3.triangle") {
+            bool ok = d3.drawTriangle(
+                tft, activeSprite,
+                (float)N(0), (float)N(1), (float)N(2),
+                (float)N(3), (float)N(4), (float)N(5),
+                (float)N(6), (float)N(7), (float)N(8),
+                iN(9, 1) != 0, drawColor);
+            return OSAVal(ok ? 1.0 : 0.0);
+        }
+        if (name == "d3.cube") {
+            int requestedMode = constrain(iN(7, 2), 0, 2);
+            int renderMode = d3AdaptiveQuality && d3ReducedQuality
+                           ? 0 : requestedMode;
+            uint16_t edge = argc >= 9
+                          ? (uint16_t)iN(8)
+                          : (renderMode == 0
+                             ? drawColor
+                             : OSA3DRenderer::shade565(drawColor, 0.28f));
+            int rendered = d3.drawCube(
+                tft, activeSprite,
+                (float)N(0), (float)N(1), (float)N(2), (float)N(3, 1),
+                (float)N(4), (float)N(5), (float)N(6),
+                renderMode, drawColor, edge);
+            return OSAVal((double)rendered);
+        }
+        if (name == "d3.grid") {
+            return OSAVal((double)d3.drawGrid(
+                tft, activeSprite, (float)N(0), (float)N(1, 5),
+                (float)N(2, 1), drawColor));
+        }
+        if (name == "d3.axes") {
+            d3.drawAxes(tft, activeSprite, (float)N(0, 2));
+            return OSAVal();
+        }
+        if (name == "d3.renderMs")
+            return OSAVal((double)d3.lastRenderMicros() / 1000.0);
+        if (name == "d3.faces")
+            return OSAVal((double)d3.lastFaceCount());
+        if (name == "d3.adaptive") {
+            d3AdaptiveQuality = N(0, 1) != 0;
+            if (!d3AdaptiveQuality) d3ReducedQuality = false;
+            return OSAVal(d3AdaptiveQuality ? 1.0 : 0.0);
+        }
+        if (name == "d3.quality")
+            return OSAVal(d3ReducedQuality ? 0.0 : 1.0);
+        if (name == "d3.fps") return OSAVal((double)frameFps);
+        if (name == "d3.delta")
+            return OSAVal((double)frameDeltaMs / 1000.0);
+        if (name == "d3.frame") {
+            // Hard 3D limit: scripts cannot request less than 12 or more than
+            // 20 FPS. The headroom keeps touch and Wi-Fi responsive.
+            int targetFps = constrain(iN(0, 20), 12, 20);
+            uint32_t targetMs = 1000U / (uint32_t)targetFps;
+            uint32_t now = millis();
+            if (frameLastMs == 0) {
+                frameLastMs = now;
+                frameDeltaMs = targetMs;
+                frameFps = (float)targetFps;
+            } else {
+                uint32_t elapsed = now - frameLastMs;
+                while (elapsed < targetMs && !exitFlag) {
+                    if (checkExitGesture() || checkOverlayGesture()) break;
+                    uint32_t remaining = targetMs - elapsed;
+                    delay((uint32_t)min((uint32_t)5, remaining));
+                    yield();
+                    now = millis();
+                    elapsed = now - frameLastMs;
+                }
+                if (elapsed == 0) elapsed = 1;
+                frameLastMs = now;
+                frameDeltaMs = elapsed;
+                float instant = 1000.0f / (float)elapsed;
+                frameFps = frameFps * 0.75f + instant * 0.25f;
+
+                if (elapsed > 83U) {
+                    d3FastFrames = 0;
+                    if (d3SlowFrames < 255) ++d3SlowFrames;
+                    if (d3AdaptiveQuality && d3SlowFrames >= 2)
+                        d3ReducedQuality = true;
+                } else {
+                    d3SlowFrames = 0;
+                    if (elapsed <= 70U && d3FastFrames < 255)
+                        ++d3FastFrames;
+                    else
+                        d3FastFrames = 0;
+                    if (d3ReducedQuality && d3FastFrames >= 10) {
+                        d3ReducedQuality = false;
+                        d3FastFrames = 0;
+                    }
+                }
+            }
+            // A frame boundary is an explicit cooperative yield just like
+            // wait(), so animation loops do not consume the script budget.
+            scriptSliceStarted = millis();
+            scriptOpsSinceYield = 0;
+            scriptLoopOpsTotal = 0;
+            return OSAVal((double)frameFps);
+        }
+    }
+
     if (name == "touch.down") {
         sampleTouch();
         return OSAVal(touchSampleDown ? 1.0 : 0.0);
@@ -4021,6 +4436,105 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     }
 
     // ── System ────────────────────────────────────────────────────────────────
+
+    if (name == "touch.pressed") {
+        pollGesture();
+        bool pressed = pressedOneShot;
+        pressedOneShot = false;
+        return OSAVal(pressed ? 1.0 : 0.0);
+    }
+    if (name == "touch.startX") {
+        pollGesture();
+        return OSAVal((double)gestureStartX);
+    }
+    if (name == "touch.startY") {
+        pollGesture();
+        return OSAVal((double)gestureStartY);
+    }
+    if (name == "touch.endX") {
+        pollGesture();
+        return OSAVal((double)gestureEndX);
+    }
+    if (name == "touch.endY") {
+        pollGesture();
+        return OSAVal((double)gestureEndY);
+    }
+    if (name == "touch.dx") {
+        pollGesture();
+        if (!gestureActive && !touchWasDown) return OSAVal(0.0);
+        return OSAVal((double)(gestureLastX - gestureStartX));
+    }
+    if (name == "touch.dy") {
+        pollGesture();
+        if (!gestureActive && !touchWasDown) return OSAVal(0.0);
+        return OSAVal((double)(gestureLastY - gestureStartY));
+    }
+    if (name == "touch.duration") {
+        pollGesture();
+        if (!gestureActive) return OSAVal(0.0);
+        return OSAVal((double)(millis() - gestureStartT));
+    }
+    if (name == "touch.held") {
+        pollGesture();
+        return OSAVal(gestureActive &&
+                      (uint32_t)(millis() - gestureStartT) >=
+                      (uint32_t)max(0, iN(0)) ? 1.0 : 0.0);
+    }
+    if (name == "touch.moved") {
+        pollGesture();
+        if (!gestureActive && !touchWasDown) return OSAVal(0.0);
+        int threshold = constrain(iN(0, 8), 0, 512);
+        int dx = gestureLastX - gestureStartX;
+        int dy = gestureLastY - gestureStartY;
+        return OSAVal(dx * dx + dy * dy >= threshold * threshold ? 1.0 : 0.0);
+    }
+    if (name == "touch.in") {
+        sampleTouch();
+        if (!touchSampleDown) return OSAVal(0.0);
+        int x = iN(0), y = iN(1);
+        int width = constrain(iN(2), 0, 8192);
+        int height = constrain(iN(3), 0, 8192);
+        int64_t right = (int64_t)x + width;
+        int64_t bottom = (int64_t)y + height;
+        return OSAVal(width > 0 && height > 0 &&
+                      touchSampleX >= x && touchSampleX < right &&
+                      touchSampleY >= y && touchSampleY < bottom
+                      ? 1.0 : 0.0);
+    }
+    if (name == "touch.tap") {
+        pollGesture();
+        if (!tapOneShot) return OSAVal(0.0);
+        int x = iN(0), y = iN(1);
+        int width = constrain(iN(2), 0, 8192);
+        int height = constrain(iN(3), 0, 8192);
+        int64_t right = (int64_t)x + width;
+        int64_t bottom = (int64_t)y + height;
+        bool matched = width > 0 && height > 0 &&
+                       gestureEndX >= x && gestureEndX < right &&
+                       gestureEndY >= y && gestureEndY < bottom;
+        if (matched) tapOneShot = false;
+        return OSAVal(matched ? 1.0 : 0.0);
+    }
+    if (name == "touch.clearTap") {
+        tapOneShot = false;
+        return OSAVal();
+    }
+    if (name == "touch.released") {
+        pollGesture();
+        bool released = releasedOneShot;
+        releasedOneShot = false;
+        return OSAVal(released ? 1.0 : 0.0);
+    }
+    if (name == "gesture.swipeUp" || name == "gesture.swipeDown" ||
+        name == "gesture.swipeLeft" || name == "gesture.swipeRight") {
+        pollGesture();
+        int expected = name == "gesture.swipeUp" ? 1 :
+                       name == "gesture.swipeDown" ? 2 :
+                       name == "gesture.swipeLeft" ? 3 : 4;
+        bool matched = swipeOneShot == expected;
+        if (matched) swipeOneShot = 0;
+        return OSAVal(matched ? 1.0 : 0.0);
+    }
 
     if (name == "wait") {
         // Poll the global exit gesture during long waits so scripts with custom
@@ -4056,6 +4570,73 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         return OSAVal(showSystemPopup(t, b, "", "Cancel", "OK", false) ? 1.0 : 0.0);
     }
     if (name == "millis") return OSAVal((double)millis());
+    if (name == "micros") return OSAVal((double)micros());
+    if (name == "sdk.version") return OSAVal(2.0);
+    if (name == "sdk.has") {
+        String feature = S(0);
+        feature.toLowerCase();
+        bool available = feature == "d3" || feature == "sprite" ||
+                         feature == "touch" || feature == "perf" ||
+                         feature == "http" || feature == "json" ||
+                         feature == "opk";
+        return OSAVal(available ? 1.0 : 0.0);
+    }
+    if (name == "elapsed")
+        return OSAVal((double)((uint32_t)millis() - (uint32_t)N(0)));
+    if (name == "yield") {
+        ::yield();
+        delay(0);
+        if (checkExitGesture() || checkOverlayGesture()) exitFlag = true;
+        scriptSliceStarted = millis();
+        scriptOpsSinceYield = 0;
+        scriptLoopOpsTotal = 0;
+        return OSAVal();
+    }
+    if (name == "heap.free") return OSAVal((double)ESP.getFreeHeap());
+    if (name == "heap.maxBlock") return OSAVal((double)ESP.getMaxAllocHeap());
+    if (name == "heap.lowWater") return OSAVal((double)ESP.getMinFreeHeap());
+    if (name == "heap.total") return OSAVal((double)ESP.getHeapSize());
+    if (name == "heap.fragmentation") {
+        uint32_t freeBytes = ESP.getFreeHeap();
+        uint32_t largest = ESP.getMaxAllocHeap();
+        double percent = freeBytes == 0 ? 100.0
+                       : 100.0 - (double)largest * 100.0 / freeBytes;
+        return OSAVal(percent < 0.0 ? 0.0 : percent);
+    }
+    if (name == "perf.fps") return OSAVal((double)frameFps);
+    if (name == "perf.delta")
+        return OSAVal((double)frameDeltaMs / 1000.0);
+    if (name == "perf.frameMs") return OSAVal((double)frameDeltaMs);
+    if (name == "perf.frame") {
+        int targetFps = constrain(iN(0, 30), 1, 60);
+        uint32_t targetMs = max((uint32_t)1,
+                                1000U / (uint32_t)targetFps);
+        uint32_t now = millis();
+        if (frameLastMs == 0) {
+            frameLastMs = now;
+            frameDeltaMs = targetMs;
+            frameFps = (float)targetFps;
+        } else {
+            uint32_t elapsedMs = now - frameLastMs;
+            while (elapsedMs < targetMs && !exitFlag) {
+                if (checkExitGesture() || checkOverlayGesture()) break;
+                uint32_t remaining = targetMs - elapsedMs;
+                delay((uint32_t)min((uint32_t)5, remaining));
+                ::yield();
+                now = millis();
+                elapsedMs = now - frameLastMs;
+            }
+            if (elapsedMs == 0) elapsedMs = 1;
+            frameLastMs = now;
+            frameDeltaMs = elapsedMs;
+            float instant = 1000.0f / (float)elapsedMs;
+            frameFps = frameFps * 0.75f + instant * 0.25f;
+        }
+        scriptSliceStarted = millis();
+        scriptOpsSinceYield = 0;
+        scriptLoopOpsTotal = 0;
+        return OSAVal((double)frameFps);
+    }
     if (name == "theme")  return OSAVal((double)sysTheme);
     if (name == "uptime") return OSAVal((double)(millis() / 1000));
     if (name == "freeram") return OSAVal((double)ESP.getFreeHeap());
@@ -4122,6 +4703,47 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     //   json.size(body, "choices")                  → element count
     static const String emptyJson;
     const String& jsonSource = (argc > 0 && !a[0].isNum) ? a[0].str : emptyJson;
+    if (name == "json.escape" || name == "json.quote") {
+        const String& source = jsonSource;
+        size_t required = name == "json.quote" ? 2 : 0;
+        for (unsigned int i = 0; i < source.length(); ++i) {
+            uint8_t c = (uint8_t)source[i];
+            size_t add = (c == '"' || c == '\\' || c == '\n' || c == '\r' ||
+                          c == '\t' || c == '\b' || c == '\f') ? 2 :
+                         (c < 0x20 ? 6 : 1);
+            if (required > OSA_MAX_FILE_READ - add) {
+                s_ioError = "Escaped JSON exceeds 32768 byte limit";
+                return OSAVal("");
+            }
+            required += add;
+        }
+        String output;
+        if (!output.reserve(required)) {
+            s_ioError = "Not enough memory for escaped JSON";
+            return OSAVal("");
+        }
+        if (name == "json.quote") output += '"';
+        static const char hexDigits[] = "0123456789ABCDEF";
+        for (unsigned int i = 0; i < source.length(); ++i) {
+            uint8_t c = (uint8_t)source[i];
+            if      (c == '"')  output += "\\\"";
+            else if (c == '\\') output += "\\\\";
+            else if (c == '\n') output += "\\n";
+            else if (c == '\r') output += "\\r";
+            else if (c == '\t') output += "\\t";
+            else if (c == '\b') output += "\\b";
+            else if (c == '\f') output += "\\f";
+            else if (c < 0x20) {
+                output += "\\u00";
+                output += hexDigits[c >> 4];
+                output += hexDigits[c & 0x0F];
+            } else {
+                output += (char)c;
+            }
+        }
+        if (name == "json.quote") output += '"';
+        return OSAVal(static_cast<String&&>(output));
+    }
     if (name == "json.get") {
         String raw = jsonWalkPath(jsonSource, S(1));
         return OSAVal(jsonUnquote(raw));
@@ -4141,6 +4763,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
 
     // ── HTTP (network permission) ────────────────────────────────────────────
     if (name == "url_encode") return OSAVal(urlEncode(S(0)));
+    if (name == "url_decode") return OSAVal(urlDecode(S(0)));
     if (name == "http.status") return OSAVal((double)s_httpStatus);
     if (name == "http.error") return OSAVal(s_httpError);
     if (name == "http.bearer") {
@@ -4293,20 +4916,139 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     if (name == "sqrt")   return OSAVal(sqrt(N(0)));
     if (name == "sin")    return OSAVal(sin(N(0)));
     if (name == "cos")    return OSAVal(cos(N(0)));
+    if (name == "asin")   return OSAVal(asin(max(-1.0, min(1.0, N(0)))));
+    if (name == "acos")   return OSAVal(acos(max(-1.0, min(1.0, N(0)))));
+    if (name == "atan")   return OSAVal(atan(N(0)));
     if (name == "floor")  return OSAVal(floor(N(0)));
     if (name == "ceil")   return OSAVal(ceil(N(0)));
     if (name == "int")    return OSAVal((double)(int)N(0));
     if (name == "pow")    return OSAVal(pow(N(0), N(1)));
-    if (name == "round")  return OSAVal((double)(long long)floor(N(0) + 0.5));
+    if (name == "round")  return OSAVal(::round(N(0)));
     if (name == "log")    return OSAVal(log(N(0)));
     if (name == "exp")    return OSAVal(exp(N(0)));
     if (name == "tan")    return OSAVal(tan(N(0)));
     if (name == "atan2")  return OSAVal(atan2(N(0), N(1)));
+    if (name == "hypot")  return OSAVal(hypot(N(0), N(1)));
+    if (name == "sign") {
+        double value = N(0);
+        return OSAVal(value > 0 ? 1.0 : (value < 0 ? -1.0 : 0.0));
+    }
+    if (name == "fract") {
+        double value = N(0);
+        return OSAVal(value - floor(value));
+    }
+    if (name == "radians") return OSAVal(N(0) * 0.017453292519943295);
+    if (name == "degrees") return OSAVal(N(0) * 57.29577951308232);
+    if (name == "dist") {
+        double dx = N(2) - N(0), dy = N(3) - N(1);
+        return OSAVal(hypot(dx, dy));
+    }
+    if (name == "angle")
+        return OSAVal(atan2(N(3) - N(1), N(2) - N(0)));
+    if (name == "map") {
+        double value = N(0), inputMin = N(1), inputMax = N(2);
+        double outputMin = N(3), outputMax = N(4);
+        if (inputMax == inputMin) return OSAVal(outputMin);
+        return OSAVal(outputMin + (value - inputMin) *
+                      (outputMax - outputMin) / (inputMax - inputMin));
+    }
+    if (name == "smoothstep") {
+        double edge0 = N(0), edge1 = N(1);
+        if (edge0 == edge1) return OSAVal(N(2) < edge0 ? 0.0 : 1.0);
+        double t = (N(2) - edge0) / (edge1 - edge0);
+        t = max(0.0, min(1.0, t));
+        return OSAVal(t * t * (3.0 - 2.0 * t));
+    }
+    if (name == "wrap") {
+        double value = N(0), minimum = N(1), maximum = N(2);
+        double range = maximum - minimum;
+        if (range <= 0.0) return OSAVal(minimum);
+        double wrapped = fmod(value - minimum, range);
+        if (wrapped < 0.0) wrapped += range;
+        return OSAVal(minimum + wrapped);
+    }
+    if (name == "approach") {
+        double current = N(0), target = N(1), amount = fabs(N(2));
+        if (current < target) return OSAVal(min(current + amount, target));
+        if (current > target) return OSAVal(max(current - amount, target));
+        return OSAVal(target);
+    }
+    if (name == "lerp") {
+        double first = N(0), second = N(1), amount = N(2);
+        return OSAVal(first + (second - first) * amount);
+    }
+    if (name == "clamp") {
+        double value = N(0), minimum = N(1), maximum = N(2);
+        if (minimum > maximum) {
+            double swap = minimum;
+            minimum = maximum;
+            maximum = swap;
+        }
+        return OSAVal(max(minimum, min(maximum, value)));
+    }
+    if (name == "ease") {
+        double amount = max(0.0, min(1.0, N(0)));
+        switch (iN(1)) {
+            case 1: return OSAVal(amount * amount);
+            case 2: {
+                double inverse = 1.0 - amount;
+                return OSAVal(1.0 - inverse * inverse);
+            }
+            case 3:
+                return OSAVal(amount < 0.5
+                    ? 4.0 * amount * amount * amount
+                    : 1.0 - pow(-2.0 * amount + 2.0, 3.0) / 2.0);
+            case 4: return OSAVal(amount * amount * amount);
+            case 5: {
+                double inverse = 1.0 - amount;
+                return OSAVal(1.0 - inverse * inverse * inverse);
+            }
+            default: return OSAVal(amount);
+        }
+    }
+    if (name == "finite")
+        return OSAVal(isfinite(N(0)) ? 1.0 : 0.0);
     if (name == "random") {
         if (argc < 2) return OSAVal((double)random((long)N(0)));
         return OSAVal((double)random((long)N(0), (long)N(1)));
     }
+    if (name == "randomf") {
+        double minimum = argc >= 2 ? N(0) : 0.0;
+        double maximum = argc >= 2 ? N(1) : N(0, 1);
+        double unit = (double)(uint32_t)esp_random() / 4294967295.0;
+        return OSAVal(minimum + (maximum - minimum) * unit);
+    }
+    if (name == "noise" || name == "noise2") {
+        double inputX = N(0);
+        double inputY = name == "noise2" ? N(1) : 0.0;
+        if (!isfinite(inputX)) inputX = 0.0;
+        if (!isfinite(inputY)) inputY = 0.0;
+        inputX = max(-1000000.0, min(1000000.0, inputX));
+        inputY = max(-1000000.0, min(1000000.0, inputY));
+        int32_t x0 = (int32_t)floor(inputX);
+        int32_t y0 = (int32_t)floor(inputY);
+        float tx = (float)(inputX - x0);
+        float ty = (float)(inputY - y0);
+        tx = tx * tx * (3.0f - 2.0f * tx);
+        ty = ty * ty * (3.0f - 2.0f * ty);
+        auto hash = [](int32_t x, int32_t y) -> float {
+            uint32_t value = (uint32_t)x * 0x8DA6B343u ^
+                             (uint32_t)y * 0xD8163841u ^ 0xCB1AB31Fu;
+            value ^= value >> 13;
+            value *= 0x85EBCA6Bu;
+            value ^= value >> 16;
+            return (float)(value & 0x00FFFFFFu) / 16777215.0f;
+        };
+        float a0 = hash(x0, y0);
+        float a1 = hash(x0 + 1, y0);
+        float b0 = hash(x0, y0 + 1);
+        float b1 = hash(x0 + 1, y0 + 1);
+        float top = a0 + (a1 - a0) * tx;
+        float bottom = b0 + (b1 - b0) * tx;
+        return OSAVal((double)(top + (bottom - top) * ty));
+    }
     if (name == "pi") return OSAVal(3.14159265358979);
+    if (name == "tau") return OSAVal(6.283185307179586);
 
     // ── String ───────────────────────────────────────────────────────────────
 
@@ -4322,21 +5064,102 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     if (name == "startswith")return OSAVal(S(0).startsWith(S(1)) ? 1.0 : 0.0);
     if (name == "endswith")  return OSAVal(S(0).endsWith(S(1)) ? 1.0 : 0.0);
     if (name == "indexof")   return OSAVal((double)S(0).indexOf(S(1)));
+    if (name == "lastindexof") return OSAVal((double)S(0).lastIndexOf(S(1)));
+    if (name == "left") {
+        String source = S(0);
+        return OSAVal(source.substring(0, min((int)source.length(),
+                                              max(0, iN(1)))));
+    }
+    if (name == "right") {
+        String source = S(0);
+        int length = min((int)source.length(), max(0, iN(1)));
+        return OSAVal(source.substring(source.length() - length));
+    }
+    if (name == "slice") {
+        String source = S(0);
+        int length = (int)source.length();
+        int start = iN(1), end = iN(2, length);
+        if (start < 0) start += length;
+        if (end < 0) end += length;
+        start = constrain(start, 0, length);
+        end = constrain(end, 0, length);
+        if (end < start) end = start;
+        return OSAVal(source.substring(start, end));
+    }
+    if (name == "count") {
+        String source = S(0), needle = S(1);
+        if (needle.length() == 0) return OSAVal(0.0);
+        int found = 0, position = 0;
+        while (position <= (int)source.length() - (int)needle.length()) {
+            int next = source.indexOf(needle, position);
+            if (next < 0) break;
+            ++found;
+            position = next + needle.length();
+        }
+        return OSAVal((double)found);
+    }
     if (name == "char")      { char c = (char)iN(0); return OSAVal(String(c)); }
-    if (name == "code")      return OSAVal((double)(unsigned char)S(0)[0]);
+    if (name == "code") {
+        String source = S(0);
+        return OSAVal(source.length() == 0 ? 0.0 :
+                      (double)(unsigned char)source[0]);
+    }
+    if (name == "isnumber") {
+        String source = S(0);
+        source.trim();
+        if (source.length() == 0) return OSAVal(0.0);
+        char* end = nullptr;
+        strtod(source.c_str(), &end);
+        return OSAVal(end && *end == '\0' ? 1.0 : 0.0);
+    }
+    if (name == "hex") {
+        uint32_t value = (uint32_t)N(0);
+        int digits = constrain(iN(1, 0), 0, 8);
+        char output[9];
+        if (digits > 0) snprintf(output, sizeof(output), "%0*lX", digits,
+                                 (unsigned long)value);
+        else            snprintf(output, sizeof(output), "%lX",
+                                 (unsigned long)value);
+        return OSAVal(String(output));
+    }
+    if (name == "unhex") {
+        String source = S(0);
+        source.trim();
+        if (source.startsWith("#")) source.remove(0, 1);
+        if (source.startsWith("0x") || source.startsWith("0X"))
+            source.remove(0, 2);
+        if (source.length() == 0 || source.length() > 8) return OSAVal(0.0);
+        for (unsigned int i = 0; i < source.length(); ++i)
+            if (!isxdigit((unsigned char)source[i])) return OSAVal(0.0);
+        return OSAVal((double)strtoul(source.c_str(), nullptr, 16));
+    }
     if (name == "split") {
-        // split(str, delim) -> returns the Nth part; split(s, ",", n)
-        String src = S(0), delim = S(1); int idx = iN(2);
-        int count = 0, start = 0;
-        for (int i = 0; i <= (int)src.length(); i++) {
-            bool atDelim = (i == (int)src.length()) ||
-                           src.substring(i, i + delim.length()) == delim;
-            if (atDelim) {
-                if (count == idx) return OSAVal(src.substring(start, i));
-                count++; start = i + delim.length();
-            }
+        String source = S(0), delimiter = S(1);
+        int wanted = iN(2);
+        if (wanted < 0 || delimiter.length() == 0) return OSAVal("");
+        int part = 0, start = 0;
+        while (true) {
+            int next = source.indexOf(delimiter, start);
+            if (part == wanted)
+                return OSAVal(next < 0 ? source.substring(start)
+                                      : source.substring(start, next));
+            if (next < 0) break;
+            start = next + delimiter.length();
+            ++part;
         }
         return OSAVal("");
+    }
+    if (name == "splitcount") {
+        String source = S(0), delimiter = S(1);
+        if (delimiter.length() == 0) return OSAVal(0.0);
+        int pieces = 1, start = 0;
+        while (true) {
+            int next = source.indexOf(delimiter, start);
+            if (next < 0) break;
+            ++pieces;
+            start = next + delimiter.length();
+        }
+        return OSAVal((double)pieces);
     }
 
     // ── File I/O (sandboxed to /apps/<appname>/) ──────────────────────────────
@@ -5929,20 +6752,26 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         CV(drawRoundRect(iN(0), iN(1), iN(2), iN(3), iN(4), drawColor));
         return OSAVal();
     }
-    if (name == "gradient") {
-        // Vertical gradient from (r1,g1,b1) at top to (r2,g2,b2) at bottom.
+    if (name == "gradient" || name == "gradienth") {
         int x = iN(0), y = iN(1), w = iN(2), h = iN(3);
         int r1 = iN(4), g1 = iN(5), b1 = iN(6);
         int r2 = iN(7), g2 = iN(8), b2 = iN(9);
         if (h <= 0 || w <= 0) return OSAVal();
-        for (int row = 0; row < h; row++) {
-            float t = (float)row / (float)(h - 1 > 0 ? h - 1 : 1);
-            int r = r1 + (int)((r2 - r1) * t);
-            int g = g1 + (int)((g2 - g1) * t);
-            int b = b1 + (int)((b2 - b1) * t);
-            uint16_t c = tft->color565(r, g, b);
-            if (activeSprite) activeSprite->drawFastHLine(x, y + row, w, c);
-            else              tft->drawFastHLine(x, y + row, w, c);
+        int length = name == "gradient" ? h : w;
+        int denominator = max(1, length - 1);
+        for (int position = 0; position < length; ++position) {
+            int inverse = denominator - position;
+            int red = (r1 * inverse + r2 * position) / denominator;
+            int green = (g1 * inverse + g2 * position) / denominator;
+            int blue = (b1 * inverse + b2 * position) / denominator;
+            uint16_t color = osaRgb565(red, green, blue);
+            if (name == "gradient") {
+                if (activeSprite) activeSprite->drawFastHLine(x, y + position, w, color);
+                else              tft->drawFastHLine(x, y + position, w, color);
+            } else {
+                if (activeSprite) activeSprite->drawFastVLine(x + position, y, h, color);
+                else              tft->drawFastVLine(x + position, y, h, color);
+            }
         }
         return OSAVal();
     }
@@ -5984,61 +6813,6 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         if (!activeSprite)
             Wallpaper::drawRegion(tft, iN(0), iN(1), iN(2), iN(3));
         return OSAVal();
-    }
-
-    // ── Gesture / touch state ────────────────────────────────────────────────
-    if (name == "touch.startX")  { pollGesture(); return OSAVal((double)gestureStartX); }
-    if (name == "touch.startY")  { pollGesture(); return OSAVal((double)gestureStartY); }
-    if (name == "touch.dx")      { pollGesture();
-        if (!gestureActive && !touchWasDown) return OSAVal(0.0);
-        return OSAVal((double)(gestureLastX - gestureStartX)); }
-    if (name == "touch.dy")      { pollGesture();
-        if (!gestureActive && !touchWasDown) return OSAVal(0.0);
-        return OSAVal((double)(gestureLastY - gestureStartY)); }
-    if (name == "touch.duration") { pollGesture();
-        if (!gestureActive) return OSAVal(0.0);
-        return OSAVal((double)(millis() - gestureStartT)); }
-    if (name == "touch.released") {
-        pollGesture();
-        bool r = releasedOneShot;
-        releasedOneShot = false;
-        return OSAVal(r ? 1.0 : 0.0);
-    }
-    if (name == "gesture.swipeUp")    { pollGesture(); bool ok = (swipeOneShot == 1);
-                                        if (ok) swipeOneShot = 0; return OSAVal(ok ? 1.0 : 0.0); }
-    if (name == "gesture.swipeDown")  { pollGesture(); bool ok = (swipeOneShot == 2);
-                                        if (ok) swipeOneShot = 0; return OSAVal(ok ? 1.0 : 0.0); }
-    if (name == "gesture.swipeLeft")  { pollGesture(); bool ok = (swipeOneShot == 3);
-                                        if (ok) swipeOneShot = 0; return OSAVal(ok ? 1.0 : 0.0); }
-    if (name == "gesture.swipeRight") { pollGesture(); bool ok = (swipeOneShot == 4);
-                                        if (ok) swipeOneShot = 0; return OSAVal(ok ? 1.0 : 0.0); }
-
-    // ── Animation helpers ────────────────────────────────────────────────────
-    if (name == "lerp") {
-        double a = N(0), b = N(1), t = N(2);
-        return OSAVal(a + (b - a) * t);
-    }
-    if (name == "clamp") {
-        double v = N(0), lo = N(1), hi = N(2);
-        if (v < lo) v = lo; if (v > hi) v = hi;
-        return OSAVal(v);
-    }
-    if (name == "ease") {
-        // type: 0=linear, 1=ease-in (quad), 2=ease-out (quad),
-        //       3=ease-in-out (cubic), 4=cubic-in, 5=cubic-out
-        double t = N(0); int type = iN(1);
-        if (t < 0) t = 0; if (t > 1) t = 1;
-        double out = t;
-        switch (type) {
-            case 1: out = t * t; break;
-            case 2: out = 1.0 - (1.0 - t) * (1.0 - t); break;
-            case 3: out = (t < 0.5) ? 4 * t * t * t
-                                    : 1.0 - pow(-2.0 * t + 2.0, 3) / 2.0; break;
-            case 4: out = t * t * t; break;
-            case 5: { double u = 1.0 - t; out = 1.0 - u * u * u; break; }
-            default: out = t;
-        }
-        return OSAVal(out);
     }
 
     // ── Time formatting helpers ──────────────────────────────────────────────
