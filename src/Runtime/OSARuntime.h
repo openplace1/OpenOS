@@ -2,6 +2,7 @@
 #include <Arduino.h>
 #include <TFT_eSPI.h>
 #include <XPT2046_Touchscreen.h>
+#include "OSA3D.h"
 
 #define OSA_MAX_LINES  512
 #define OSA_MAX_VARS   96
@@ -281,7 +282,11 @@ private:
     unsigned long gestureStartT  = 0;
     bool          gestureActive  = false;
     bool          touchWasDown   = false;
+    bool          pressedOneShot = false;
     bool          releasedOneShot = false;
+    bool          tapOneShot = false;
+    int           gestureEndX = -1;
+    int           gestureEndY = -1;
     int           swipeOneShot   = 0;  // 1=up,2=down,3=left,4=right, consumed on read
     uint32_t      touchSampleMs   = UINT32_MAX;
     bool          touchSampleDown = false;
@@ -289,6 +294,18 @@ private:
     int           touchSampleY    = -1;
     void sampleTouch();
     void pollGesture();
+
+    // Shared frame clock for perf.* and d3.*. The 3D entry point clamps its
+    // target to 12-20 FPS and can reduce a filled cube to wireframe after
+    // repeated frames outside the 12 FPS budget.
+    uint32_t frameLastMs = 0;
+    uint32_t frameDeltaMs = 50;
+    float    frameFps = 20.0f;
+    uint8_t  d3SlowFrames = 0;
+    uint8_t  d3FastFrames = 0;
+    bool     d3ReducedQuality = false;
+    bool     d3AdaptiveQuality = true;
+    OSA3DRenderer d3;
 
     // Returns true if the swipe-up-to-home gesture just completed. Called from
     // every blocking widget loop so the user can leave the app from anywhere.
