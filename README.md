@@ -18,6 +18,7 @@ live. No reflash.
   - [Syntax](#syntax)
 - [Permissions](#permissions)
 - [OpenStore and OPK packages](#openstore-and-opk-packages)
+- [Firmware OTA updates](#firmware-ota-updates)
 - [SDK reference](#sdk-reference)
   - [Screen drawing](#screen-drawing)
   - [Colours](#colours)
@@ -39,6 +40,8 @@ live. No reflash.
   - [App control](#app-control)
   - [Privileged — system](#privileged--system)
   - [Privileged — file system](#privileged--file-system)
+  - [Privileged — OpenStore](#privileged--openstore)
+  - [Privileged — firmware OTA](#privileged--firmware-ota)
   - [Privileged — Wi-Fi and Bluetooth](#privileged--wi-fi-and-bluetooth)
   - [Privileged — config](#privileged--config)
   - [Privileged — crypto](#privileged--crypto)
@@ -72,14 +75,19 @@ The TFT_eSPI setup is pinned in `platformio.ini`, so no global library
 
 ## Installation
 
-1. **Flash the firmware.** Use PlatformIO (`pio run --target upload`) or
-   `esptool.py`. The image goes to flash offset `0x10000`.
+1. **Flash the complete firmware layout.** Use PlatformIO
+   (`pio run --target upload`). OpenOS 1.1.0 changes the flash from the legacy
+   single application slot to two OTA slots, so an existing device needs this
+   one-time USB flash including `partitions.bin`. Writing only `firmware.bin`
+   at `0x10000` does not migrate the partition table.
 2. **Prepare the SD card.** Copy the contents of `sd_content/` from this
    repo to the root of the card. The expected layout is described
    [below](#sd-card-layout).
 3. **Insert and power on.** Boot loads `/system/apps/lockscreen.osa`; on
    unlock it transitions to `/system/apps/home.osa`. If either is missing
    the screen shows a red error.
+4. **Update Settings.** Open OpenStore's **System Apps** tab and install
+   Settings 1.1.0. Its Software Update page requires OpenOS code 2 / OSA SDK 3.
 
 ---
 
@@ -183,6 +191,33 @@ boot from staging/backup directories.
 Build packages and regenerate the catalog with `tools/build_opk.py`. The full
 format and publishing workflow are documented in `store/README.md`.
 
+## Firmware OTA updates
+
+`partitions_ota.csv` provides `ota_0` and `ota_1`, each `0x1F0000`
+(2,031,616 bytes). An update is streamed into the inactive slot and activated
+only after its exact signed size and SHA-256 are verified. `Update.end(false)`
+performs the ESP image checks without bypassing validation.
+
+The default manifest is
+`https://raw.githubusercontent.com/openplace1/OpenStore/main/update/info.json`.
+It is a flat, maximum-4-KB JSON object signed with ECDSA P-256. The matching
+release public key is compiled into OpenOS. HTTPS currently uses no CA
+validation, so authenticity comes from that signature and the signed firmware
+hash, not from the server certificate. The official URL accepts only the
+`stable` channel.
+
+Settings can store another HTTPS `info.json` URL in NVS, like OpenStore can
+change its catalog. Custom feeds may publish `stable`, `beta` or `dev`, but
+they must still be signed by the release key embedded in this firmware. A URL
+change, install and manual rollback each require a native on-device
+confirmation; those mutating calls are restricted to Settings.
+
+After the new slot starts, OpenOS waits until display, touch, SD/application
+startup completes and the main loop remains healthy for eight seconds before
+marking the image valid. A failed probation boot is rolled back by the ESP32
+bootloader. Settings also exposes manual restore while the previous slot is
+still bootable.
+
 ---
 
 ## The `.osa` language
@@ -223,7 +258,7 @@ Optional, must be near the top of the file.
 
 Runtime limits per script: 128 KB source, 512 lines, 4096 bytes per source line,
 96 variables, 24 user functions and 10 nested calls. Compiled bytecode is
-limited to 8192 bytes, 96 numeric constants, 160 string constants, 192 names and
+limited to 12288 bytes, 96 numeric constants, 224 string constants, 224 names and
 a 48-value operand stack. Exceeding a compiler pool is a hard compile error;
 it never falls through to an invalid `-1` bytecode index.
 The OpenStore publisher applies a stricter 768-byte line limit to packaged OSA
@@ -599,10 +634,10 @@ swiped away.
 | `millis()` | ms since boot |
 | `micros()` | µs counter since boot |
 | `elapsed(startMs)` | Wrap-safe milliseconds elapsed since `startMs` |
-| `sdk.version()` | Numeric SDK compatibility level (currently `2`) |
-| `sdk.has(feature)` | Capability check, including `d3`, `sprite`, `touch`, `perf`, `http`, `json`, `opk`, `store.compatibility` and `store.updateAll` |
-| `openos.version()` | Display version (currently `1.0b`) |
-| `openos.versionCode()` | Numeric OpenOS compatibility level (currently `1`) |
+| `sdk.version()` | Numeric SDK compatibility level (currently `3`) |
+| `sdk.has(feature)` | Capability check, including `d3`, `sprite`, `touch`, `perf`, `http`, `json`, `opk`, `ota`, `store.compatibility` and `store.updateAll` |
+| `openos.version()` | Display version (currently `1.1.0`) |
+| `openos.versionCode()` | Numeric OpenOS compatibility level (currently `2`) |
 
 ### Privileged — system
 
@@ -681,6 +716,26 @@ must obtain confirmation before invoking it.
 | `store.remove(id, [label])` | Remove a user package after confirmation; optional label is shown to the user |
 | `store.error()` | Last catalog/package error |
 | `store.restartRequired()` | `1` when Home must be refreshed by reboot |
+
+### Privileged — firmware OTA
+
+Read/check calls require a trusted privileged system entry. Mutating calls are
+additionally restricted to Settings and always show a native confirmation.
+
+| Call | Returns |
+|---|---|
+| `ota.supported()` | `1` only when the running and inactive partitions are the expected dual OTA slots |
+| `ota.check()` | `1` newer release, `0` current/newer local version, `-1` error |
+| `ota.available()` | `1` after a successful check found a newer signed release |
+| `ota.name()` / `ota.version()` / `ota.versionCode()` | Signed release identity |
+| `ota.channel()` / `ota.type()` | `stable|beta|dev` and `major|minor|patch|security` |
+| `ota.description()` / `ota.notes()` | Signed release notes |
+| `ota.publishedAt()` / `ota.size()` | Signed publication label and byte size |
+| `ota.source()` | Current HTTPS `info.json` URL |
+| `ota.setSource(url)` | Change source; empty string restores the official feed |
+| `ota.install()` | Confirm, stream, verify and activate the checked release; restarts on success |
+| `ota.canRollback()` / `ota.rollback()` | Query/confirm restoration of the previous bootable slot |
+| `ota.error()` | Last OTA error |
 
 ### Privileged — Wi-Fi and Bluetooth
 
@@ -787,11 +842,15 @@ cd OpenOS
 pio run --target upload
 ```
 
-`platformio.ini` is preconfigured for the `denky32` board, the
-`huge_app.csv` partition (single 3 MB app slot), and the CYD display through
-TFT_eSPI build flags. The display remains on VSPI; touch uses its own remapped
-SPI bus and the SD card uses HSPI. Switch to `min_spiffs.csv` (or a custom
-OTA-capable table) when adding OTA.
+`platformio.ini` is preconfigured for the `denky32` board, the dual-slot
+`partitions_ota.csv` table and the CYD display through TFT_eSPI build flags.
+Both OTA app slots are 2,031,616 bytes. LTO is enabled because the complete
+kernel must fit independently in either slot. The display remains on VSPI;
+touch uses its own remapped SPI bus and the SD card uses HSPI.
+
+The first upload from a legacy `huge_app.csv` installation must include the new
+partition table over USB. After that migration, signed releases may be
+installed from Settings without a cable.
 
 If the upload port differs from the configured `COM3`, change `upload_port` or
 override it with `pio run --target upload --upload-port <port>`.
@@ -806,13 +865,13 @@ data store (home grid, wallpaper cache, theme palette).
 
 | Metric | Value |
 |---|---|
-| C++ source | ~11 500 lines |
+| C++ source | ~12 500 lines |
 | OSA scripts | Loaded from SD / OPK packages |
-| Flash | 2 039 245 B (64.8% of the 3 MiB app partition); `firmware.bin` is 2 045 824 B |
-| RAM (static) | 100 652 B (98.3 KiB; 30.7% of 320 KiB) |
+| Flash | 2,000,529 B (98.5% of either 1.9375 MiB OTA slot); `firmware.bin` is 2,007,104 B |
+| RAM (static) | 106,088 B (103.6 KiB; 32.4% of 320 KiB) |
 | Heap headroom at boot | ~60 KB |
 | Wallpaper cache | 150 KB (lazy) |
-| Per-runtime overhead | ~25 KB (vars + lines + funcs arrays) |
+| Per-runtime overhead | ~31 KB (vars + lines + funcs + bytecode/pools) |
 
 ---
 

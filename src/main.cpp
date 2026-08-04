@@ -23,11 +23,19 @@ size_t getArduinoLoopTaskStackSize() {
     return 32768;
 }
 
+// Keep a freshly installed OTA image in PENDING_VERIFY until OpenOS completes
+// setup and remains alive in loop() for the probation window. This overrides
+// the Arduino core's weak default, which otherwise accepts it before setup().
+extern "C" bool verifyRollbackLater() {
+    return true;
+}
+
 #include "Applications/Home.h"
 #include "Applications/Crypto.h"
 #include "Applications/Wallpaper.h"
 #include "Applications/Theme.h"
 #include "Applications/OSAApp.h"
+#include "Runtime/FirmwareUpdate.h"
 #include "Runtime/PackageManager.h"
 #include "Runtime/OSARuntime.h"
 
@@ -649,6 +657,7 @@ void setup() {
     setCpuFrequencyMhz(240);
     Serial.begin(115200);
     delay(1000);
+    FirmwareUpdate::begin();
 
     
     struct tm timeinfo;
@@ -723,9 +732,11 @@ void setup() {
         currentState = STATE_HOMESCREEN;
         loadHomeScript();
     }
+    FirmwareUpdate::beginBootValidation();
 }
 
 void loop() {
+    FirmwareUpdate::pollBootValidation();
     // Background WiFi -> NTP one-shot once the radio comes up.
     static bool autoNtpDone = false;
     if (!autoNtpDone && sysNtpSynced == false && WiFi.status() == WL_CONNECTED) {

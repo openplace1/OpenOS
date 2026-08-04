@@ -1,4 +1,5 @@
 #include "OSARuntime.h"
+#include "FirmwareUpdate.h"
 #include "PackageManager.h"
 #include "../Config.h"
 #include "../OpenOSVersion.h"
@@ -26,6 +27,49 @@ static void releaseStringStorage(String& value) {
 static void releaseValueStorage(OSAVal& value) {
     value.~OSAVal();
     new (&value) OSAVal();
+}
+
+struct OtaProgressUi {
+    TFT_eSPI* display = nullptr;
+    String phase;
+    int percent = -1;
+};
+
+static void drawOtaProgress(const char* phase, size_t completed, size_t total,
+                            void* context) {
+    OtaProgressUi* ui = static_cast<OtaProgressUi*>(context);
+    if (!ui || !ui->display) return;
+    int percent = total > 0 ? (int)((completed * 100U) / total) : 0;
+    if (percent > 100) percent = 100;
+    String nextPhase = phase ? phase : "Updating";
+    bool phaseChanged = nextPhase != ui->phase;
+    if (!phaseChanged && percent == ui->percent) return;
+    TFT_eSPI* display = ui->display;
+    if (phaseChanged) {
+        ui->phase = nextPhase;
+        display->fillScreen(Theme::bg());
+        display->fillRect(0, 0, 240, 44, Theme::header());
+        display->drawFastHLine(0, 44, 240, Theme::divider());
+        display->setTextDatum(MC_DATUM);
+        display->setTextFont(2);
+        display->setTextColor(Theme::text());
+        display->drawString("Software Update", 120, 22);
+        display->drawString(ui->phase, 120, 128);
+        display->setTextFont(1);
+        display->setTextColor(Theme::hint());
+        display->drawString("Keep the device powered", 120, 205);
+    }
+    ui->percent = percent;
+    display->fillRoundRect(20, 154, 200, 18, 7, Theme::divider2());
+    int fill = (196 * percent) / 100;
+    if (fill > 0)
+        display->fillRoundRect(22, 156, fill, 14, 6,
+                               display->color565(52, 199, 89));
+    display->fillRect(80, 178, 80, 20, Theme::bg());
+    display->setTextDatum(MC_DATUM);
+    display->setTextFont(2);
+    display->setTextColor(Theme::subtext());
+    display->drawString(String(percent) + "%", 120, 188);
 }
 
 static bool userPackageFromEntry(const String& path, String& id,
@@ -4605,7 +4649,8 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
                          feature == "http" || feature == "json" ||
                          feature == "opk" ||
                          feature == "store.compatibility" ||
-                         feature == "store.updateall";
+                         feature == "store.updateall" ||
+                         feature == "ota";
         return OSAVal(available ? 1.0 : 0.0);
     }
     if (name == "openos.version")
@@ -6090,6 +6135,18 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         setError(-1, String(fn) + " needs #exception");
         return false;
     };
+    auto needSettingsOta = [&](const char* fn) -> bool {
+        if (!needException(fn)) return false;
+        String path = loadedScriptPath;
+        path.toLowerCase();
+        bool legacy = path == "/system/apps/settings.osa" ||
+                      path == "/system/apps/settings.osac";
+        bool packaged = path.startsWith("/system/packages/openos.settings/") &&
+                        PackageManager::isTrustedSystemEntry(loadedScriptPath);
+        if (legacy || packaged) return true;
+        setError(-1, String(fn) + " is restricted to Settings");
+        return false;
+    };
 
     // OpenStore package API. Installation is restricted to a trusted system
     // app and still requires an explicit confirmation on the device.
@@ -6317,6 +6374,112 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         bool removed = PackageManager::removeUserPackage(id);
         if (removed) home.removeScriptsUnder("/packages/" + id + "/");
         return OSAVal(removed ? 1.0 : 0.0);
+    }
+
+    // Firmware OTA API. OSA can only ask the kernel to check/install the
+    // configured feed; URL, target, hash and signature are never accepted as
+    // install arguments. Every manifest is verified by the embedded release
+    // key and every mutating action retains a native physical confirmation.
+    if (name == "ota.supported") {
+        if (!needException("ota.supported")) return OSAVal(0.0);
+        return OSAVal(FirmwareUpdate::supported() ? 1.0 : 0.0);
+    }
+    if (name == "ota.check") {
+        if (!needException("ota.check")) return OSAVal(-1.0);
+        clearRichMenuCache();
+        PackageManager::clearCatalog();
+        return OSAVal((double)FirmwareUpdate::check());
+    }
+    if (name == "ota.available") {
+        if (!needException("ota.available")) return OSAVal(0.0);
+        return OSAVal(FirmwareUpdate::available() ? 1.0 : 0.0);
+    }
+    if (name == "ota.name") {
+        if (!needException("ota.name")) return OSAVal("");
+        return OSAVal(FirmwareUpdate::remoteName());
+    }
+    if (name == "ota.version") {
+        if (!needException("ota.version")) return OSAVal("");
+        return OSAVal(FirmwareUpdate::remoteVersion());
+    }
+    if (name == "ota.versionCode") {
+        if (!needException("ota.versionCode")) return OSAVal(0.0);
+        return OSAVal((double)FirmwareUpdate::remoteVersionCode());
+    }
+    if (name == "ota.channel") {
+        if (!needException("ota.channel")) return OSAVal("");
+        return OSAVal(FirmwareUpdate::releaseChannel());
+    }
+    if (name == "ota.type") {
+        if (!needException("ota.type")) return OSAVal("");
+        return OSAVal(FirmwareUpdate::releaseType());
+    }
+    if (name == "ota.description" || name == "ota.notes") {
+        if (!needException("ota.description")) return OSAVal("");
+        return OSAVal(FirmwareUpdate::releaseDescription());
+    }
+    if (name == "ota.publishedAt") {
+        if (!needException("ota.publishedAt")) return OSAVal("");
+        return OSAVal(FirmwareUpdate::publishedAt());
+    }
+    if (name == "ota.size") {
+        if (!needException("ota.size")) return OSAVal(0.0);
+        return OSAVal((double)FirmwareUpdate::downloadSize());
+    }
+    if (name == "ota.source") {
+        if (!needException("ota.source")) return OSAVal("");
+        return OSAVal(FirmwareUpdate::sourceUrl());
+    }
+    if (name == "ota.setSource") {
+        if (!needSettingsOta("ota.setSource")) return OSAVal(0.0);
+        String source = S(0);
+        String shown = source.length() > 0 ? source : String("Official OpenStore feed");
+        if (!showSystemPopup("Firmware update source", shown,
+                             "Only release-key signed firmware is accepted",
+                             "Cancel", "Change", true)) return OSAVal(0.0);
+        return OSAVal(FirmwareUpdate::setSourceUrl(source) ? 1.0 : 0.0);
+    }
+    if (name == "ota.error") {
+        if (!needException("ota.error")) return OSAVal("");
+        return OSAVal(FirmwareUpdate::lastError());
+    }
+    if (name == "ota.install") {
+        if (!needSettingsOta("ota.install")) return OSAVal(0.0);
+        if (!FirmwareUpdate::available()) {
+            return OSAVal(0.0);
+        }
+        String detail = FirmwareUpdate::remoteVersion() + " / " +
+                        FirmwareUpdate::releaseChannel() + " / " +
+                        FirmwareUpdate::releaseType();
+        if (!showSystemPopup("Install firmware update?", detail,
+                             "Keep power connected during installation",
+                             "Cancel", "Install", true)) return OSAVal(0.0);
+        clearRichMenuCache();
+        PackageManager::clearCatalog();
+        OtaProgressUi progressUi;
+        progressUi.display = tft;
+        bool installed = FirmwareUpdate::install(drawOtaProgress, &progressUi);
+        if (!installed) return OSAVal(0.0);
+        showSystemPopup("Update installed", FirmwareUpdate::remoteVersion(),
+                        "OpenOS will restart into the new slot",
+                        "", "Restart", true);
+        delay(150);
+        ESP.restart();
+        return OSAVal(1.0);
+    }
+    if (name == "ota.canRollback") {
+        if (!needException("ota.canRollback")) return OSAVal(0.0);
+        return OSAVal(FirmwareUpdate::canRollback() ? 1.0 : 0.0);
+    }
+    if (name == "ota.rollback") {
+        if (!needSettingsOta("ota.rollback")) return OSAVal(0.0);
+        if (!showSystemPopup("Restore previous firmware?", "Previous OTA slot",
+                             "The device will restart immediately",
+                             "Cancel", "Restore", true)) return OSAVal(0.0);
+        if (!FirmwareUpdate::rollback()) return OSAVal(0.0);
+        delay(150);
+        ESP.restart();
+        return OSAVal(1.0);
     }
 
     // sys.* — system mutation
