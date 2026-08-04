@@ -58,12 +58,15 @@ live. No reflash.
 | Part | Notes |
 |---|---|
 | MCU | ESP32 (denky32 / generic ESP32, no PSRAM required) |
-| Display | 240×320 TFT, ILI9341 over VSPI |
-| Touch | XPT2046 resistive (separate bus pins) |
-| Storage | microSD over HSPI |
+| Display | 240×320 TFT, ILI9341_2 over VSPI: MISO 12, MOSI 13, SCLK 14, CS 15, DC 2, reset not connected |
+| Backlight | GPIO 21, active high |
+| Touch | XPT2046 resistive on a separate remapped SPI bus: IRQ 36, MOSI 32, MISO 39, CLK 25, CS 33 |
+| Storage | microSD over HSPI: CS 5, MOSI 23, MISO 19, SCLK 18 |
 | Optional | Wi-Fi + Bluetooth (built into ESP32) |
 
 Tested on the "Cheap Yellow Display" (CYD) board.
+The TFT_eSPI setup is pinned in `platformio.ini`, so no global library
+`User_Setup.h` needs to be edited.
 
 ---
 
@@ -205,7 +208,7 @@ Optional, must be near the top of the file.
 | Assignment | `x = x + 1` |
 | If / elif / else | `if cond then … elif cond then … else … end` |
 | While | `while cond do … end` |
-| For | `for i = 0 to 10 do … end` |
+| For | `for i = 0 to 10 do … end` (legacy `for i in 0..10 do … end` is also accepted) |
 | Main loop | `loop … end` (one per script, top-level only) |
 | Break / continue | `break`, `continue` (inside `while` / `for`) |
 | Function definition | `def name(arg1, arg2) … end` |
@@ -218,11 +221,13 @@ Optional, must be near the top of the file.
 | Logic | `and`, `or`, `not` (`!` also accepted) |
 | Arithmetic | `+ - * / %` (`/` is float, use `int(a/b)` for integer) |
 
-Limits per script: 128 KB source, 512 lines, 768 bytes per source line,
+Runtime limits per script: 128 KB source, 512 lines, 4096 bytes per source line,
 96 variables, 24 user functions and 10 nested calls. Compiled bytecode is
 limited to 8192 bytes, 96 numeric constants, 160 string constants, 192 names and
 a 48-value operand stack. Exceeding a compiler pool is a hard compile error;
 it never falls through to an invalid `-1` bytecode index.
+The OpenStore publisher applies a stricter 768-byte line limit to packaged OSA
+source so packages remain within the supported publishing profile.
 
 ---
 
@@ -451,7 +456,7 @@ Package assets are read-only and remain confined to the active OPK directory.
 
 ### Key–value storage — sandboxed
 
-Persisted to `/apps/<scriptname>/_kv.ini`. Up to 32 entries per script.
+Persisted to `/apps/<scriptname>/_kv.ini`. Up to 24 entries per script.
 
 | Call | Returns |
 |---|---|
@@ -588,7 +593,6 @@ swiped away.
 
 | Call | Effect |
 |---|---|
-| `app.launch(path)` | Unload current script, load and run another `.osa` / `.osac` |
 | `exit()` | End the script; main router returns to home |
 | `wait(ms)` | Sleep, while still processing the universal swipe-up gesture |
 | `yield()` | Cooperatively feed the system and reset the execution slice |
@@ -612,7 +616,7 @@ not-yet-implemented signed-catalog layer.
 | `sys.brightness(n)` | Set backlight (0–255) |
 | `sys.theme(n)` | `0` light / `1` dark |
 | `sys.wallpaper(path)` | Set wallpaper BMP, invalidate cache |
-| `sys.setTime(unix_ts)` | Override RTC |
+| `sys.setTime(hour, minute, second, day, month, year)` | Set the system clock |
 | `sys.reboot()` | `ESP.restart()` |
 | `sys.notify(msg)` | Alias for `notify()` |
 | `setbright(n)` | Requires `#perm system` |
@@ -639,10 +643,12 @@ Any absolute path on SD. Use carefully.
 | `fs.append(path, data)` | Append line |
 | `fs.exists(path)` / `fs.delete(path)` | 0/1 |
 | `fs.mkdir(path)` / `fs.rmdir(path)` | 0/1 |
-| `fs.wipe()` | Erase whole SD (after confirmation in the calling script) |
+| `fs.wipe(path)` | Recursively erase the contents below an absolute directory; use `/` for the whole SD |
 
 `fs.read` is capped at 32 KB per call. `io.error()` reports limit, seek and
 allocation failures.
+`fs.wipe` does not show a confirmation prompt; the calling privileged script
+must obtain confirmation before invoking it.
 
 ### Privileged — OpenStore
 
@@ -717,6 +723,7 @@ Used by Settings to list installed scripts and toggle permissions.
 
 | Call | Returns |
 |---|---|
+| `app.launch(path)` | Unload the current script and run another `.osa` / `.osac` |
 | `apps.scan()` | Number of `.osa` apps on SD |
 | `apps.name(i)` / `apps.path(i)` | Per-app |
 | `apps.needsPerm(i, bit)` | 0/1 — does the manifest declare this perm? |
@@ -780,9 +787,14 @@ cd OpenOS
 pio run --target upload
 ```
 
-`platformio.ini` is preconfigured for `denky32` board with the
-`huge_app.csv` partition (single 3 MB app slot). Switch to
-`min_spiffs.csv` (or a custom OTA-capable table) when adding OTA.
+`platformio.ini` is preconfigured for the `denky32` board, the
+`huge_app.csv` partition (single 3 MB app slot), and the CYD display through
+TFT_eSPI build flags. The display remains on VSPI; touch uses its own remapped
+SPI bus and the SD card uses HSPI. Switch to `min_spiffs.csv` (or a custom
+OTA-capable table) when adding OTA.
+
+If the upload port differs from the configured `COM3`, change `upload_port` or
+override it with `pio run --target upload --upload-port <port>`.
 
 The C++ sources live under `src/`. The runtime is in `src/Runtime/`; the
 host kernel in `src/main.cpp` plus a small `Applications/` layer for the
@@ -794,10 +806,10 @@ data store (home grid, wallpaper cache, theme palette).
 
 | Metric | Value |
 |---|---|
-| C++ source | ~8 000 lines |
+| C++ source | ~11 500 lines |
 | OSA scripts | Loaded from SD / OPK packages |
-| Flash | 1.99 MB / 3 MB partition |
-| RAM (static) | 95.7 KB |
+| Flash | 2 039 245 B (64.8% of the 3 MiB app partition); `firmware.bin` is 2 045 824 B |
+| RAM (static) | 100 652 B (98.3 KiB; 30.7% of 320 KiB) |
 | Heap headroom at boot | ~60 KB |
 | Wallpaper cache | 150 KB (lazy) |
 | Per-runtime overhead | ~25 KB (vars + lines + funcs arrays) |

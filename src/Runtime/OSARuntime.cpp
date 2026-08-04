@@ -3167,23 +3167,46 @@ void OSARuntime::processWhile(int lineNo, int& pc) {
     pc = matchEnd + 1;
 }
 
-// ── for i in start..end do ───────────────────────────────────────────────────
+// ── for i = start to end do (legacy: for i in start..end do) ────────────────
 
 void OSARuntime::processFor(int lineNo, int& pc) {
     const String& raw = lines[lineNo];
-    // "for VAR in START..END do"
     String rest = raw.substring(4); rest.trim();
-    int inPos = rest.indexOf(" in ");
-    if (inPos < 0) { pc++; return; }
-    String varNm  = rest.substring(0, inPos); varNm.trim();
-    String rangeS = rest.substring(inPos + 4);
-    if (rangeS.endsWith(" do")) rangeS = rangeS.substring(0, rangeS.length() - 3);
-    rangeS.trim();
+    String varNm;
+    String startExpr;
+    String endExpr;
 
-    int dotdot = rangeS.indexOf("..");
-    if (dotdot < 0) { pc++; return; }
-    int startV = (int)eval(rangeS.substring(0, dotdot)).toNum();
-    int endV   = (int)eval(rangeS.substring(dotdot + 2)).toNum();
+    int eqPos = rest.indexOf('=');
+    int toPos = rest.indexOf(" to ");
+    int doPos = rest.lastIndexOf(" do");
+    if (eqPos >= 0 && toPos > eqPos && doPos > toPos &&
+        doPos == rest.length() - 3) {
+        // Documented syntax, also used by the bytecode compiler.
+        varNm = rest.substring(0, eqPos);
+        startExpr = rest.substring(eqPos + 1, toPos);
+        endExpr = rest.substring(toPos + 4, doPos);
+    } else {
+        // Backwards-compatible syntax accepted by the original tree walker.
+        int inPos = rest.indexOf(" in ");
+        if (inPos < 0) { pc++; return; }
+        String rangeS = rest.substring(inPos + 4);
+        if (rangeS.endsWith(" do"))
+            rangeS = rangeS.substring(0, rangeS.length() - 3);
+        int dotdot = rangeS.indexOf("..");
+        if (dotdot < 0) { pc++; return; }
+        varNm = rest.substring(0, inPos);
+        startExpr = rangeS.substring(0, dotdot);
+        endExpr = rangeS.substring(dotdot + 2);
+    }
+    varNm.trim();
+    startExpr.trim();
+    endExpr.trim();
+    if (varNm.length() == 0 || startExpr.length() == 0 || endExpr.length() == 0) {
+        pc++;
+        return;
+    }
+    int startV = (int)eval(startExpr).toNum();
+    int endV   = (int)eval(endExpr).toNum();
 
     int matchEnd = findMatchingEnd(lineNo);
     for (int i = startV; i <= endV && !exitFlag && !returnFlag && errLine < 0; i++) {

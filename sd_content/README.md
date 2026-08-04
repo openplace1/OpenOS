@@ -27,22 +27,23 @@ SD root/
 
 | Path                          | What it does                                |
 |-------------------------------|---------------------------------------------|
-| `system/apps/*.osa`           | Built-in apps. Privileged — they get the full SDK (`sys.*`, `cfg.*`, `fs.*`, `crypto.*`, `wifi.*`, `bt.*`, NTP, app launch, home mutations). |
+| `system/apps/*.osa`           | Legacy built-in app location. Only fixed kernel-approved entry paths receive the privileged SDK. |
 | `system/apps/lockscreen.osa`  | Boot script; runs first at power-on. `exit()` unlocks to home. |
 | `system/apps/controlcenter.osa` | Swipe-down-from-top overlay. |
 | `tap_game.osa`                | Demo mini-game in the root for testing. Not a system app. |
 
-Anything you drop into `system/apps/` becomes privileged (because the runtime
-checks path prefix). Anything dropped anywhere else (root, subfolders one
-level deep) is a normal user app — sandboxed reads/writes only inside
-`/apps/<scriptname>/`.
+Putting a script in `system/apps/` does not grant privilege. The kernel grants
+the full SDK only to its fixed legacy OpenOS entry paths and to recognized
+entry points of allowlisted system OPKs. Other scripts in this directory — and
+scripts found at the root or one level below it — remain normal user apps with
+sandboxed reads/writes under `/apps/<scriptname>/`.
 
 ## How the firmware finds your scripts
 
 At boot the firmware scans:
 
 1. `/` (root) — one level deep — for any `*.osa` with `#isApp true`
-2. `/system/apps/` — privileged location, same scan
+2. `/system/apps/` — legacy system-app location, same scan
 
 Each match becomes a home-screen tile (icon color from `#appColor "#RRGGBB"`,
 name from `#app "..."`). The firmware **no longer ships these scripts in
