@@ -182,11 +182,15 @@ reserved `openos.*` IDs in user packages, ZIP traversal, unsupported ZIP
 features and scope changes. An interrupted install is recovered on the next
 boot from staging/backup directories.
 
-> **Security:** catalog SHA-256 detects corruption and a package that differs
-> from its catalog entry. The current catalog is not digitally signed yet and
-> HTTPS uses the device's insecure/no-CA mode. Do not treat remote system OPKs
-> as secure against an active network attacker until release-key signatures are
-> added. User OPKs remain unprivileged and permission-gated.
+> **Security:** the catalog is signed with the same ECDSA P-256 release key
+> as firmware updates (`keyId` + `signature`, verified by
+> `PackageManager::verifyCatalogSignature` before any URL or hash is read),
+> and every OPK must match the SHA-256 recorded in that signed catalog. The
+> official host is additionally pinned to ISRG Root X1 (see
+> `Runtime/OpenOSTrustAnchors.h`). An unsigned or re-signed catalog — from
+> the official feed or a custom `store_catalog_url` — is rejected with
+> "Store catalog is not signed". User OPKs remain unprivileged and
+> permission-gated.
 
 Build packages and regenerate the catalog with `tools/build_opk.py`. The full
 format and publishing workflow are documented in `store/README.md`.
@@ -201,22 +205,41 @@ performs the ESP image checks without bypassing validation.
 The default manifest is
 `https://raw.githubusercontent.com/openplace1/OpenStore/main/update/info.json`.
 It is a flat, maximum-4-KB JSON object signed with ECDSA P-256. The matching
-release public key is compiled into OpenOS. HTTPS currently uses no CA
-validation, so authenticity comes from that signature and the signed firmware
-hash, not from the server certificate. The official URL accepts only the
+release public key is compiled into OpenOS, so authenticity comes from that
+signature and the signed firmware hash. On top of that the official host is
+pinned: `Runtime/OpenOSTrustAnchors.h` carries ISRG Root X1, the root that
+issues the GitHub raw CDN certificates, and mbedTLS verifies the chain and
+host name of `*.githubusercontent.com` against it before any byte of a
+manifest, catalog or firmware is accepted. The official URL accepts only the
 `stable` channel.
 
 Settings can store another HTTPS `info.json` URL in NVS, like OpenStore can
 change its catalog. Custom feeds may publish `stable`, `beta` or `dev`, but
-they must still be signed by the release key embedded in this firmware. A URL
-change, install and manual rollback each require a native on-device
-confirmation; those mutating calls are restricted to Settings.
+they must still be signed by the release key embedded in this firmware; hosts
+outside the pinned list are reached without certificate verification, which
+is exactly why the documents themselves stay signed. A URL change, install
+and manual rollback each require a native on-device confirmation; those
+mutating calls are restricted to Settings.
 
 After the new slot starts, OpenOS waits until display, touch, SD/application
 startup completes and the main loop remains healthy for eight seconds before
 marking the image valid. A failed probation boot is rolled back by the ESP32
 bootloader. Settings also exposes manual restore while the previous slot is
 still bootable.
+
+Manifest and firmware transfers go through `Runtime/SecureHttp`, shared with
+OpenStore. Before a handshake it pauses Classic Bluetooth, keeps the Wi-Fi
+modem out of power save, resolves the host up front and verifies that the
+heap can hold mbedTLS's two 16 KB record buffers (about 46 KB free with two
+17 KB blocks, 52 KB when a pinned root has to be parsed). `Runtime/HeapReserve`
+keeps a 45 KB block claimed from boot and lends it out here: mbedTLS carves
+both record buffers out of one region and then verifies an RSA-4096 signature
+while holding them, so a fragmented heap makes the handshake fail with a
+misleading "certificate verification failed". Transport failures
+are retried and reported by cause — DNS, TCP, TLS allocation, handshake or a
+certificate that does not chain to the pinned root — instead of HTTPClient's
+generic "connection refused"; the serial log prints the same detail with the
+heap figures at each attempt.
 
 ---
 
@@ -273,7 +296,9 @@ source so packages remain within the supported publishing profile.
 | 1 | `notify` | `notify()` |
 | 2 | `network` | `http.get`, `http.post` |
 | 4 | `system` | `setbright`, `setwallpaper` |
-| 8 | `overlay` | `overlay.draw` (planned — draw on top of any app) |
+
+Bit 8 is reserved (an `overlay` permission was planned but never implemented)
+so stored grant/deny masks keep their meaning.
 
 Declare with `#perm notify,network` etc. The runtime prompts the user
 the first time a script touches a permission and remembers the choice in
@@ -556,18 +581,20 @@ lighting and a painter-sort for cube faces. It allocates no vertex heap and uses
 | `d3.cube(x,y,z,size,rx,ry,rz[,mode[,edge565]])` | Cube; mode `0` wire, `1` solid, `2` solid + edges |
 | `d3.grid(y,halfSize,step)` | XZ reference grid, capped at 66 lines |
 | `d3.axes(size)` | RGB X/Y/Z axes |
-| `d3.frame([fps])` | 3D frame boundary; target is hard-clamped to 12–20 FPS |
+| `d3.frame([fps])` | 3D frame boundary; target is clamped to 12–40 FPS (default 20) |
 | `d3.fps()` / `d3.delta()` | Smoothed FPS / frame delta in seconds |
 | `d3.renderMs()` / `d3.faces()` | Last cube render time / visible face count |
 | `d3.adaptive(enabled)` | Enable/disable automatic quality fallback |
 | `d3.quality()` | `1` full quality, `0` temporary wireframe fallback |
 
-If two consecutive frames exceed the 12 FPS budget, filled cubes temporarily
-switch to wireframe. Full quality returns after ten fast frames. The hard 20 FPS
-cap prevents a tight animation from monopolising the ESP32. The
+If two consecutive frames take longer than ~1.67× the requested frame time,
+filled cubes temporarily switch to wireframe. Full quality returns after ten
+frames close to target. The frame limiter sleeps in 1 ms steps up to the
+deadline and keeps polling system gestures, so a 40 FPS target never starves
+touch or Wi-Fi; a 160×160 8-bit sprite pushed over 40 MHz SPI costs about
+12 ms per frame, which is what the 40 FPS ceiling is sized for. The
 [`3D Cube`](https://github.com/openplace1/OpenStore/blob/main/apps/cube3d.osa)
-sample is distributed through OpenStore. It uses a 160×160 8-bit sprite and is
-the reference workload for the 12–20 FPS target.
+sample is distributed through OpenStore and is the reference workload.
 
 ### Wallpaper
 
@@ -622,7 +649,7 @@ swiped away.
 
 | Call | Effect |
 |---|---|
-| `notify(msg)` | No-op in current version (NotificationService was removed; the builtin stays for back-compat) |
+| `notify(msg)` | Non-blocking 22-px banner along the top edge for 1.5 s; stays visible over script drawing and restores the panel when it expires. Needs the `notify` permission |
 
 ### App control
 
@@ -653,7 +680,7 @@ not-yet-implemented signed-catalog layer.
 | `sys.wallpaper(path)` | Set wallpaper BMP, invalidate cache |
 | `sys.setTime(hour, minute, second, day, month, year)` | Set the system clock |
 | `sys.reboot()` | `ESP.restart()` |
-| `sys.notify(msg)` | Alias for `notify()` |
+| `sys.notify(msg)` | Same banner as `notify()` without the permission prompt |
 | `setbright(n)` | Requires `#perm system` |
 | `getbright()` | Read current backlight |
 | `freeram()` | `ESP.getFreeHeap()` |
@@ -663,7 +690,8 @@ not-yet-implemented signed-catalog layer.
 | `heap.fragmentation()` | Approximate fragmentation percentage |
 | `uptime()` | Seconds since boot |
 | `sdready()` | `1` if SD mounted |
-| `battery()` | Mock value (`97`) — CYD has no fuel gauge |
+| `battery()` | Charge percentage from an optional ADC divider, `-1` when no gauge is configured (the stock CYD has none) |
+| `battery.available()` / `battery.mv()` | `1` when `battery_pin` is set; measured pack voltage in mV |
 
 ### Privileged — file system
 
@@ -765,12 +793,18 @@ Persisted to `/user/config.ini`. Up to 48 keys system-wide.
 
 ### Privileged — crypto
 
-XOR encryption — *not* cryptographically secure, only obscures.
+AES-256-GCM with a key that never leaves the device: SHA-256 over a domain
+tag, the factory Wi-Fi MAC and a 32-byte random secret generated on first
+boot and kept in NVS (internal flash). Wi-Fi credentials (`wifi.save`) and
+the lockscreen passcode use it, so a copy of the SD card is not enough to
+read them. Values look like `v2:<base64 nonce‖ciphertext‖tag>`; older
+XOR-obfuscated values are still readable and are re-sealed automatically on
+the first boot of OpenOS 1.2.
 
 | Call | Returns |
 |---|---|
-| `crypto.encrypt(plaintext)` | Hex string |
-| `crypto.decrypt(hex)` | Original string |
+| `crypto.encrypt(plaintext)` | `v2:` + base64 sealed value (up to 1 KB of text) |
+| `crypto.decrypt(value)` | Original string, or `""` when the value was tampered with or sealed by another device |
 
 ### Privileged — apps
 

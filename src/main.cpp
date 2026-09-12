@@ -34,9 +34,15 @@ extern "C" bool verifyRollbackLater() {
 #include "Applications/Crypto.h"
 #include "Applications/Wallpaper.h"
 #include "Applications/Theme.h"
+#include "Applications/Toast.h"
 #include "Applications/OSAApp.h"
 #include "Runtime/FirmwareUpdate.h"
+#include "Runtime/HeapReserve.h"
 #include "Runtime/PackageManager.h"
+#include "Runtime/SecureHttp.h"
+#include "OpenOSVersion.h"
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include "Runtime/OSARuntime.h"
 
 
@@ -200,8 +206,9 @@ static void prepareMemoryForScript(const String& path) {
     if (source && !source.isDirectory()) sourceBytes = (size_t)source.size();
     if (source) source.close();
 
-    // Source text, compiler temporaries, variables and initial UI strings all
-    // coexist briefly. Small apps stay connected; large apps get headroom.
+    // The source buffer, its line index, compiler temporaries, variables and
+    // initial UI strings all coexist briefly. Small apps stay connected;
+    // large apps get headroom.
     const size_t required = sourceBytes + 24U * 1024U;
     if (ESP.getFreeHeap() < required ||
         heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < 12U * 1024U)
@@ -444,6 +451,80 @@ static void registerOsaShortcuts() {
     scanPackageRoot("/system/packages", true);
 }
 
+// ─── USB serial diagnostics ──────────────────────────────────────────────────
+// Line-oriented commands on the USB serial port for a developer with the
+// board on a cable; nothing here changes state on the device.
+//   OPENOS:PING            firmware version and heap
+//   OPENOS:TLSDIAG [host]  certificate chain of host (default: OTA feed) and
+//                          the mbedTLS verify flags against the pinned root
+//   OPENOS:FETCH [url]     run the real SecureHttp::get path from the main
+//                          loop (default: the OpenStore catalog URL)
+void osaPollSerialCommands() {
+    static char line[80];
+    static uint8_t length = 0;
+    while (Serial.available() > 0) {
+        char c = (char)Serial.read();
+        if (c == '\n' || c == '\r') {
+            line[length] = 0;
+            if (strcmp(line, "OPENOS:PING") == 0) {
+                Serial.printf("OPENOS:PONG %s/%d free=%u maxBlock=%u\n",
+                              OpenOSBuild::VERSION_NAME, OpenOSBuild::VERSION_CODE,
+                              (unsigned)ESP.getFreeHeap(),
+                              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+            } else if (strncmp(line, "OPENOS:TLSDIAG", 14) == 0) {
+                String host = String(line + 14);
+                host.trim();
+                if (host.length() == 0) host = "raw.githubusercontent.com";
+                SecureHttp::diagnoseCertificateChain(host);
+                Serial.println("OPENOS:TLSDIAG-DONE");
+            } else if (strncmp(line, "OPENOS:FETCH", 12) == 0) {
+                String url = String(line + 12);
+                url.trim();
+                if (url.length() == 0) url = PackageManager::catalogSourceUrl();
+                Serial.printf("[HTTPS] fetch %s stackFree=%u\n", url.c_str(),
+                              (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+                HTTPClient http;
+                WiFiClientSecure client;
+                SecureHttp::Request request;
+                request.attempts = 1;
+                String why;
+                int status = SecureHttp::get(http, client, url, request, why);
+                Serial.printf("OPENOS:FETCH-DONE status=%d size=%d why=%s\n", status,
+                              status > 0 ? http.getSize() : 0, why.c_str());
+                http.end();
+                client.stop();
+            }
+            length = 0;
+        } else if (length < sizeof(line) - 1) {
+            line[length++] = c;
+        } else {
+            length = 0;
+        }
+    }
+}
+
+// OpenOS <= 1.1 stored these values XOR-obfuscated with a key compiled into
+// the firmware. Re-seal them with the per-device AES-GCM key the first time
+// the new firmware boots so the SD card stops carrying readable secrets.
+static void migrateLegacySecrets() {
+    if (!isSdReady || !Crypto::ready()) return;
+    static const char* keys[] = { "net_0", "passcode" };
+    bool changed = false;
+    for (const char* key : keys) {
+        String stored = Config::get(key, "");
+        if (stored.length() == 0 || Crypto::isCurrent(stored)) continue;
+        String plain = Crypto::decrypt(stored);
+        String sealed = Crypto::encrypt(plain);
+        if (sealed.length() == 0) continue;
+        Config::set(key, sealed);
+        changed = true;
+    }
+    if (changed) {
+        Config::save();
+        Serial.println("[CRYPTO] re-sealed legacy secrets with the device key");
+    }
+}
+
 static void applySystemState() {
     pinMode(TFT_BL, OUTPUT);
     analogWrite(TFT_BL, sysBrightness);
@@ -571,6 +652,7 @@ void osaPlayOpenAnim(int idx) {
 // after lockscreen unlock, and after every app exit.
 static void loadHomeScript() {
     osaApp.recycle();
+    HeapReserve::reclaim();
     // OpenStore keeps one bounded catalog String while it is open. Home never
     // needs that document, so release it before rediscovery and BT resume.
     PackageManager::clearCatalog();
@@ -656,7 +738,9 @@ void setup() {
 
     setCpuFrequencyMhz(240);
     Serial.begin(115200);
-    delay(1000);
+    // Long enough for a serial monitor to attach; a full second only delayed
+    // every cold boot.
+    delay(250);
     FirmwareUpdate::begin();
 
     
@@ -700,10 +784,26 @@ void setup() {
         sysTheme            = Config::getInt("theme", 0);
         sysWiFiEnabled      = (Config::getInt("wifi", 0) != 0);
         sysBTEnabled        = (Config::getInt("bluetooth", 0) != 0);
-        PackageManager::begin();
     }
 
     applySystemState();
+
+    // The device secret must come from the hardware RNG, which is only a
+    // true random source while an RF stack runs. Bring the Wi-Fi STA up for
+    // the first-boot draw when the user keeps the radio off, then stop it.
+    bool radioForEntropy = !sysWiFiEnabled && !sysBTEnabled && !Crypto::hasDeviceSecret();
+    if (radioForEntropy) WiFi.mode(WIFI_STA);
+    Crypto::begin();
+    if (radioForEntropy) {
+        WiFi.disconnect(true, false);
+        WiFi.mode(WIFI_OFF);
+    }
+    if (isSdReady) {
+        migrateLegacySecrets();
+        PackageManager::begin();
+    }
+    // Take the large-block reserve now, while nothing has fragmented the heap.
+    HeapReserve::begin();
 
     // Auto-connect to last saved WiFi network (background, non-blocking)
     if (sysWiFiEnabled && isSdReady) {
@@ -737,6 +837,8 @@ void setup() {
 
 void loop() {
     FirmwareUpdate::pollBootValidation();
+    Toast::poll(&tft);
+    osaPollSerialCommands();
     // Background WiFi -> NTP one-shot once the radio comes up.
     static bool autoNtpDone = false;
     if (!autoNtpDone && sysNtpSynced == false && WiFi.status() == WL_CONNECTED) {

@@ -2,33 +2,41 @@
 #define CRYPTO_H
 #include <Arduino.h>
 
-// Simple XOR obfuscation — prevents casual file reading on SD card.
-// Not cryptographically secure; key is compiled into firmware.
+// Authenticated encryption for secrets that live on the removable SD card
+// (Wi-Fi credentials, the lockscreen passcode, crypto.* from privileged
+// scripts).
+//
+// Values are AES-256-GCM sealed with a key that never leaves the device:
+// SHA-256 over a fixed domain tag, the factory Wi-Fi MAC and a 32-byte random
+// secret that is generated on first boot and kept in NVS (internal flash).
+// A copy of the SD card, or of this public firmware, is therefore not enough
+// to read the stored values. Format: "v2:" + base64(nonce[12] || ciphertext
+// || tag[16]); a fresh random nonce is drawn for every encrypt().
+//
+// Earlier releases obfuscated the same values with a fixed XOR key compiled
+// into the firmware. decrypt() still understands that format so that an
+// existing card upgrades in place, and main.cpp re-seals any legacy value it
+// finds at boot. The legacy path is decrypt-only and can be deleted once no
+// pre-1.2 cards remain.
 namespace Crypto {
-    static const char KEY[] = "0p3nOS!k3y$";
+    // Loads (or on first boot creates) the device secret and derives the key.
+    // Needs only NVS, but call it while an RF stack (Wi-Fi or Bluetooth) is
+    // running the first time so the secret comes from the true hardware RNG.
+    void begin();
 
-    static inline String encrypt(const String& input) {
-        int kLen = strlen(KEY);
-        String out = "";
-        for (int i = 0; i < (int)input.length(); i++) {
-            uint8_t c = (uint8_t)input[i] ^ (uint8_t)KEY[i % kLen];
-            char hex[3]; sprintf(hex, "%02X", c);
-            out += hex;
-        }
-        return out;
-    }
+    // True once a device secret exists in NVS (i.e. begin() will not draw one).
+    bool hasDeviceSecret();
 
-    static inline String decrypt(const String& hex) {
-        int kLen = strlen(KEY);
-        String out = "";
-        int pairs = hex.length() / 2;
-        for (int i = 0; i < pairs; i++) {
-            String bs = hex.substring(i * 2, i * 2 + 2);
-            uint8_t b = (uint8_t)strtoul(bs.c_str(), nullptr, 16);
-            out += (char)(b ^ (uint8_t)KEY[i % kLen]);
-        }
-        return out;
-    }
+    // Returns true when the per-device key is available.
+    bool ready();
+
+    String encrypt(const String& plain);
+    // Returns an empty String when the value was tampered with or sealed by
+    // another device.
+    String decrypt(const String& stored);
+
+    // True for values already in the v2 authenticated format.
+    bool isCurrent(const String& stored);
 }
 
 #endif

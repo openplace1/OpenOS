@@ -3,10 +3,6 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
-// notify() builtin used to forward here; with NotificationService removed
-// it's a silent no-op (the builtin itself still exists for back-compat).
-void osa_notify(const char*) {}
-
 OSAApp::OSAApp(TFT_eSPI* t, XPT2046_Touchscreen* touchscreen)
     : tft(t), ts(touchscreen), runtime(t, touchscreen)
 {}

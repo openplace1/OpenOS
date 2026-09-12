@@ -9,6 +9,7 @@ private:
     static uint16_t* cache;  // 240*320*2 = 150KB heap buffer
     static bool      cached;
     static bool loadWallpaperPath(String& outPath);
+    static uint16_t* allocateCache();
     static bool drawBmp(TFT_eSPI* tft, const String& path);
     static void drawFallback(TFT_eSPI* tft);
 

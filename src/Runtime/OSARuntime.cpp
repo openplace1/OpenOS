@@ -1,12 +1,15 @@
 #include "OSARuntime.h"
 #include "FirmwareUpdate.h"
+#include "HeapReserve.h"
 #include "PackageManager.h"
+#include "SecureHttp.h"
 #include "../Config.h"
 #include "../OpenOSVersion.h"
 #include "../Applications/Theme.h"
 #include "../Applications/Crypto.h"
 #include "../Applications/Wallpaper.h"
 #include "../Applications/Home.h"
+#include "../Applications/Toast.h"
 #include <SD.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
@@ -457,16 +460,13 @@ static int visitWrappedText(TFT_eSPI* metrics, const String& text, int maxWidth,
 
 // Forward — defined below near the block-navigation helpers.
 static bool isBlockOpen(const String& t);
-
-// Forward-declare notification push
-namespace _osa_notify { void push(const char* msg); }
+static bool isBlockOpen(const char* t);
 
 // ─── Permission table ────────────────────────────────────────────────────────
 const OSAPermDesc OSA_PERM_TABLE[] = {
     { OSA_PERM_NOTIFY,  "Notifications",       "notify() \xE2\x80\x94 system banners" },
     { OSA_PERM_NETWORK, "Network",             "http.get(), http.post() \xE2\x80\x94 outbound" },
     { OSA_PERM_SYSTEM,  "System Settings",     "setbright(), setwallpaper()" },
-    { OSA_PERM_OVERLAY, "Draw over other apps","overlay.draw() \xE2\x80\x94 banners, alerts on top of any screen" },
 };
 const int OSA_PERM_TABLE_COUNT = sizeof(OSA_PERM_TABLE) / sizeof(OSA_PERM_TABLE[0]);
 
@@ -1295,14 +1295,21 @@ bool OSARuntime::serializeOsac(const String& dstPath) {
     for (int i = 0; i < 4; i++) f.write(OSAC_MAGIC[i]);
     w8(f, OSAC_VERSION);
     wS(f, appName);
-    w16(f, parseAppColor(lines, lineCount, 0));
+    // loadScript() releases the source lines once the bytecode is ready, so
+    // the header directives are re-read from the file the runtime loaded.
+    w16(f, lines ? parseAppColor(lines, lineCount, 0)
+                 : readIconColorFromFile(loadedScriptPath, 0));
     bool isApp = false;
-    for (int i = 0; i < lineCount; i++) {
-        String t = lines[i]; t.trim();
-        if (t.startsWith("#isApp")) {
-            isApp = (t.indexOf("true") > 0);
-            break;
+    if (lines) {
+        for (int i = 0; i < lineCount; i++) {
+            String t = lines[i]; t.trim();
+            if (t.startsWith("#isApp")) {
+                isApp = (t.indexOf("true") > 0);
+                break;
+            }
         }
+    } else {
+        isApp = readIsAppFromFile(loadedScriptPath);
     }
     w8(f, isApp ? 1 : 0);
     w8(f, isException ? 1 : 0);
@@ -1442,8 +1449,24 @@ bool OSARuntime::loadOsac(const String& srcPath) {
     }
     f.close();
     isException = readIsExceptionFromFile(srcPath);
+    resolveFuncParamIds();
     bc.valid = true;
     return true;
+}
+
+void OSARuntime::resolveFuncParamIds() {
+    for (int f = 0; f < OSA_MAX_FUNCS; f++) {
+        for (int j = 0; j < 8; j++) {
+            funcs[f].paramIds[j] = -1;
+            if (f >= funcCount || j >= funcs[f].paramCount) continue;
+            for (int n = 0; n < bc.namePoolLen; n++) {
+                if (bc.namePool[n] == funcs[f].params[j]) {
+                    funcs[f].paramIds[j] = (int16_t)n;
+                    break;
+                }
+            }
+        }
+    }
 }
 
 // ─── Compiler helpers ────────────────────────────────────────────────────────
@@ -1620,7 +1643,7 @@ bool OSARuntime::compile() {
     {
         int depth = 0;
         for (int i = 0; i < lineCount; i++) {
-            const String& t = lines[i];
+            String t = lineText(i);
             if (depth == 0 && t == "loop") { topLoopStart = i; break; }
             if (isBlockOpen(t)) depth++;
             else if (t == "end" && depth > 0) depth--;
@@ -1660,6 +1683,7 @@ bool OSARuntime::compile() {
 
     if (bc.buildError != OSA_BCERR_NONE)
         return failCompile(bc.buildError);
+    resolveFuncParamIds();
     bc.valid = true;
     return true;
 }
@@ -1674,7 +1698,7 @@ static bool compileLineRange(OSARuntime* rt, int from, int to) {
 }
 
 static bool compileLineAt(OSARuntime* rt, int& i, int rangeEnd) {
-    String s = rt->bcLines()[i]; s.trim();
+    String s = rt->lineText(i); s.trim();
     if (s.length() == 0 || s[0] == '#') { i++; return true; }
 
     // def name(...) — top-level compile() emits bodies separately at the end
@@ -1701,11 +1725,10 @@ static bool compileLineAt(OSARuntime* rt, int& i, int rangeEnd) {
             return false;
         int skipPatch = rt->bc.codeLen - 2;
 
-        String saved = rt->bcLines()[i];
-        rt->bcLines()[i] = body;
+        String saved = rt->swapLineText(i, body);
         int inner = i;
         bool bodyOk = compileLineAt(rt, inner, i + 1);
-        rt->bcLines()[i] = saved;
+        rt->swapLineText(i, saved);
         if (!bodyOk ||
             !patch16(rt->bc, skipPatch,
                      (int16_t)(rt->bc.codeLen - (skipPatch + 2))))
@@ -1730,11 +1753,10 @@ static bool compileLineAt(OSARuntime* rt, int& i, int rangeEnd) {
         { LoopFrame& frame = g_loopStack[g_loopDepth++];
           frame.startPc = topPc; frame.breakCount = 0; }
 
-        String saved = rt->bcLines()[i];
-        rt->bcLines()[i] = body;
+        String saved = rt->swapLineText(i, body);
         int inner = i;
         bool bodyOk = compileLineAt(rt, inner, i + 1);
-        rt->bcLines()[i] = saved;
+        rt->swapLineText(i, saved);
         if (!bodyOk) { g_loopDepth--; return false; }
 
         int backAt = rt->bc.codeLen;
@@ -1775,7 +1797,7 @@ static bool compileLineAt(OSARuntime* rt, int& i, int rangeEnd) {
 
         int j = i;
         while (j < finalEnd) {
-            String h = rt->bcLines()[j]; h.trim();
+            String h = rt->lineText(j); h.trim();
             if (h.startsWith("if ") || h.startsWith("elif ")) {
                 if (branchPc >= 0 &&
                     !patch16(rt->bc, branchPc,
@@ -2256,13 +2278,7 @@ bool OSARuntime::exec(int pcStart, int pcEnd) {
                 uint16_t idx;
                 if (!readOperand16(idx)) return false;
                 if (idx >= (uint16_t)bc.namePoolLen) return failVm("VM: bad name index");
-                const OSAVal* value = nullptr;
-                for (int i = varCount - 1; i >= 0; --i) {
-                    if (vars[i].name == bc.namePool[idx]) {
-                        value = &vars[i].val;
-                        break;
-                    }
-                }
+                const OSAVal* value = findVarById(idx);
                 if (value) {
                     if (!pushCopy(*value)) return false;
                 } else if (!vmPush(OSAVal())) return false;
@@ -2272,14 +2288,14 @@ bool OSARuntime::exec(int pcStart, int pcEnd) {
                 uint16_t idx;
                 if (!readOperand16(idx)) return false;
                 if (idx >= (uint16_t)bc.namePoolLen) return failVm("VM: bad name index");
-                setVar(bc.namePool[idx], vmPop());
+                setVarById(idx, vmPop());
                 break;
             }
             case OP_DECLARE_VAR: {
                 uint16_t idx;
                 if (!readOperand16(idx)) return false;
                 if (idx >= (uint16_t)bc.namePoolLen) return failVm("VM: bad name index");
-                declareVar(bc.namePool[idx], vmPop());
+                declareVarById(idx, vmPop());
                 break;
             }
             case OP_ADD: { OSAVal b = vmPop(), a = vmPop();
@@ -2416,8 +2432,13 @@ bool OSARuntime::exec(int pcStart, int pcEnd) {
                 vmCallStack[vmCallDepth].savedVarCount  = varCount;
                 vmCallDepth++;
                 // Bind params as locals in the callee's scope.
-                for (int i = 0; i < n && i < fn.paramCount; i++)
-                    declareVar(fn.params[i], static_cast<OSAVal&&>(args[i]));
+                for (int i = 0; i < n && i < fn.paramCount; i++) {
+                    if (fn.paramIds[i] >= 0)
+                        declareVarById((uint16_t)fn.paramIds[i],
+                                       static_cast<OSAVal&&>(args[i]));
+                    else
+                        declareVar(fn.params[i], static_cast<OSAVal&&>(args[i]));
+                }
                 pc = fn.bcStart;
                 break;
             }
@@ -2476,10 +2497,11 @@ void OSARuntime::reset() {
     // Walk every slot that *might* hold heap-allocated String content from the
     // previous script and release it. Counters get zeroed too so the next
     // loadScript starts clean.
-    for (int i = 0; i < OSA_MAX_LINES; i++) releaseStringStorage(lines[i]);
+    releaseLines();
     for (int i = 0; i < OSA_MAX_VARS; i++) {
         releaseStringStorage(vars[i].name);
         releaseValueStorage(vars[i].val);
+        varNameIds[i] = -1;
     }
     for (int i = 0; i < OSA_MAX_FUNCS; i++) {
         releaseStringStorage(funcs[i].name);
@@ -2508,6 +2530,7 @@ void OSARuntime::reset() {
         delete stashSprite;
         stashSprite = nullptr;
     }
+    HeapReserve::reclaim();
     bc.clear();
     vmSp = 0;
     vmCallDepth = 0;
@@ -2543,6 +2566,65 @@ void OSARuntime::reset() {
     releaseStringStorage(s_httpBearer);
     releaseStringStorage(s_httpError);
     releaseStringStorage(s_ioError);
+}
+
+String OSARuntime::lineText(int index) const {
+    if (index == overrideIndex) return overrideText;
+    if (index < 0 || index >= lineCount) return String();
+    if (lines) return lines[index];
+    if (sourceText && lineOffsets) return String(sourceText + lineOffsets[index]);
+    return String();
+}
+
+const char* OSARuntime::lineView(int index) const {
+    if (index == overrideIndex || index < 0 || index >= lineCount) return nullptr;
+    if (lines) return lines[index].c_str();
+    if (sourceText && lineOffsets) return sourceText + lineOffsets[index];
+    return nullptr;
+}
+
+String OSARuntime::swapLineText(int index, const String& text) {
+    String previous = lineText(index);
+    overrideIndex = index;
+    overrideText = text;
+    return previous;
+}
+
+// The tree-walker rewrites lines while it runs (inline if/while bodies), so
+// it gets real Strings. Only reached when the compiler declined the script.
+bool OSARuntime::materializeLines() {
+    if (lines) return true;
+    if (!sourceText || !lineOffsets) return false;
+    lines = new (std::nothrow) String[OSA_MAX_LINES];
+    if (!lines) return false;
+    for (int i = 0; i < lineCount; i++) {
+        const char* text = sourceText + lineOffsets[i];
+        size_t length = strlen(text);
+        if (length > 0 && (!lines[i].reserve(length) ||
+                           !lines[i].concat(text, (unsigned int)length))) {
+            delete[] lines;
+            lines = nullptr;
+            return false;
+        }
+    }
+    free(sourceText);
+    sourceText = nullptr;
+    free(lineOffsets);
+    lineOffsets = nullptr;
+    return true;
+}
+
+void OSARuntime::releaseLines() {
+    delete[] lines;
+    lines = nullptr;
+    free(sourceText);
+    sourceText = nullptr;
+    free(lineOffsets);
+    lineOffsets = nullptr;
+    lineCount = 0;
+    loopStart = loopEnd = -1;
+    overrideIndex = -1;
+    releaseStringStorage(overrideText);
 }
 
 // Waits until the touch panel has reported "not touched" for N consecutive
@@ -2584,6 +2666,10 @@ static void markTapAccepted() {
 }
 
 void OSARuntime::sampleTouch() {
+    // Every blocking widget loop and the VM's loop tick pass through here, so
+    // it is the one place a pending toast can be refreshed or taken down
+    // while a script owns the display.
+    Toast::poll(tft);
     uint32_t now = millis();
     // touch.down(), touch.x() and touch.y() are normally called together.
     // One XPT2046 transaction is enough for the whole group; repeated SPI
@@ -2755,24 +2841,43 @@ bool OSARuntime::loadScript(String path) {
     File f = SD.open(path);
     if (!f) { setError(0, "Not found: " + path); return false; }
 
-    if ((size_t)f.size() > OSA_MAX_SOURCE_BYTES) {
+    const size_t sourceBytes = (size_t)f.size();
+    if (sourceBytes > OSA_MAX_SOURCE_BYTES) {
         f.close();
         setError(0, "OSA source exceeds 128 KB");
         return false;
     }
 
-    // Validate the physical line layout before allocating one String per
-    // source line. Besides producing an exact error, this detects files that
-    // were copied through an editor/tool which removed every newline.
+    // One buffer for the whole file: a single allocation that is released
+    // after compiling, instead of one String per line. The boot-time reserve
+    // is lent out for the duration so a 20 KB script always fits.
+    HeapReserve::release("script load");
+    sourceText = (char*)malloc(sourceBytes + 1);
+    if (!sourceText) {
+        f.close();
+        setError(0, "Not enough RAM to load OSA source");
+        return false;
+    }
+    size_t got = 0;
+    while (got < sourceBytes) {
+        int count = f.read((uint8_t*)sourceText + got, sourceBytes - got);
+        if (count <= 0) break;
+        got += (size_t)count;
+    }
+    f.close();
+    sourceText[got] = 0;
+
+    // Validate the physical line layout first. Besides producing an exact
+    // error, this detects files copied through a tool that removed every
+    // newline, and it counts the lines the offset table needs.
     size_t longestBytes = 0;
     size_t currentBytes = 0;
     size_t newlineCount = 0;
     int physicalLine = 1;
     int longestLine = 1;
-    while (f.available()) {
-        int value = f.read();
-        if (value < 0) break;
-        if (value == '\n') {
+    for (size_t i = 0; i < got; i++) {
+        char c = sourceText[i];
+        if (c == '\n') {
             if (currentBytes > longestBytes) {
                 longestBytes = currentBytes;
                 longestLine = physicalLine;
@@ -2780,7 +2885,7 @@ bool OSARuntime::loadScript(String path) {
             currentBytes = 0;
             newlineCount++;
             physicalLine++;
-        } else if (value != '\r') {
+        } else if (c != '\r') {
             currentBytes++;
         }
     }
@@ -2788,11 +2893,10 @@ bool OSARuntime::loadScript(String path) {
         longestBytes = currentBytes;
         longestLine = physicalLine;
     }
-    Serial.printf("[RT] source bytes=%u newlines=%u longest=L%d/%u\n",
-                  (unsigned)f.size(), (unsigned)newlineCount, longestLine,
-                  (unsigned)longestBytes);
+    Serial.printf("[RT] source bytes=%u newlines=%u longest=L%d/%u free=%u\n",
+                  (unsigned)got, (unsigned)newlineCount, longestLine,
+                  (unsigned)longestBytes, (unsigned)ESP.getFreeHeap());
     if (longestBytes > OSA_MAX_LINE_BYTES) {
-        f.close();
         String reason = String("Line ") + longestLine + " has " +
                         (unsigned)longestBytes + " bytes (limit " +
                         OSA_MAX_LINE_BYTES + ")";
@@ -2801,28 +2905,32 @@ bool OSARuntime::loadScript(String path) {
         setError(longestLine - 1, reason);
         return false;
     }
-    if (!f.seek(0)) {
-        f.close();
-        setError(0, "Could not rewind OSA source");
+    if (newlineCount + 1 > OSA_MAX_LINES) {
+        setError(0, "OSA source exceeds 512 lines");
         return false;
     }
-    while (f.available()) {
-        if (lineCount >= OSA_MAX_LINES) {
-            f.close();
-            setError(0, "OSA source exceeds 512 lines");
-            return false;
-        }
-        String raw;
-        if (!readLineLimited(f, raw, OSA_MAX_LINE_BYTES)) {
-            f.close();
-            setError(lineCount, String("Not enough RAM reading OSA line ") +
-                                (lineCount + 1));
-            return false;
-        }
-        raw.trim();
-        lines[lineCount++] = raw;
+    lineOffsets = (uint32_t*)malloc(sizeof(uint32_t) * (newlineCount + 1));
+    if (!lineOffsets) {
+        setError(0, "Not enough RAM to index OSA source");
+        return false;
     }
-    f.close();
+
+    // Split in place: every line becomes a NUL-terminated, trimmed C string
+    // (the old loader trimmed each String the same way).
+    size_t position = 0;
+    while (position <= got) {
+        size_t lineStart = position;
+        while (position < got && sourceText[position] != '\n') position++;
+        size_t lineEnd = position;              // exclusive
+        if (position < got) position++;         // skip the newline
+        while (lineStart < lineEnd && (uint8_t)sourceText[lineStart] <= ' ') lineStart++;
+        while (lineEnd > lineStart && (uint8_t)sourceText[lineEnd - 1] <= ' ') lineEnd--;
+        sourceText[lineEnd] = 0;
+        lineOffsets[lineCount++] = (uint32_t)lineStart;
+        if (position >= got) break;
+    }
+    // A file that ends with a newline has no extra empty line after it.
+    if (lineCount > (int)newlineCount + 1) lineCount = (int)newlineCount + 1;
 
     // Headers — shared helpers keep Settings + runtime in sync.
     appName       = readAppNameFromFile(path);
@@ -2835,10 +2943,11 @@ bool OSARuntime::loadScript(String path) {
     {
         int depth = 0;
         for (int i = 0; i < lineCount; i++) {
-            const String& t = lines[i];
-            if (depth == 0 && t == "loop") { loopStart = i; break; }
+            const char* t = lineView(i);
+            if (!t) continue;
+            if (depth == 0 && strcmp(t, "loop") == 0) { loopStart = i; break; }
             if (isBlockOpen(t)) depth++;
-            else if (t == "end" && depth > 0) depth--;
+            else if (strcmp(t, "end") == 0 && depth > 0) depth--;
         }
     }
     if (loopStart >= 0) loopEnd = findMatchingEnd(loopStart);
@@ -2871,16 +2980,16 @@ bool OSARuntime::loadScript(String path) {
         return false;
     }
 
-    // A successfully compiled app no longer needs its source text at runtime.
-    // Releasing the per-line buffers here is especially important before TLS
-    // work in OpenStore on ESP32 boards without PSRAM.
+    // A successfully compiled app no longer needs its source text at runtime;
+    // the tree-walker fallback needs it as mutable Strings instead.
     if (compiled) {
-        for (int i = 0; i < OSA_MAX_LINES; i++) releaseStringStorage(lines[i]);
-        lineCount = 0;
-        loopStart = loopEnd = -1;
-        Serial.printf("[RT] released source lines free=%u\n",
-                      (unsigned)ESP.getFreeHeap());
+        releaseLines();
+        Serial.printf("[RT] released source free=%u\n", (unsigned)ESP.getFreeHeap());
+    } else if (!materializeLines()) {
+        setError(0, "Not enough RAM for the OSA interpreter");
+        return false;
     }
+    HeapReserve::reclaim();
 
     // Create per-app sandbox directory
     if (isSdReady) {
@@ -2929,25 +3038,43 @@ bool OSARuntime::runUpdate() {
 // Block navigation helpers
 // ═══════════════════════════════════════════════════════════════════════════════
 
-static bool isBlockOpen(const String& t) {
-    // Inline one-liners ("if X then Y end" / "while X do Y end") are *not*
-    // block opens — they're complete on one line and execLine handles them
-    // directly. Treating them as block opens would skew depth counting in
-    // findMatchingEnd, breaking enclosing def/while/if scopes.
-    if (t.startsWith("if ") && t.endsWith(" end") &&
-        t.indexOf(" then ") > 0) return false;
-    if (t.startsWith("while ") && t.endsWith(" end") &&
-        t.indexOf(" do ") > 0) return false;
-    return t.startsWith("if ") || t.startsWith("while ") ||
-           t.startsWith("for ") || t.startsWith("def ") || t == "loop";
+static bool startsWithC(const char* text, const char* prefix) {
+    return strncmp(text, prefix, strlen(prefix)) == 0;
 }
 
+static bool endsWithC(const char* text, const char* suffix) {
+    size_t textLength = strlen(text);
+    size_t suffixLength = strlen(suffix);
+    return textLength >= suffixLength &&
+           strcmp(text + textLength - suffixLength, suffix) == 0;
+}
+
+// Inline one-liners ("if X then Y end" / "while X do Y end") are *not*
+// block opens — they're complete on one line and execLine handles them
+// directly. Treating them as block opens would skew depth counting in
+// findMatchingEnd, breaking enclosing def/while/if scopes.
+static bool isBlockOpen(const char* t) {
+    if (startsWithC(t, "if ") && endsWithC(t, " end") &&
+        strstr(t + 1, " then ") != nullptr) return false;
+    if (startsWithC(t, "while ") && endsWithC(t, " end") &&
+        strstr(t + 1, " do ") != nullptr) return false;
+    return startsWithC(t, "if ") || startsWithC(t, "while ") ||
+           startsWithC(t, "for ") || startsWithC(t, "def ") ||
+           strcmp(t, "loop") == 0;
+}
+
+static bool isBlockOpen(const String& t) { return isBlockOpen(t.c_str()); }
+
+// Scanners run for every block while compiling, so they read the source
+// buffer directly instead of materialising a String per line.
 int OSARuntime::findMatchingEnd(int lineNo) {
     int depth = 1;
     for (int i = lineNo + 1; i < lineCount; i++) {
-        const String& t = lines[i];
-        if (isBlockOpen(t)) depth++;
-        else if (t == "end") { if (--depth == 0) return i; }
+        const char* view = lineView(i);
+        String copy;
+        if (!view) { copy = lineText(i); view = copy.c_str(); }
+        if (isBlockOpen(view)) depth++;
+        else if (strcmp(view, "end") == 0) { if (--depth == 0) return i; }
     }
     return lineCount;
 }
@@ -2955,13 +3082,15 @@ int OSARuntime::findMatchingEnd(int lineNo) {
 int OSARuntime::findNextBranch(int from) {
     int depth = 0;
     for (int i = from; i < lineCount; i++) {
-        const String& t = lines[i];
-        if (isBlockOpen(t)) {
+        const char* view = lineView(i);
+        String copy;
+        if (!view) { copy = lineText(i); view = copy.c_str(); }
+        if (isBlockOpen(view)) {
             depth++;
-        } else if (t == "end") {
+        } else if (strcmp(view, "end") == 0) {
             if (depth == 0) return i;
             depth--;
-        } else if (depth == 0 && (t.startsWith("elif ") || t == "else")) {
+        } else if (depth == 0 && (startsWithC(view, "elif ") || strcmp(view, "else") == 0)) {
             return i;
         }
     }
@@ -2974,7 +3103,7 @@ int OSARuntime::findNextBranch(int from) {
 
 void OSARuntime::registerFuncs() {
     for (int i = 0; i < lineCount; i++) {
-        String t = lines[i]; t.trim();
+        String t = lineText(i); t.trim();
         if (!t.startsWith("def ")) continue;
         if (funcCount >= OSA_MAX_FUNCS) break;
 
@@ -3283,6 +3412,7 @@ void OSARuntime::setVar(const String& name, OSAVal val) {
     if (varCount < OSA_MAX_VARS) {
         vars[varCount].name = name;
         vars[varCount].val  = static_cast<OSAVal&&>(val);
+        varNameIds[varCount] = -1;
         varCount++;
     }
 }
@@ -3304,6 +3434,62 @@ void OSARuntime::declareVar(const String& name, OSAVal val) {
     if (varCount < OSA_MAX_VARS) {
         vars[varCount].name = name;
         vars[varCount].val  = static_cast<OSAVal&&>(val);
+        varNameIds[varCount] = -1;
+        varCount++;
+    }
+}
+
+// ── Bytecode fast paths ─────────────────────────────────────────────────────
+// The name pool is deduplicated, so equal identifiers always share one index.
+// Slots created by the VM carry that index; a slot without one (tree-walker
+// parameter binding) falls back to the String compare.
+
+const OSAVal* OSARuntime::findVarById(uint16_t nameId) const {
+    const String& name = bc.namePool[nameId];
+    for (int i = varCount - 1; i >= 0; i--) {
+        const Var& slot = vars[i];
+        if (varNameIds[i] == (int16_t)nameId ||
+            (varNameIds[i] < 0 && slot.name == name))
+            return &slot.val;
+    }
+    return nullptr;
+}
+
+void OSARuntime::setVarById(uint16_t nameId, OSAVal val) {
+    const String& name = bc.namePool[nameId];
+    for (int i = varCount - 1; i >= 0; i--) {
+        Var& slot = vars[i];
+        if (varNameIds[i] == (int16_t)nameId ||
+            (varNameIds[i] < 0 && slot.name == name)) {
+            slot.val = static_cast<OSAVal&&>(val);
+            return;
+        }
+    }
+    if (varCount < OSA_MAX_VARS) {
+        vars[varCount].name   = name;
+        vars[varCount].val    = static_cast<OSAVal&&>(val);
+        varNameIds[varCount] = (int16_t)nameId;
+        varCount++;
+    }
+}
+
+void OSARuntime::declareVarById(uint16_t nameId, OSAVal val) {
+    const String& name = bc.namePool[nameId];
+    int scopeStart = 0;
+    if (vmCallDepth > 0) scopeStart = vmCallStack[vmCallDepth - 1].savedVarCount;
+    else if (stackDepth > 0) scopeStart = callStack[stackDepth - 1].retVarCount;
+    for (int i = varCount - 1; i >= scopeStart; i--) {
+        Var& slot = vars[i];
+        if (varNameIds[i] == (int16_t)nameId ||
+            (varNameIds[i] < 0 && slot.name == name)) {
+            slot.val = static_cast<OSAVal&&>(val);
+            return;
+        }
+    }
+    if (varCount < OSA_MAX_VARS) {
+        vars[varCount].name   = name;
+        vars[varCount].val    = static_cast<OSAVal&&>(val);
+        varNameIds[varCount] = (int16_t)nameId;
         varCount++;
     }
 }
@@ -3978,12 +4164,23 @@ bool OSARuntime::showPermPopup(const String& label, const String& detail) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
-    // Check user functions first — avoids allocating arg arrays on the stack
-    for (int i = 0; i < funcCount; i++) {
-        if (funcs[i].name == name) return callUser(name, argsStr);
+    // The bytecode compiler already resolved user functions to OP_CALL_USER,
+    // so only the tree-walker path still needs the name scan here.
+    if (!directBuiltinArgs) {
+        for (int i = 0; i < funcCount; i++) {
+            if (funcs[i].name == name) return callUser(name, argsStr);
+        }
     }
 
     BuiltinBudgetGuard builtinBudget(scriptSliceStarted);
+
+    // The dispatch below is a long chain of literal comparisons. Comparing the
+    // length first rejects almost every candidate with one integer compare
+    // instead of a strcmp() call, which matters for per-frame drawing calls.
+    const char*    namePtr = name.c_str();
+    const unsigned nameLen = name.length();
+#define IS(literal) (nameLen == sizeof(literal) - 1 && \
+                     memcmp(namePtr, literal, sizeof(literal) - 1) == 0)
 
     OSAVal localArgs[12];
     OSAVal* a = localArgs;
@@ -4016,25 +4213,25 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
 
     // ── Screen drawing ────────────────────────────────────────────────────────
 
-    if (name == "clear" || name == "cls") {
+    if (IS("clear") || IS("cls")) {
         uint16_t c = (sysTheme == 1) ? tft->color565(28, 28, 30) : TFT_WHITE;
         if (activeSprite) activeSprite->fillSprite(c);
         else              tft->fillScreen(c);
         return OSAVal();
     }
-    if (name == "bg") {
+    if (IS("bg")) {
         uint16_t c = tft->color565(iN(0), iN(1), iN(2));
         if (activeSprite) activeSprite->fillSprite(c);
         else              tft->fillScreen(c);
         return OSAVal();
     }
-    if (name == "bg565") {
+    if (IS("bg565")) {
         uint16_t c = (uint16_t)iN(0);
         if (activeSprite) activeSprite->fillSprite(c);
         else              tft->fillScreen(c);
         return OSAVal();
     }
-    if (name == "text") {
+    if (IS("text")) {
         CV(setTextFont(textFont));
         CV(setTextSize(1));
         CV(setTextColor(txtColor));
@@ -4042,7 +4239,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         CV(drawString(S(2), iN(0), iN(1)));
         return OSAVal();
     }
-    if (name == "textc") {
+    if (IS("textc")) {
         CV(setTextFont(textFont));
         CV(setTextSize(1));
         CV(setTextColor(txtColor));
@@ -4050,62 +4247,62 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         CV(drawString(S(2), iN(0), iN(1)));
         return OSAVal();
     }
-    if (name == "rect") {
+    if (IS("rect")) {
         CV(fillRect(iN(0), iN(1), iN(2), iN(3), drawColor));
         return OSAVal();
     }
-    if (name == "rrect") {
+    if (IS("rrect")) {
         CV(fillRoundRect(iN(0), iN(1), iN(2), iN(3), iN(4), drawColor));
         return OSAVal();
     }
-    if (name == "frame") {
+    if (IS("frame")) {
         CV(drawRect(iN(0), iN(1), iN(2), iN(3), drawColor));
         return OSAVal();
     }
-    if (name == "circle") {
+    if (IS("circle")) {
         CV(fillCircle(iN(0), iN(1), iN(2), drawColor));
         return OSAVal();
     }
-    if (name == "ring") {
+    if (IS("ring")) {
         CV(drawCircle(iN(0), iN(1), iN(2), drawColor));
         return OSAVal();
     }
-    if (name == "line") {
+    if (IS("line")) {
         CV(drawLine(iN(0), iN(1), iN(2), iN(3), drawColor));
         return OSAVal();
     }
-    if (name == "hline") {
+    if (IS("hline")) {
         CV(drawFastHLine(iN(0), iN(1), max(0, iN(2)), drawColor));
         return OSAVal();
     }
-    if (name == "vline") {
+    if (IS("vline")) {
         CV(drawFastVLine(iN(0), iN(1), max(0, iN(2)), drawColor));
         return OSAVal();
     }
-    if (name == "thickline") {
+    if (IS("thickline")) {
         float width = max(1.0f, (float)N(4, 1));
         CV(drawWideLine((float)N(0), (float)N(1), (float)N(2), (float)N(3),
                         width, drawColor));
         return OSAVal();
     }
-    if (name == "pixel") {
+    if (IS("pixel")) {
         CV(drawPixel(iN(0), iN(1), drawColor));
         return OSAVal();
     }
-    if (name == "ellipse") {
+    if (IS("ellipse")) {
         CV(fillEllipse(iN(0), iN(1), max(0, iN(2)), max(0, iN(3)),
                        drawColor));
         return OSAVal();
     }
-    if (name == "eframe") {
+    if (IS("eframe")) {
         CV(drawEllipse(iN(0), iN(1), max(0, iN(2)), max(0, iN(3)),
                        drawColor));
         return OSAVal();
     }
-    if (name == "quad" || name == "qframe") {
+    if (IS("quad") || IS("qframe")) {
         int x1 = iN(0), y1 = iN(1), x2 = iN(2), y2 = iN(3);
         int x3 = iN(4), y3 = iN(5), x4 = iN(6), y4 = iN(7);
-        if (name == "quad") {
+        if (IS("quad")) {
             CV(fillTriangle(x1, y1, x2, y2, x3, y3, drawColor));
             CV(fillTriangle(x1, y1, x3, y3, x4, y4, drawColor));
         } else {
@@ -4116,7 +4313,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         }
         return OSAVal();
     }
-    if (name == "arc") {
+    if (IS("arc")) {
         int radius = max(1, iN(2));
         int thickness = constrain(iN(3, 1), 1, radius);
         int start = iN(4) % 360; if (start < 0) start += 360;
@@ -4126,53 +4323,53 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
                    start, end, drawColor, background, false));
         return OSAVal();
     }
-    if (name == "setcolor") {
+    if (IS("setcolor")) {
         drawColor = osaRgb565(iN(0), iN(1), iN(2));
         return OSAVal();
     }
-    if (name == "setcolor565")  { drawColor = (uint16_t)iN(0); return OSAVal(); }
-    if (name == "textcolor") {
+    if (IS("setcolor565"))  { drawColor = (uint16_t)iN(0); return OSAVal(); }
+    if (IS("textcolor")) {
         txtColor = osaRgb565(iN(0), iN(1), iN(2));
         return OSAVal();
     }
-    if (name == "textcolor565") { txtColor  = (uint16_t)iN(0); return OSAVal(); }
-    if (name == "color.rgb") {
+    if (IS("textcolor565")) { txtColor  = (uint16_t)iN(0); return OSAVal(); }
+    if (IS("color.rgb")) {
         return OSAVal((double)osaRgb565(iN(0), iN(1), iN(2)));
     }
-    if (name == "color.gray") {
+    if (IS("color.gray")) {
         int level = iN(0);
         return OSAVal((double)osaRgb565(level, level, level));
     }
-    if (name == "color.r" || name == "color.g" || name == "color.b") {
+    if (IS("color.r") || IS("color.g") || IS("color.b")) {
         int red, green, blue;
         osaUnpack565((uint16_t)iN(0), red, green, blue);
-        if (name == "color.r") return OSAVal((double)red);
-        if (name == "color.g") return OSAVal((double)green);
+        if (IS("color.r")) return OSAVal((double)red);
+        if (IS("color.g")) return OSAVal((double)green);
         return OSAVal((double)blue);
     }
-    if (name == "color.lerp") {
+    if (IS("color.lerp")) {
         return OSAVal((double)osaMix565((uint16_t)iN(0), (uint16_t)iN(1),
                                         (float)N(2)));
     }
-    if (name == "color.lighten") {
+    if (IS("color.lighten")) {
         return OSAVal((double)osaMix565((uint16_t)iN(0), TFT_WHITE,
                                         (float)N(1)));
     }
-    if (name == "color.darken") {
+    if (IS("color.darken")) {
         return OSAVal((double)osaMix565((uint16_t)iN(0), TFT_BLACK,
                                         (float)N(1)));
     }
-    if (name == "color.hsv") {
+    if (IS("color.hsv")) {
         return OSAVal((double)osaHsv565((float)N(0), (float)N(1),
                                         (float)N(2)));
     }
-    if (name == "color.contrast") {
+    if (IS("color.contrast")) {
         int red, green, blue;
         osaUnpack565((uint16_t)iN(0), red, green, blue);
         int luminance = red * 299 + green * 587 + blue * 114;
         return OSAVal((double)(luminance >= 150000 ? TFT_BLACK : TFT_WHITE));
     }
-    if (name == "fontsize") {
+    if (IS("fontsize")) {
         // TFT_eSPI ships fonts 1, 2, 4, 6, 7 — 6 is digits-only (big clock
         // glyphs), 7 is 7-segment. Anything in between rounds down.
         int fs = iN(0);
@@ -4184,7 +4381,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         return OSAVal();
     }
     // textfit(text, width) returns a single line shortened with "...".
-    if (name == "textfit") {
+    if (IS("textfit")) {
         tft->setTextFont(textFont); tft->setTextSize(1);
         return OSAVal(popupFitLine(tft, S(0), max(1, iN(1))));
     }
@@ -4192,7 +4389,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     //           [maxLines]) draws word-wrapped text and returns content height.
     // Only visible complete lines are painted, so a fixed header can be drawn
     // independently while the block scrolls underneath it.
-    if (name == "textblock") {
+    if (IS("textblock")) {
         int x = iN(0), y = iN(1), width = max(1, iN(2));
         String numericText;
         const String* blockText = nullptr;
@@ -4219,14 +4416,14 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
                                          drawWrappedLine, &context);
         return OSAVal((double)(lineCount * lineHeight));
     }
-    if (name == "screenw") return OSAVal(240.0);
-    if (name == "screenh") return OSAVal(320.0);
+    if (IS("screenw")) return OSAVal(240.0);
+    if (IS("screenh")) return OSAVal(320.0);
 
     // ── Off-screen sprite (double buffering for smooth animations) ────────────
     //   ok = gfx.begin(w, h)   — allocate; subsequent draws go to the sprite
     //   gfx.push(x, y)         — blit sprite to TFT at (x, y)
     //   gfx.end()              — release sprite, drawing returns to direct TFT
-    if (name == "gfx.begin" || name == "gfx.auto") {
+    if (IS("gfx.begin") || IS("gfx.auto")) {
         // Optional 3rd arg: depth 1/8/16 (default 16). 8-bit halves memory
         // (256-color palette) — perfect for solid-color sprites.
         int w = iN(0), h = iN(1);
@@ -4241,6 +4438,9 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
             activeSprite = nullptr;
         }
         auto tryDepth = [&](int depth) -> bool {
+            // Sprites are the other big consumer of the boot-time reserve.
+            if (!osaCanAllocateSprite(w, h, depth) && HeapReserve::held())
+                HeapReserve::release("sprite");
             if (!osaCanAllocateSprite(w, h, depth)) return false;
             activeSprite = new (std::nothrow) TFT_eSprite(tft);
             if (!activeSprite) return false;
@@ -4253,7 +4453,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
             activeSprite->fillSprite(TFT_BLACK);
             return true;
         };
-        if (name == "gfx.auto") {
+        if (IS("gfx.auto")) {
             const int candidates[3] = {16, 8, 1};
             for (int candidate : candidates) {
                 if (candidate > requestedDepth) continue;
@@ -4264,12 +4464,12 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         if (!tryDepth(requestedDepth)) return OSAVal(0.0);
         return OSAVal(1.0);
     }
-    if (name == "gfx.push") {
+    if (IS("gfx.push")) {
         if (!activeSprite) return OSAVal(0.0);
         activeSprite->pushSprite(iN(0), iN(1));
         return OSAVal(1.0);
     }
-    if (name == "gfx.pushClip") {
+    if (IS("gfx.pushClip")) {
         if (!activeSprite) return OSAVal(0.0);
         int clipX = iN(2), clipY = iN(3);
         int clipW = iN(4), clipH = iN(5);
@@ -4279,14 +4479,14 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         tft->resetViewport();
         return OSAVal(1.0);
     }
-    if (name == "gfx.origin") {
+    if (IS("gfx.origin")) {
         if (!activeSprite) return OSAVal(0.0);
         // Drawing coordinates are translated before sprite clipping. This
         // lets a small reusable stripe render a window of a much taller UI.
         activeSprite->setOrigin(iN(0), iN(1));
         return OSAVal(1.0);
     }
-    if (name == "gfx.end") {
+    if (IS("gfx.end")) {
         if (activeSprite) {
             activeSprite->deleteSprite();
             delete activeSprite;
@@ -4297,16 +4497,17 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
             delete stashSprite;
             stashSprite = nullptr;
         }
+        HeapReserve::reclaim();
         return OSAVal();
     }
-    if (name == "gfx.active") return OSAVal(activeSprite ? 1.0 : 0.0);
-    if (name == "gfx.width")
+    if (IS("gfx.active")) return OSAVal(activeSprite ? 1.0 : 0.0);
+    if (IS("gfx.width"))
         return OSAVal(activeSprite ? (double)activeSprite->width() : 240.0);
-    if (name == "gfx.height")
+    if (IS("gfx.height"))
         return OSAVal(activeSprite ? (double)activeSprite->height() : 320.0);
-    if (name == "gfx.depth")
+    if (IS("gfx.depth"))
         return OSAVal(activeSprite ? (double)activeSprite->getColorDepth() : 16.0);
-    if (name == "gfx.bytes") {
+    if (IS("gfx.bytes")) {
         if (!activeSprite) return OSAVal(0.0);
         return OSAVal((double)osaSpriteBytes(activeSprite->width(),
                                              activeSprite->height(),
@@ -4317,7 +4518,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     // call gfx.stash() to detach it (drawing returns to screen but the buffer
     // stays alive), then gfx.show(x, y) to blit it on demand. gfx.unstash
     // re-activates the stashed sprite for further drawing.
-    if (name == "gfx.stash") {
+    if (IS("gfx.stash")) {
         if (activeSprite) {
             if (stashSprite) {
                 stashSprite->deleteSprite();
@@ -4328,12 +4529,12 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         }
         return OSAVal();
     }
-    if (name == "gfx.show") {
+    if (IS("gfx.show")) {
         if (!stashSprite) return OSAVal(0.0);
         stashSprite->pushSprite(iN(0), iN(1));
         return OSAVal(1.0);
     }
-    if (name == "gfx.unstash") {
+    if (IS("gfx.unstash")) {
         if (activeSprite) {
             activeSprite->deleteSprite();
             delete activeSprite;
@@ -4348,7 +4549,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     // Lightweight pseudo-3D. Complex primitives stay inside one native call so
     // script bytecode does not pay a VM transition for every vertex and edge.
     if (name.startsWith("d3.")) {
-        if (name == "d3.reset") {
+        if (IS("d3.reset")) {
             d3.reset();
             frameLastMs = 0;
             frameDeltaMs = 50;
@@ -4358,39 +4559,39 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
             d3AdaptiveQuality = true;
             return OSAVal();
         }
-        if (name == "d3.camera") {
+        if (IS("d3.camera")) {
             d3.setCamera((float)N(0, 120), (float)N(1, 160),
                          (float)N(2, 110), (float)N(3, 5));
             return OSAVal();
         }
-        if (name == "d3.cameraX") return OSAVal((double)d3.centerX());
-        if (name == "d3.cameraY") return OSAVal((double)d3.centerY());
-        if (name == "d3.focal") return OSAVal((double)d3.focal());
-        if (name == "d3.distance") return OSAVal((double)d3.distance());
-        if (name == "d3.visible" || name == "d3.projectX" ||
-            name == "d3.projectY") {
+        if (IS("d3.cameraX")) return OSAVal((double)d3.centerX());
+        if (IS("d3.cameraY")) return OSAVal((double)d3.centerY());
+        if (IS("d3.focal")) return OSAVal((double)d3.focal());
+        if (IS("d3.distance")) return OSAVal((double)d3.distance());
+        if (IS("d3.visible") || IS("d3.projectX") ||
+            IS("d3.projectY")) {
             int16_t projectedX = 0, projectedY = 0;
             bool visible = d3.project((float)N(0), (float)N(1), (float)N(2),
                                       projectedX, projectedY);
-            if (name == "d3.visible") return OSAVal(visible ? 1.0 : 0.0);
+            if (IS("d3.visible")) return OSAVal(visible ? 1.0 : 0.0);
             if (!visible) return OSAVal(-32768.0);
-            return OSAVal((double)(name == "d3.projectX"
+            return OSAVal((double)(IS("d3.projectX")
                                    ? projectedX : projectedY));
         }
-        if (name == "d3.line") {
+        if (IS("d3.line")) {
             bool ok = d3.drawLine(tft, activeSprite,
                                   (float)N(0), (float)N(1), (float)N(2),
                                   (float)N(3), (float)N(4), (float)N(5),
                                   drawColor);
             return OSAVal(ok ? 1.0 : 0.0);
         }
-        if (name == "d3.point") {
+        if (IS("d3.point")) {
             bool ok = d3.drawPoint(tft, activeSprite,
                                    (float)N(0), (float)N(1), (float)N(2),
                                    iN(3, 1), drawColor);
             return OSAVal(ok ? 1.0 : 0.0);
         }
-        if (name == "d3.triangle") {
+        if (IS("d3.triangle")) {
             bool ok = d3.drawTriangle(
                 tft, activeSprite,
                 (float)N(0), (float)N(1), (float)N(2),
@@ -4399,7 +4600,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
                 iN(9, 1) != 0, drawColor);
             return OSAVal(ok ? 1.0 : 0.0);
         }
-        if (name == "d3.cube") {
+        if (IS("d3.cube")) {
             int requestedMode = constrain(iN(7, 2), 0, 2);
             int renderMode = d3AdaptiveQuality && d3ReducedQuality
                            ? 0 : requestedMode;
@@ -4415,33 +4616,35 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
                 renderMode, drawColor, edge);
             return OSAVal((double)rendered);
         }
-        if (name == "d3.grid") {
+        if (IS("d3.grid")) {
             return OSAVal((double)d3.drawGrid(
                 tft, activeSprite, (float)N(0), (float)N(1, 5),
                 (float)N(2, 1), drawColor));
         }
-        if (name == "d3.axes") {
+        if (IS("d3.axes")) {
             d3.drawAxes(tft, activeSprite, (float)N(0, 2));
             return OSAVal();
         }
-        if (name == "d3.renderMs")
+        if (IS("d3.renderMs"))
             return OSAVal((double)d3.lastRenderMicros() / 1000.0);
-        if (name == "d3.faces")
+        if (IS("d3.faces"))
             return OSAVal((double)d3.lastFaceCount());
-        if (name == "d3.adaptive") {
+        if (IS("d3.adaptive")) {
             d3AdaptiveQuality = N(0, 1) != 0;
             if (!d3AdaptiveQuality) d3ReducedQuality = false;
             return OSAVal(d3AdaptiveQuality ? 1.0 : 0.0);
         }
-        if (name == "d3.quality")
+        if (IS("d3.quality"))
             return OSAVal(d3ReducedQuality ? 0.0 : 1.0);
-        if (name == "d3.fps") return OSAVal((double)frameFps);
-        if (name == "d3.delta")
+        if (IS("d3.fps")) return OSAVal((double)frameFps);
+        if (IS("d3.delta"))
             return OSAVal((double)frameDeltaMs / 1000.0);
-        if (name == "d3.frame") {
-            // Hard 3D limit: scripts cannot request less than 12 or more than
-            // 20 FPS. The headroom keeps touch and Wi-Fi responsive.
-            int targetFps = constrain(iN(0, 20), 12, 20);
+        if (IS("d3.frame")) {
+            // Scripts choose 12-40 FPS. 40 is what a 160x160 sprite push over
+            // 40 MHz SPI leaves room for; the wait loop below still yields to
+            // Wi-Fi and touch every millisecond, so a higher target never
+            // starves them. Without an argument the historical 20 FPS applies.
+            int targetFps = constrain(iN(0, 20), 12, 40);
             uint32_t targetMs = 1000U / (uint32_t)targetFps;
             uint32_t now = millis();
             if (frameLastMs == 0) {
@@ -4453,7 +4656,9 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
                 while (elapsed < targetMs && !exitFlag) {
                     if (checkExitGesture() || checkOverlayGesture()) break;
                     uint32_t remaining = targetMs - elapsed;
-                    delay((uint32_t)min((uint32_t)5, remaining));
+                    // Coarse sleeps first, then single ticks, so the frame
+                    // lands on its deadline instead of up to 5 ms late.
+                    delay(remaining > 4U ? 4U : 1U);
                     yield();
                     now = millis();
                     elapsed = now - frameLastMs;
@@ -4464,14 +4669,19 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
                 float instant = 1000.0f / (float)elapsed;
                 frameFps = frameFps * 0.75f + instant * 0.25f;
 
-                if (elapsed > 83U) {
+                // Adaptive quality is relative to the requested rate: two
+                // consecutive frames slower than ~60% of target drop filled
+                // cubes to wireframe, ten frames near target restore them.
+                const uint32_t slowMs = targetMs * 5U / 3U;
+                const uint32_t fastMs = targetMs * 7U / 5U;
+                if (elapsed > slowMs) {
                     d3FastFrames = 0;
                     if (d3SlowFrames < 255) ++d3SlowFrames;
                     if (d3AdaptiveQuality && d3SlowFrames >= 2)
                         d3ReducedQuality = true;
                 } else {
                     d3SlowFrames = 0;
-                    if (elapsed <= 70U && d3FastFrames < 255)
+                    if (elapsed <= fastMs && d3FastFrames < 255)
                         ++d3FastFrames;
                     else
                         d3FastFrames = 0;
@@ -4490,65 +4700,65 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         }
     }
 
-    if (name == "touch.down") {
+    if (IS("touch.down")) {
         sampleTouch();
         return OSAVal(touchSampleDown ? 1.0 : 0.0);
     }
-    if (name == "touch.x") {
+    if (IS("touch.x")) {
         sampleTouch();
         return OSAVal((double)touchSampleX);
     }
-    if (name == "touch.y") {
+    if (IS("touch.y")) {
         sampleTouch();
         return OSAVal((double)touchSampleY);
     }
 
     // ── System ────────────────────────────────────────────────────────────────
 
-    if (name == "touch.pressed") {
+    if (IS("touch.pressed")) {
         pollGesture();
         bool pressed = pressedOneShot;
         pressedOneShot = false;
         return OSAVal(pressed ? 1.0 : 0.0);
     }
-    if (name == "touch.startX") {
+    if (IS("touch.startX")) {
         pollGesture();
         return OSAVal((double)gestureStartX);
     }
-    if (name == "touch.startY") {
+    if (IS("touch.startY")) {
         pollGesture();
         return OSAVal((double)gestureStartY);
     }
-    if (name == "touch.endX") {
+    if (IS("touch.endX")) {
         pollGesture();
         return OSAVal((double)gestureEndX);
     }
-    if (name == "touch.endY") {
+    if (IS("touch.endY")) {
         pollGesture();
         return OSAVal((double)gestureEndY);
     }
-    if (name == "touch.dx") {
+    if (IS("touch.dx")) {
         pollGesture();
         if (!gestureActive && !touchWasDown) return OSAVal(0.0);
         return OSAVal((double)(gestureLastX - gestureStartX));
     }
-    if (name == "touch.dy") {
+    if (IS("touch.dy")) {
         pollGesture();
         if (!gestureActive && !touchWasDown) return OSAVal(0.0);
         return OSAVal((double)(gestureLastY - gestureStartY));
     }
-    if (name == "touch.duration") {
+    if (IS("touch.duration")) {
         pollGesture();
         if (!gestureActive) return OSAVal(0.0);
         return OSAVal((double)(millis() - gestureStartT));
     }
-    if (name == "touch.held") {
+    if (IS("touch.held")) {
         pollGesture();
         return OSAVal(gestureActive &&
                       (uint32_t)(millis() - gestureStartT) >=
                       (uint32_t)max(0, iN(0)) ? 1.0 : 0.0);
     }
-    if (name == "touch.moved") {
+    if (IS("touch.moved")) {
         pollGesture();
         if (!gestureActive && !touchWasDown) return OSAVal(0.0);
         int threshold = constrain(iN(0, 8), 0, 512);
@@ -4556,7 +4766,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         int dy = gestureLastY - gestureStartY;
         return OSAVal(dx * dx + dy * dy >= threshold * threshold ? 1.0 : 0.0);
     }
-    if (name == "touch.in") {
+    if (IS("touch.in")) {
         sampleTouch();
         if (!touchSampleDown) return OSAVal(0.0);
         int x = iN(0), y = iN(1);
@@ -4569,7 +4779,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
                       touchSampleY >= y && touchSampleY < bottom
                       ? 1.0 : 0.0);
     }
-    if (name == "touch.tap") {
+    if (IS("touch.tap")) {
         pollGesture();
         if (!tapOneShot) return OSAVal(0.0);
         int x = iN(0), y = iN(1);
@@ -4583,28 +4793,28 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         if (matched) tapOneShot = false;
         return OSAVal(matched ? 1.0 : 0.0);
     }
-    if (name == "touch.clearTap") {
+    if (IS("touch.clearTap")) {
         tapOneShot = false;
         return OSAVal();
     }
-    if (name == "touch.released") {
+    if (IS("touch.released")) {
         pollGesture();
         bool released = releasedOneShot;
         releasedOneShot = false;
         return OSAVal(released ? 1.0 : 0.0);
     }
-    if (name == "gesture.swipeUp" || name == "gesture.swipeDown" ||
-        name == "gesture.swipeLeft" || name == "gesture.swipeRight") {
+    if (IS("gesture.swipeUp") || IS("gesture.swipeDown") ||
+        IS("gesture.swipeLeft") || IS("gesture.swipeRight")) {
         pollGesture();
-        int expected = name == "gesture.swipeUp" ? 1 :
-                       name == "gesture.swipeDown" ? 2 :
-                       name == "gesture.swipeLeft" ? 3 : 4;
+        int expected = IS("gesture.swipeUp") ? 1 :
+                       IS("gesture.swipeDown") ? 2 :
+                       IS("gesture.swipeLeft") ? 3 : 4;
         bool matched = swipeOneShot == expected;
         if (matched) swipeOneShot = 0;
         return OSAVal(matched ? 1.0 : 0.0);
     }
 
-    if (name == "wait") {
+    if (IS("wait")) {
         // Poll the global exit gesture during long waits so scripts with custom
         // touch loops (no ui.menu*) can still be swiped up to home.
         int ms = iN(0);
@@ -4630,18 +4840,18 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         scriptLoopOpsTotal = 0;
         return OSAVal();
     }
-    if (name == "exit")   { exitFlag = true; return OSAVal(); }
-    if (name == "confirm") {
+    if (IS("exit"))   { exitFlag = true; return OSAVal(); }
+    if (IS("confirm")) {
         // confirm(title, body) or confirm(body) → 1 if OK, 0 if Cancel
         String t = (argc >= 2) ? S(0) : appName;
         String b = (argc >= 2) ? S(1) : S(0);
         return OSAVal(showSystemPopup(t, b, "", "Cancel", "OK", false) ? 1.0 : 0.0);
     }
-    if (name == "millis") return OSAVal((double)millis());
-    if (name == "micros") return OSAVal((double)micros());
-    if (name == "sdk.version")
+    if (IS("millis")) return OSAVal((double)millis());
+    if (IS("micros")) return OSAVal((double)micros());
+    if (IS("sdk.version"))
         return OSAVal((double)OpenOSBuild::OSA_SDK_VERSION);
-    if (name == "sdk.has") {
+    if (IS("sdk.has")) {
         String feature = S(0);
         feature.toLowerCase();
         bool available = feature == "d3" || feature == "sprite" ||
@@ -4653,13 +4863,13 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
                          feature == "ota";
         return OSAVal(available ? 1.0 : 0.0);
     }
-    if (name == "openos.version")
+    if (IS("openos.version"))
         return OSAVal(OpenOSBuild::VERSION_NAME);
-    if (name == "openos.versionCode")
+    if (IS("openos.versionCode"))
         return OSAVal((double)OpenOSBuild::VERSION_CODE);
-    if (name == "elapsed")
+    if (IS("elapsed"))
         return OSAVal((double)((uint32_t)millis() - (uint32_t)N(0)));
-    if (name == "yield") {
+    if (IS("yield")) {
         ::yield();
         delay(0);
         if (checkExitGesture() || checkOverlayGesture()) exitFlag = true;
@@ -4668,22 +4878,22 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         scriptLoopOpsTotal = 0;
         return OSAVal();
     }
-    if (name == "heap.free") return OSAVal((double)ESP.getFreeHeap());
-    if (name == "heap.maxBlock") return OSAVal((double)ESP.getMaxAllocHeap());
-    if (name == "heap.lowWater") return OSAVal((double)ESP.getMinFreeHeap());
-    if (name == "heap.total") return OSAVal((double)ESP.getHeapSize());
-    if (name == "heap.fragmentation") {
+    if (IS("heap.free")) return OSAVal((double)ESP.getFreeHeap());
+    if (IS("heap.maxBlock")) return OSAVal((double)ESP.getMaxAllocHeap());
+    if (IS("heap.lowWater")) return OSAVal((double)ESP.getMinFreeHeap());
+    if (IS("heap.total")) return OSAVal((double)ESP.getHeapSize());
+    if (IS("heap.fragmentation")) {
         uint32_t freeBytes = ESP.getFreeHeap();
         uint32_t largest = ESP.getMaxAllocHeap();
         double percent = freeBytes == 0 ? 100.0
                        : 100.0 - (double)largest * 100.0 / freeBytes;
         return OSAVal(percent < 0.0 ? 0.0 : percent);
     }
-    if (name == "perf.fps") return OSAVal((double)frameFps);
-    if (name == "perf.delta")
+    if (IS("perf.fps")) return OSAVal((double)frameFps);
+    if (IS("perf.delta"))
         return OSAVal((double)frameDeltaMs / 1000.0);
-    if (name == "perf.frameMs") return OSAVal((double)frameDeltaMs);
-    if (name == "perf.frame") {
+    if (IS("perf.frameMs")) return OSAVal((double)frameDeltaMs);
+    if (IS("perf.frame")) {
         int targetFps = constrain(iN(0, 30), 1, 60);
         uint32_t targetMs = max((uint32_t)1,
                                 1000U / (uint32_t)targetFps);
@@ -4697,7 +4907,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
             while (elapsedMs < targetMs && !exitFlag) {
                 if (checkExitGesture() || checkOverlayGesture()) break;
                 uint32_t remaining = targetMs - elapsedMs;
-                delay((uint32_t)min((uint32_t)5, remaining));
+                delay(remaining > 4U ? 4U : 1U);
                 ::yield();
                 now = millis();
                 elapsedMs = now - frameLastMs;
@@ -4713,46 +4923,47 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         scriptLoopOpsTotal = 0;
         return OSAVal((double)frameFps);
     }
-    if (name == "theme")  return OSAVal((double)sysTheme);
-    if (name == "uptime") return OSAVal((double)(millis() / 1000));
-    if (name == "freeram") return OSAVal((double)ESP.getFreeHeap());
-    if (name == "sdready") return OSAVal(isSdReady ? 1.0 : 0.0);
-    if (name == "getbright") return OSAVal((double)sysBrightness);
-    if (name == "getwallpaper") return OSAVal(Config::get("wallpaper_path", ""));
-    if (name == "print") { Serial.println(S(0)); return OSAVal(); }
+    if (IS("theme"))  return OSAVal((double)sysTheme);
+    if (IS("uptime")) return OSAVal((double)(millis() / 1000));
+    if (IS("freeram")) return OSAVal((double)ESP.getFreeHeap());
+    if (IS("sdready")) return OSAVal(isSdReady ? 1.0 : 0.0);
+    if (IS("getbright")) return OSAVal((double)sysBrightness);
+    if (IS("getwallpaper")) return OSAVal(Config::get("wallpaper_path", ""));
+    if (IS("print")) { Serial.println(S(0)); return OSAVal(); }
 
     // ── Time (NTP-backed) ─────────────────────────────────────────────────────
     {
         bool needsTime =
-            name == "time.hour"  || name == "time.min"  || name == "time.sec" ||
-            name == "time.day"   || name == "time.month"|| name == "time.year"||
-            name == "time.weekday" || name == "time.now";
+            IS("time.hour")  || IS("time.min")  || IS("time.sec") ||
+            IS("time.day")   || IS("time.month")|| IS("time.year")||
+            IS("time.weekday") || IS("time.now");
         if (needsTime) {
             struct tm ti;
             if (!getLocalTime(&ti, 5)) return OSAVal(-1.0);
-            if (name == "time.hour")    return OSAVal((double)ti.tm_hour);
-            if (name == "time.min")     return OSAVal((double)ti.tm_min);
-            if (name == "time.sec")     return OSAVal((double)ti.tm_sec);
-            if (name == "time.day")     return OSAVal((double)ti.tm_mday);
-            if (name == "time.month")   return OSAVal((double)(ti.tm_mon + 1));
-            if (name == "time.year")    return OSAVal((double)(ti.tm_year + 1900));
-            if (name == "time.weekday") return OSAVal((double)ti.tm_wday);
-            if (name == "time.now") {
+            if (IS("time.hour"))    return OSAVal((double)ti.tm_hour);
+            if (IS("time.min"))     return OSAVal((double)ti.tm_min);
+            if (IS("time.sec"))     return OSAVal((double)ti.tm_sec);
+            if (IS("time.day"))     return OSAVal((double)ti.tm_mday);
+            if (IS("time.month"))   return OSAVal((double)(ti.tm_mon + 1));
+            if (IS("time.year"))    return OSAVal((double)(ti.tm_year + 1900));
+            if (IS("time.weekday")) return OSAVal((double)ti.tm_wday);
+            if (IS("time.now")) {
                 time_t t; time(&t); return OSAVal((double)t);
             }
         }
     }
-    if (name == "time.synced") return OSAVal(sysNtpSynced ? 1.0 : 0.0);
+    if (IS("time.synced")) return OSAVal(sysNtpSynced ? 1.0 : 0.0);
 
-    if (name == "notify") {
+    if (IS("notify")) {
         if (!checkPerm(OSA_PERM_NOTIFY, "Send Notifications",
                        "Show system notification banners"))
             return OSAVal();
-        extern void osa_notify(const char*);
-        osa_notify(S(0).c_str());
+        // Non-blocking strip along the top edge; Toast::poll() keeps it
+        // visible over script drawing and restores the panel when it expires.
+        Toast::show(tft, S(0));
         return OSAVal();
     }
-    if (name == "setbright") {
+    if (IS("setbright")) {
         if (!checkPerm(OSA_PERM_SYSTEM, "System Settings",
                        "Change screen brightness"))
             return OSAVal();
@@ -4760,7 +4971,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         analogWrite(21, sysBrightness); // TFT_BL
         return OSAVal();
     }
-    if (name == "setwallpaper") {
+    if (IS("setwallpaper")) {
         if (!checkPerm(OSA_PERM_SYSTEM, "System Settings",
                        "Change system wallpaper"))
             return OSAVal();
@@ -4768,9 +4979,9 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         Config::save();
         return OSAVal();
     }
-    if (name == "wifi.connected") return OSAVal(WiFi.status() == WL_CONNECTED ? 1.0 : 0.0);
-    if (name == "wifi.ssid") return OSAVal(WiFi.SSID());
-    if (name == "wifi.ip")   return OSAVal(WiFi.localIP().toString());
+    if (IS("wifi.connected")) return OSAVal(WiFi.status() == WL_CONNECTED ? 1.0 : 0.0);
+    if (IS("wifi.ssid")) return OSAVal(WiFi.SSID());
+    if (IS("wifi.ip"))   return OSAVal(WiFi.localIP().toString());
 
     // ── JSON path navigation ─────────────────────────────────────────────────
     // Use dotted paths; numeric segments index arrays.
@@ -4779,9 +4990,9 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     //   json.size(body, "choices")                  → element count
     static const String emptyJson;
     const String& jsonSource = (argc > 0 && !a[0].isNum) ? a[0].str : emptyJson;
-    if (name == "json.escape" || name == "json.quote") {
+    if (IS("json.escape") || IS("json.quote")) {
         const String& source = jsonSource;
-        size_t required = name == "json.quote" ? 2 : 0;
+        size_t required = IS("json.quote") ? 2 : 0;
         for (unsigned int i = 0; i < source.length(); ++i) {
             uint8_t c = (uint8_t)source[i];
             size_t add = (c == '"' || c == '\\' || c == '\n' || c == '\r' ||
@@ -4798,7 +5009,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
             s_ioError = "Not enough memory for escaped JSON";
             return OSAVal("");
         }
-        if (name == "json.quote") output += '"';
+        if (IS("json.quote")) output += '"';
         static const char hexDigits[] = "0123456789ABCDEF";
         for (unsigned int i = 0; i < source.length(); ++i) {
             uint8_t c = (uint8_t)source[i];
@@ -4817,32 +5028,32 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
                 output += (char)c;
             }
         }
-        if (name == "json.quote") output += '"';
+        if (IS("json.quote")) output += '"';
         return OSAVal(static_cast<String&&>(output));
     }
-    if (name == "json.get") {
+    if (IS("json.get")) {
         String raw = jsonWalkPath(jsonSource, S(1));
         return OSAVal(jsonUnquote(raw));
     }
-    if (name == "json.raw") {
+    if (IS("json.raw")) {
         // Returns the raw JSON fragment without unquoting — useful for nested
         // objects you want to feed back into json.get later.
         return OSAVal(jsonWalkPath(jsonSource, S(1)));
     }
-    if (name == "json.has") {
+    if (IS("json.has")) {
         return OSAVal(jsonWalkSpan(jsonSource, S(1)).valid() ? 1.0 : 0.0);
     }
-    if (name == "json.size") {
+    if (IS("json.size")) {
         JsonSpan span = jsonWalkSpan(jsonSource, S(1));
         return OSAVal(span.valid() ? (double)jsonContainerSize(jsonSource, span.start) : 0.0);
     }
 
     // ── HTTP (network permission) ────────────────────────────────────────────
-    if (name == "url_encode") return OSAVal(urlEncode(S(0)));
-    if (name == "url_decode") return OSAVal(urlDecode(S(0)));
-    if (name == "http.status") return OSAVal((double)s_httpStatus);
-    if (name == "http.error") return OSAVal(s_httpError);
-    if (name == "http.bearer") {
+    if (IS("url_encode")) return OSAVal(urlEncode(S(0)));
+    if (IS("url_decode")) return OSAVal(urlDecode(S(0)));
+    if (IS("http.status")) return OSAVal((double)s_httpStatus);
+    if (IS("http.error")) return OSAVal(s_httpError);
+    if (IS("http.bearer")) {
         if (!checkPerm(OSA_PERM_NETWORK, "Network",
                        "Send authenticated requests"))
             return OSAVal();
@@ -4854,7 +5065,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         s_httpBearer = static_cast<String&&>(a[0].str);
         return OSAVal();
     }
-    if (name == "http.get" || name == "http.post") {
+    if (IS("http.get") || IS("http.post")) {
         s_httpError = "";
         if (!checkPerm(OSA_PERM_NETWORK, "Network",
                        "Make HTTP requests over Wi-Fi"))
@@ -4878,11 +5089,11 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
             return OSAVal("");
         }
         size_t requestLength = 0;
-        if (name == "http.post" && argc >= 2) {
+        if (IS("http.post") && argc >= 2) {
             requestLength = a[1].isNum ? a[1].toString().length()
                                        : a[1].str.length();
         }
-        if (name == "http.post" && requestLength > OSA_HTTP_MAX_SEND) {
+        if (IS("http.post") && requestLength > OSA_HTTP_MAX_SEND) {
             s_httpStatus = -3;
             s_httpError = "HTTP request body too large";
             return OSAVal("");
@@ -4904,8 +5115,18 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         http.setConnectTimeout(8000);
         http.setTimeout(10000);
         WiFiClientSecure secureClient;
+        // Credentials apply to one request only. Reusing them automatically
+        // for a later, unrelated host could leak an API key.
+        String bearer = static_cast<String&&>(s_httpBearer);
+        s_httpBearer = "";
         bool ok = false;
         if (secure) {
+            String why;
+            if (!SecureHttp::memoryAvailable(why)) {
+                s_httpStatus = -4;
+                s_httpError = why;
+                return OSAVal("");
+            }
             secureClient.setInsecure(); // encrypted, but no server identity verification
             ok = http.begin(secureClient, url);
         } else {
@@ -4917,15 +5138,26 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
             return OSAVal("");
         }
 
-        // Credentials apply to one request only. Reusing them automatically
-        // for a later, unrelated host could leak an API key.
-        String bearer = static_cast<String&&>(s_httpBearer);
-        s_httpBearer = "";
         if (bearer.length() > 0)
             http.addHeader("Authorization", "Bearer " + bearer);
 
         int code;
-        if (name == "http.get") {
+        if (IS("http.get") && secure) {
+            // Shared transport: DNS pre-resolution, one retry and an error that
+            // names the real cause instead of HTTPClient's "connection refused".
+            SecureHttp::Request request;
+            request.attempts = 2;
+            request.connectTimeoutMs = 8000;
+            request.readTimeoutMs = 10000;
+            String why;
+            code = SecureHttp::get(http, secureClient, url, request, why);
+            if (code <= 0) {
+                s_httpStatus = code;
+                s_httpError = why;
+                http.end();
+                return OSAVal("");
+            }
+        } else if (IS("http.get")) {
             code = http.GET();
         } else {
             String body = (argc >= 2 && !a[1].isNum)
@@ -4966,6 +5198,8 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         }
         int received = http.writeToStream(&sink);
         http.end();
+        secureClient.stop();
+        HeapReserve::reclaim();
         if (sink.tooLarge()) {
             s_httpStatus = -3;
             s_httpError = "HTTP response exceeds 24576 byte limit";
@@ -4986,56 +5220,56 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
 
     // ── Math ─────────────────────────────────────────────────────────────────
 
-    if (name == "abs")    return OSAVal(fabs(N(0)));
-    if (name == "min")    return OSAVal(min(N(0), N(1)));
-    if (name == "max")    return OSAVal(max(N(0), N(1)));
-    if (name == "sqrt")   return OSAVal(sqrt(N(0)));
-    if (name == "sin")    return OSAVal(sin(N(0)));
-    if (name == "cos")    return OSAVal(cos(N(0)));
-    if (name == "asin")   return OSAVal(asin(max(-1.0, min(1.0, N(0)))));
-    if (name == "acos")   return OSAVal(acos(max(-1.0, min(1.0, N(0)))));
-    if (name == "atan")   return OSAVal(atan(N(0)));
-    if (name == "floor")  return OSAVal(floor(N(0)));
-    if (name == "ceil")   return OSAVal(ceil(N(0)));
-    if (name == "int")    return OSAVal((double)(int)N(0));
-    if (name == "pow")    return OSAVal(pow(N(0), N(1)));
-    if (name == "round")  return OSAVal(::round(N(0)));
-    if (name == "log")    return OSAVal(log(N(0)));
-    if (name == "exp")    return OSAVal(exp(N(0)));
-    if (name == "tan")    return OSAVal(tan(N(0)));
-    if (name == "atan2")  return OSAVal(atan2(N(0), N(1)));
-    if (name == "hypot")  return OSAVal(hypot(N(0), N(1)));
-    if (name == "sign") {
+    if (IS("abs"))    return OSAVal(fabs(N(0)));
+    if (IS("min"))    return OSAVal(min(N(0), N(1)));
+    if (IS("max"))    return OSAVal(max(N(0), N(1)));
+    if (IS("sqrt"))   return OSAVal(sqrt(N(0)));
+    if (IS("sin"))    return OSAVal(sin(N(0)));
+    if (IS("cos"))    return OSAVal(cos(N(0)));
+    if (IS("asin"))   return OSAVal(asin(max(-1.0, min(1.0, N(0)))));
+    if (IS("acos"))   return OSAVal(acos(max(-1.0, min(1.0, N(0)))));
+    if (IS("atan"))   return OSAVal(atan(N(0)));
+    if (IS("floor"))  return OSAVal(floor(N(0)));
+    if (IS("ceil"))   return OSAVal(ceil(N(0)));
+    if (IS("int"))    return OSAVal((double)(int)N(0));
+    if (IS("pow"))    return OSAVal(pow(N(0), N(1)));
+    if (IS("round"))  return OSAVal(::round(N(0)));
+    if (IS("log"))    return OSAVal(log(N(0)));
+    if (IS("exp"))    return OSAVal(exp(N(0)));
+    if (IS("tan"))    return OSAVal(tan(N(0)));
+    if (IS("atan2"))  return OSAVal(atan2(N(0), N(1)));
+    if (IS("hypot"))  return OSAVal(hypot(N(0), N(1)));
+    if (IS("sign")) {
         double value = N(0);
         return OSAVal(value > 0 ? 1.0 : (value < 0 ? -1.0 : 0.0));
     }
-    if (name == "fract") {
+    if (IS("fract")) {
         double value = N(0);
         return OSAVal(value - floor(value));
     }
-    if (name == "radians") return OSAVal(N(0) * 0.017453292519943295);
-    if (name == "degrees") return OSAVal(N(0) * 57.29577951308232);
-    if (name == "dist") {
+    if (IS("radians")) return OSAVal(N(0) * 0.017453292519943295);
+    if (IS("degrees")) return OSAVal(N(0) * 57.29577951308232);
+    if (IS("dist")) {
         double dx = N(2) - N(0), dy = N(3) - N(1);
         return OSAVal(hypot(dx, dy));
     }
-    if (name == "angle")
+    if (IS("angle"))
         return OSAVal(atan2(N(3) - N(1), N(2) - N(0)));
-    if (name == "map") {
+    if (IS("map")) {
         double value = N(0), inputMin = N(1), inputMax = N(2);
         double outputMin = N(3), outputMax = N(4);
         if (inputMax == inputMin) return OSAVal(outputMin);
         return OSAVal(outputMin + (value - inputMin) *
                       (outputMax - outputMin) / (inputMax - inputMin));
     }
-    if (name == "smoothstep") {
+    if (IS("smoothstep")) {
         double edge0 = N(0), edge1 = N(1);
         if (edge0 == edge1) return OSAVal(N(2) < edge0 ? 0.0 : 1.0);
         double t = (N(2) - edge0) / (edge1 - edge0);
         t = max(0.0, min(1.0, t));
         return OSAVal(t * t * (3.0 - 2.0 * t));
     }
-    if (name == "wrap") {
+    if (IS("wrap")) {
         double value = N(0), minimum = N(1), maximum = N(2);
         double range = maximum - minimum;
         if (range <= 0.0) return OSAVal(minimum);
@@ -5043,17 +5277,17 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         if (wrapped < 0.0) wrapped += range;
         return OSAVal(minimum + wrapped);
     }
-    if (name == "approach") {
+    if (IS("approach")) {
         double current = N(0), target = N(1), amount = fabs(N(2));
         if (current < target) return OSAVal(min(current + amount, target));
         if (current > target) return OSAVal(max(current - amount, target));
         return OSAVal(target);
     }
-    if (name == "lerp") {
+    if (IS("lerp")) {
         double first = N(0), second = N(1), amount = N(2);
         return OSAVal(first + (second - first) * amount);
     }
-    if (name == "clamp") {
+    if (IS("clamp")) {
         double value = N(0), minimum = N(1), maximum = N(2);
         if (minimum > maximum) {
             double swap = minimum;
@@ -5062,7 +5296,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         }
         return OSAVal(max(minimum, min(maximum, value)));
     }
-    if (name == "ease") {
+    if (IS("ease")) {
         double amount = max(0.0, min(1.0, N(0)));
         switch (iN(1)) {
             case 1: return OSAVal(amount * amount);
@@ -5082,21 +5316,21 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
             default: return OSAVal(amount);
         }
     }
-    if (name == "finite")
+    if (IS("finite"))
         return OSAVal(isfinite(N(0)) ? 1.0 : 0.0);
-    if (name == "random") {
+    if (IS("random")) {
         if (argc < 2) return OSAVal((double)random((long)N(0)));
         return OSAVal((double)random((long)N(0), (long)N(1)));
     }
-    if (name == "randomf") {
+    if (IS("randomf")) {
         double minimum = argc >= 2 ? N(0) : 0.0;
         double maximum = argc >= 2 ? N(1) : N(0, 1);
         double unit = (double)(uint32_t)esp_random() / 4294967295.0;
         return OSAVal(minimum + (maximum - minimum) * unit);
     }
-    if (name == "noise" || name == "noise2") {
+    if (IS("noise") || IS("noise2")) {
         double inputX = N(0);
-        double inputY = name == "noise2" ? N(1) : 0.0;
+        double inputY = IS("noise2") ? N(1) : 0.0;
         if (!isfinite(inputX)) inputX = 0.0;
         if (!isfinite(inputY)) inputY = 0.0;
         inputX = max(-1000000.0, min(1000000.0, inputX));
@@ -5123,35 +5357,35 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         float bottom = b0 + (b1 - b0) * tx;
         return OSAVal((double)(top + (bottom - top) * ty));
     }
-    if (name == "pi") return OSAVal(3.14159265358979);
-    if (name == "tau") return OSAVal(6.283185307179586);
+    if (IS("pi")) return OSAVal(3.14159265358979);
+    if (IS("tau")) return OSAVal(6.283185307179586);
 
     // ── String ───────────────────────────────────────────────────────────────
 
-    if (name == "str")       return OSAVal(a[0].toString());
-    if (name == "num")       return OSAVal(S(0).toDouble());
-    if (name == "len")       return OSAVal((double)S(0).length());
-    if (name == "upper")     { String s = S(0); s.toUpperCase(); return OSAVal(s); }
-    if (name == "lower")     { String s = S(0); s.toLowerCase(); return OSAVal(s); }
-    if (name == "trim")      { String s = S(0); s.trim(); return OSAVal(s); }
-    if (name == "substr")    return OSAVal(S(0).substring(iN(1), iN(1) + iN(2)));
-    if (name == "replace")   { String s = S(0); s.replace(S(1), S(2)); return OSAVal(s); }
-    if (name == "contains")  return OSAVal(S(0).indexOf(S(1)) >= 0 ? 1.0 : 0.0);
-    if (name == "startswith")return OSAVal(S(0).startsWith(S(1)) ? 1.0 : 0.0);
-    if (name == "endswith")  return OSAVal(S(0).endsWith(S(1)) ? 1.0 : 0.0);
-    if (name == "indexof")   return OSAVal((double)S(0).indexOf(S(1)));
-    if (name == "lastindexof") return OSAVal((double)S(0).lastIndexOf(S(1)));
-    if (name == "left") {
+    if (IS("str"))       return OSAVal(a[0].toString());
+    if (IS("num"))       return OSAVal(S(0).toDouble());
+    if (IS("len"))       return OSAVal((double)S(0).length());
+    if (IS("upper"))     { String s = S(0); s.toUpperCase(); return OSAVal(s); }
+    if (IS("lower"))     { String s = S(0); s.toLowerCase(); return OSAVal(s); }
+    if (IS("trim"))      { String s = S(0); s.trim(); return OSAVal(s); }
+    if (IS("substr"))    return OSAVal(S(0).substring(iN(1), iN(1) + iN(2)));
+    if (IS("replace"))   { String s = S(0); s.replace(S(1), S(2)); return OSAVal(s); }
+    if (IS("contains"))  return OSAVal(S(0).indexOf(S(1)) >= 0 ? 1.0 : 0.0);
+    if (IS("startswith"))return OSAVal(S(0).startsWith(S(1)) ? 1.0 : 0.0);
+    if (IS("endswith"))  return OSAVal(S(0).endsWith(S(1)) ? 1.0 : 0.0);
+    if (IS("indexof"))   return OSAVal((double)S(0).indexOf(S(1)));
+    if (IS("lastindexof")) return OSAVal((double)S(0).lastIndexOf(S(1)));
+    if (IS("left")) {
         String source = S(0);
         return OSAVal(source.substring(0, min((int)source.length(),
                                               max(0, iN(1)))));
     }
-    if (name == "right") {
+    if (IS("right")) {
         String source = S(0);
         int length = min((int)source.length(), max(0, iN(1)));
         return OSAVal(source.substring(source.length() - length));
     }
-    if (name == "slice") {
+    if (IS("slice")) {
         String source = S(0);
         int length = (int)source.length();
         int start = iN(1), end = iN(2, length);
@@ -5162,7 +5396,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         if (end < start) end = start;
         return OSAVal(source.substring(start, end));
     }
-    if (name == "count") {
+    if (IS("count")) {
         String source = S(0), needle = S(1);
         if (needle.length() == 0) return OSAVal(0.0);
         int found = 0, position = 0;
@@ -5174,13 +5408,13 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         }
         return OSAVal((double)found);
     }
-    if (name == "char")      { char c = (char)iN(0); return OSAVal(String(c)); }
-    if (name == "code") {
+    if (IS("char"))      { char c = (char)iN(0); return OSAVal(String(c)); }
+    if (IS("code")) {
         String source = S(0);
         return OSAVal(source.length() == 0 ? 0.0 :
                       (double)(unsigned char)source[0]);
     }
-    if (name == "isnumber") {
+    if (IS("isnumber")) {
         String source = S(0);
         source.trim();
         if (source.length() == 0) return OSAVal(0.0);
@@ -5188,7 +5422,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         strtod(source.c_str(), &end);
         return OSAVal(end && *end == '\0' ? 1.0 : 0.0);
     }
-    if (name == "hex") {
+    if (IS("hex")) {
         uint32_t value = (uint32_t)N(0);
         int digits = constrain(iN(1, 0), 0, 8);
         char output[9];
@@ -5198,7 +5432,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
                                  (unsigned long)value);
         return OSAVal(String(output));
     }
-    if (name == "unhex") {
+    if (IS("unhex")) {
         String source = S(0);
         source.trim();
         if (source.startsWith("#")) source.remove(0, 1);
@@ -5209,7 +5443,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
             if (!isxdigit((unsigned char)source[i])) return OSAVal(0.0);
         return OSAVal((double)strtoul(source.c_str(), nullptr, 16));
     }
-    if (name == "split") {
+    if (IS("split")) {
         String source = S(0), delimiter = S(1);
         int wanted = iN(2);
         if (wanted < 0 || delimiter.length() == 0) return OSAVal("");
@@ -5225,7 +5459,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         }
         return OSAVal("");
     }
-    if (name == "splitcount") {
+    if (IS("splitcount")) {
         String source = S(0), delimiter = S(1);
         if (delimiter.length() == 0) return OSAVal(0.0);
         int pieces = 1, start = 0;
@@ -5240,8 +5474,8 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
 
     // ── File I/O (sandboxed to /apps/<appname>/) ──────────────────────────────
 
-    if (name == "io.error") return OSAVal(s_ioError);
-    if (name == "asset.path") {
+    if (IS("io.error")) return OSAVal(s_ioError);
+    if (IS("asset.path")) {
         s_ioError = "";
         String path = packageAssetPath(S(0));
         if (path.length() == 0 || !SD.exists(path.c_str())) {
@@ -5250,11 +5484,11 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         }
         return OSAVal(static_cast<String&&>(path));
     }
-    if (name == "asset.exists") {
+    if (IS("asset.exists")) {
         String path = packageAssetPath(S(0));
         return OSAVal(path.length() > 0 && SD.exists(path.c_str()) ? 1.0 : 0.0);
     }
-    if (name == "asset.size") {
+    if (IS("asset.size")) {
         s_ioError = "";
         String path = packageAssetPath(S(0));
         File f = path.length() > 0 ? SD.open(path) : File();
@@ -5267,7 +5501,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         f.close();
         return OSAVal(size);
     }
-    if (name == "asset.read") {
+    if (IS("asset.read")) {
         String path = packageAssetPath(S(0));
         if (path.length() == 0) { s_ioError = "Invalid package asset path"; return OSAVal(""); }
         size_t offset = (size_t)max(0, iN(1));
@@ -5278,7 +5512,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
             return OSAVal("");
         return OSAVal(static_cast<String&&>(content));
     }
-    if (name == "fsize") {
+    if (IS("fsize")) {
         s_ioError = "";
         if (!isSdReady) { s_ioError = "No SD card"; return OSAVal(-1.0); }
         File f = SD.open(sandboxPath(S(0)));
@@ -5291,7 +5525,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         f.close();
         return OSAVal(size);
     }
-    if (name == "fread") {
+    if (IS("fread")) {
         if (!isSdReady) { s_ioError = "No SD card"; return OSAVal(""); }
         size_t offset = (size_t)max(0, iN(1));
         bool explicitLength = argc >= 3;
@@ -5301,7 +5535,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
                              explicitLength, content)) return OSAVal("");
         return OSAVal(static_cast<String&&>(content));
     }
-    if (name == "freadline") {
+    if (IS("freadline")) {
         s_ioError = "";
         if (!isSdReady) { s_ioError = "No SD card"; return OSAVal(""); }
         File f = SD.open(sandboxPath(S(0)));
@@ -5320,30 +5554,30 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         }
         f.close(); return OSAVal("");
     }
-    if (name == "fwrite") {
+    if (IS("fwrite")) {
         if (!isSdReady) return OSAVal(0.0);
         String p = sandboxPath(S(0));
         SD.remove(p.c_str());
         File f = SD.open(p, FILE_WRITE); if (!f) return OSAVal(0.0);
         f.print(S(1)); f.close(); return OSAVal(1.0);
     }
-    if (name == "fappend") {
+    if (IS("fappend")) {
         if (!isSdReady) return OSAVal(0.0);
         File f = SD.open(sandboxPath(S(0)), FILE_APPEND); if (!f) return OSAVal(0.0);
         f.println(S(1)); f.close(); return OSAVal(1.0);
     }
-    if (name == "fexists") {
+    if (IS("fexists")) {
         if (!isSdReady) return OSAVal(0.0);
         return OSAVal(SD.exists(sandboxPath(S(0)).c_str()) ? 1.0 : 0.0);
     }
-    if (name == "fremove") {
+    if (IS("fremove")) {
         if (!isSdReady) return OSAVal(0.0);
         return OSAVal(SD.remove(sandboxPath(S(0)).c_str()) ? 1.0 : 0.0);
     }
 
     // ── String formatting ────────────────────────────────────────────────────
 
-    if (name == "repeat") {
+    if (IS("repeat")) {
         String src = S(0); int n = iN(1);
         if (n <= 0) return OSAVal("");
         size_t wanted = (size_t)src.length() * (size_t)n;
@@ -5354,7 +5588,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         for (int i = 0; i < n; i++) out += src;
         return OSAVal(out);
     }
-    if (name == "padleft" || name == "padright") {
+    if (IS("padleft") || IS("padright")) {
         String src = S(0); int n = iN(1);
         if (n < 0 || n > 32768) return OSAVal("");
         String chS = (argc >= 3) ? S(2) : " ";
@@ -5362,14 +5596,14 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         if ((int)src.length() >= n) return OSAVal(src);
         String pad; pad.reserve(n - src.length());
         for (int i = 0; i < n - (int)src.length(); i++) pad += ch;
-        return OSAVal(name == "padleft" ? pad + src : src + pad);
+        return OSAVal(IS("padleft") ? pad + src : src + pad);
     }
 
     // ── Per-app key-value storage (sandboxed) ────────────────────────────────
     // Stored as INI lines in /apps/<name>/_kv.ini
-    if (name == "kv.get" || name == "kv.set" || name == "kv.del") {
+    if (IS("kv.get") || IS("kv.set") || IS("kv.del")) {
         if (!isSdReady) {
-            return (name == "kv.get") ? OSAVal(S(1, "")) : OSAVal(0.0);
+            return (IS("kv.get")) ? OSAVal(S(1, "")) : OSAVal(0.0);
         }
         String kvPath = sandboxPath("_kv.ini");
         String key = S(0);
@@ -5392,14 +5626,14 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         }
 
         // get → return matching value or default
-        if (name == "kv.get") {
+        if (IS("kv.get")) {
             for (int i = 0; i < kvCount; i++)
                 if (keys[i] == key) return OSAVal(vals[i]);
             return OSAVal(S(1, ""));
         }
 
         // mutate
-        if (name == "kv.set") {
+        if (IS("kv.set")) {
             String value = a[1].toString();
             bool found = false;
             for (int i = 0; i < kvCount; i++) {
@@ -5433,7 +5667,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     // ── input(prompt, default, [multiLine]) → modal text via OSKeyboard ──────
     // When multiLine != 0, Enter appends '\n' and a "Done" button in the
     // header confirms. Otherwise Enter confirms (single-line).
-    if (name == "input") {
+    if (IS("input")) {
         String prompt = S(0);
         String buf    = S(1, "");
         bool   multi  = (argc >= 3) ? (iN(2) != 0) : false;
@@ -5540,7 +5774,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     // ═════════════════════════════════════════════════════════════════════════
 
     // ui.header(title) — paints a standard top bar so apps look consistent.
-    if (name == "ui.header") {
+    if (IS("ui.header")) {
         tft->fillRect(0, 0, 240, 40, Theme::header());
         tft->drawFastHLine(0, 40, 240, Theme::divider());
         tft->setTextFont(2); tft->setTextSize(1);
@@ -5550,7 +5784,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     }
 
     // ui.alert(title, body) — OK popup, blocks until acknowledged.
-    if (name == "ui.alert") {
+    if (IS("ui.alert")) {
         showSystemPopup(S(0), S(1), "", "", "OK", false);
         return OSAVal();
     }
@@ -5558,7 +5792,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     // ui.menu(itemsPiped, title) — vertical list, returns selected index or -1
     // when user swipes up from the bottom edge to cancel.
     //   ui.menu("Display|Wi-Fi|About", "Settings")
-    if (name == "ui.menu") {
+    if (IS("ui.menu")) {
         String items_str = S(0);
         String title     = (argc >= 2) ? S(1) : String("Menu");
         bool   showBack  = (argc >= 3) ? (iN(2) != 0) : false;
@@ -5666,7 +5900,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     }
 
     // ui.slider(label, min, max, val) → new value, or -1 on Cancel
-    if (name == "ui.slider") {
+    if (IS("ui.slider")) {
         String label = S(0);
         int minV = iN(1), maxV = iN(2);
         int val  = constrain(iN(3), minV, maxV);
@@ -5725,7 +5959,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     }
 
     // ui.toggle(label, state) → new state (0/1), or -1 on Cancel
-    if (name == "ui.toggle") {
+    if (IS("ui.toggle")) {
         String label = S(0);
         int state = iN(1) ? 1 : 0;
         const int sw = 120, sh = 60, sx = (240 - sw) / 2, sy = 110;
@@ -5786,7 +6020,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     //   ui.menuRow("Bluetooth", "B",  0, 122, 255, "OFF >")
     //   var pick = ui.menuShow()
     {
-        if (name == "ui.menuStart") {
+        if (IS("ui.menuStart")) {
             // Optional second arg: showBack (1 = draw "< Back" in header).
             // Defaults to 0 so the root menu doesn't get an unwanted button.
             clearRichMenuCache();
@@ -5795,7 +6029,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
             s_rmCount    = 0;
             return OSAVal();
         }
-        if (name == "ui.menuRow") {
+        if (IS("ui.menuRow")) {
             // (title, letter, r, g, b, value)
             if (s_rmCount >= RICH_MAX_ROWS) return OSAVal();
             s_rmTitles [s_rmCount] = S(0);
@@ -5805,7 +6039,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
             s_rmCount++;
             return OSAVal();
         }
-        if (name == "ui.menuShow") {
+        if (IS("ui.menuShow")) {
             const int headerH    = s_rmShowBack ? 50 : 40;
             const int rowH       = 31;
             // Use the full screen below the header. The last row may be
@@ -5817,8 +6051,12 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
             const int maxScroll  = scrollable ? (contentH - viewportH) : 0;
             int scrollY = 0;
 
-            auto paint = [&]() {
-                tft->fillScreen(Theme::bg());
+            // Rows are opaque and contiguous, and a scrollable list always
+            // reaches past the bottom edge, so a scroll repaint only needs the
+            // rows, header and scrollbar. Clearing the whole panel first
+            // (30 ms of SPI) produced a visible flash on every drag step.
+            auto paint = [&](bool clearAll) {
+                if (clearAll) tft->fillScreen(Theme::bg());
 
                 // Render rows first so a partially-scrolled row that overlaps
                 // the header area can be hidden by repainting the header on top.
@@ -5864,7 +6102,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
                 }
             };
 
-            paint();
+            paint(true);
             enforceTapGap(ts);
             waitFullRelease(ts);
 
@@ -5900,7 +6138,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
                             if (newScroll > maxScroll) newScroll = maxScroll;
                             if (newScroll != scrollY) {
                                 scrollY = newScroll;
-                                paint();
+                                paint(false);
                             }
                         }
                         lastY = ty;
@@ -5929,7 +6167,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
 
     // ui.backHeader(title) — paints the standard "< Back  TITLE" 50-px bar
     // used by every Settings sub-screen.
-    if (name == "ui.backHeader") {
+    if (IS("ui.backHeader")) {
         tft->fillRect(0, 0, 240, 50, Theme::header());
         tft->drawFastHLine(0, 50, 240, Theme::divider());
         tft->setTextFont(2); tft->setTextSize(1);
@@ -5943,7 +6181,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     // ui.backTapped() — non-blocking check whether the user just tapped the
     // top-left "< Back" hot zone (x<80, y<50). Use in scripts that paint a
     // custom sub-screen and run their own touch loop.
-    if (name == "ui.backTapped") {
+    if (IS("ui.backTapped")) {
         if (!ts->touched()) return OSAVal(0.0);
         TS_Point p = ts->getPoint();
         int tx = map(p.x, 300, 3800, 0, 240);
@@ -5953,7 +6191,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
 
     // ui.segmented(label, "Opt1|Opt2|...", current) — iOS-style segmented
     // control on a full screen, returns selected index or -1 on Cancel.
-    if (name == "ui.segmented") {
+    if (IS("ui.segmented")) {
         String label = S(0);
         String opts  = S(1);
         int    cur   = iN(2);
@@ -6027,7 +6265,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
 
     // ui.numpad(prompt, maxDigits) → entered string (digits only) or "" on cancel
     // 3x4 grid: 1-9, "<" (backspace), 0, ">" (confirm).
-    if (name == "ui.numpad") {
+    if (IS("ui.numpad")) {
         String prompt    = S(0);
         int    maxDigits = (argc >= 2) ? iN(1) : 8;
         if (maxDigits < 1) maxDigits = 1;
@@ -6150,23 +6388,23 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
 
     // OpenStore package API. Installation is restricted to a trusted system
     // app and still requires an explicit confirmation on the device.
-    if (name == "store.catalog") {
+    if (IS("store.catalog")) {
         if (!needException("store.catalog")) return OSAVal("");
         return OSAVal(PackageManager::fetchCatalog());
     }
-    if (name == "store.source") {
+    if (IS("store.source")) {
         if (!needException("store.source")) return OSAVal("");
         return OSAVal(PackageManager::catalogSourceUrl());
     }
-    if (name == "store.setSource") {
+    if (IS("store.setSource")) {
         if (!needException("store.setSource")) return OSAVal(0.0);
         return OSAVal(PackageManager::setCatalogSourceUrl(S(0)) ? 1.0 : 0.0);
     }
-    if (name == "store.systemSource") {
+    if (IS("store.systemSource")) {
         if (!needException("store.systemSource")) return OSAVal("");
         return OSAVal(PackageManager::systemPackageSourcePrefix());
     }
-    if (name == "store.setSystemSource") {
+    if (IS("store.setSystemSource")) {
         if (!needException("store.setSystemSource")) return OSAVal(0.0);
         String prefix = S(0);
         if (!showSystemPopup("System package source", prefix,
@@ -6174,49 +6412,49 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
                              "Cancel", "Change", true)) return OSAVal(0.0);
         return OSAVal(PackageManager::setSystemPackageSourcePrefix(prefix) ? 1.0 : 0.0);
     }
-    if (name == "store.refresh") {
+    if (IS("store.refresh")) {
         if (!needException("store.refresh")) return OSAVal(-1.0);
         return OSAVal(PackageManager::refreshCatalog()
                     ? (double)PackageManager::catalogCount() : -1.0);
     }
-    if (name == "store.count") {
+    if (IS("store.count")) {
         if (!needException("store.count")) return OSAVal(0.0);
         return OSAVal((double)PackageManager::catalogCount());
     }
-    if (name == "store.visibleCount") {
+    if (IS("store.visibleCount")) {
         if (!needException("store.visibleCount")) return OSAVal(0.0);
         return OSAVal((double)PackageManager::catalogVisibleCount(iN(0) != 0));
     }
-    if (name == "store.visibleItem") {
+    if (IS("store.visibleItem")) {
         if (!needException("store.visibleItem")) return OSAVal(-1.0);
         return OSAVal((double)PackageManager::catalogVisibleIndex(
             iN(0) != 0, iN(1)));
     }
-    if (name == "store.state") {
+    if (IS("store.state")) {
         if (!needException("store.state")) return OSAVal(0.0);
         return OSAVal((double)PackageManager::catalogItemState(iN(0)));
     }
-    if (name == "store.minSdk") {
+    if (IS("store.minSdk")) {
         if (!needException("store.minSdk")) return OSAVal(1.0);
         return OSAVal((double)PackageManager::catalogMinSdk(iN(0)));
     }
-    if (name == "store.minOpenOS") {
+    if (IS("store.minOpenOS")) {
         if (!needException("store.minOpenOS")) return OSAVal(1.0);
         return OSAVal((double)PackageManager::catalogMinOpenOS(iN(0)));
     }
-    if (name == "store.compatible") {
+    if (IS("store.compatible")) {
         if (!needException("store.compatible")) return OSAVal(0.0);
         return OSAVal(PackageManager::catalogCompatible(iN(0)) ? 1.0 : 0.0);
     }
-    if (name == "store.requirement") {
+    if (IS("store.requirement")) {
         if (!needException("store.requirement")) return OSAVal("");
         return OSAVal(PackageManager::catalogRequirement(iN(0)));
     }
-    if (name == "store.updateCount") {
+    if (IS("store.updateCount")) {
         if (!needException("store.updateCount")) return OSAVal(0.0);
         return OSAVal((double)PackageManager::catalogUpdateCount());
     }
-    if (name == "store.updateAll") {
+    if (IS("store.updateAll")) {
         if (!needException("store.updateAll")) return OSAVal(-1.0);
         int total = PackageManager::catalogUpdateCount();
         if (total <= 0) return OSAVal(0.0);
@@ -6267,71 +6505,71 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         }
         return OSAVal((double)completed);
     }
-    if (name == "store.canUninstall") {
+    if (IS("store.canUninstall")) {
         if (!needException("store.canUninstall")) return OSAVal(0.0);
         return OSAVal(PackageManager::catalogCanUninstall(iN(0)) ? 1.0 : 0.0);
     }
-    if (name == "store.id") {
+    if (IS("store.id")) {
         if (!needException("store.id")) return OSAVal("");
         return OSAVal(PackageManager::catalogId(iN(0)));
     }
-    if (name == "store.name") {
+    if (IS("store.name")) {
         if (!needException("store.name")) return OSAVal("");
         return OSAVal(PackageManager::catalogName(iN(0)));
     }
-    if (name == "store.remoteVersion") {
+    if (IS("store.remoteVersion")) {
         if (!needException("store.remoteVersion")) return OSAVal("");
         return OSAVal(PackageManager::catalogVersion(iN(0)));
     }
-    if (name == "store.remoteVersionCode") {
+    if (IS("store.remoteVersionCode")) {
         if (!needException("store.remoteVersionCode")) return OSAVal(0.0);
         return OSAVal((double)PackageManager::catalogVersionCode(iN(0)));
     }
-    if (name == "store.scope") {
+    if (IS("store.scope")) {
         if (!needException("store.scope")) return OSAVal("");
         return OSAVal(PackageManager::catalogScope(iN(0)));
     }
-    if (name == "store.summary") {
+    if (IS("store.summary")) {
         if (!needException("store.summary")) return OSAVal("");
         return OSAVal(PackageManager::catalogSummary(iN(0)));
     }
-    if (name == "store.developer" || name == "store.owner") {
+    if (IS("store.developer") || IS("store.owner")) {
         if (!needException("store.developer")) return OSAVal("");
         return OSAVal(PackageManager::catalogDeveloper(iN(0)));
     }
-    if (name == "store.description") {
+    if (IS("store.description")) {
         if (!needException("store.description")) return OSAVal("");
         return OSAVal(PackageManager::catalogDescription(iN(0)));
     }
-    if (name == "store.color") {
+    if (IS("store.color")) {
         if (!needException("store.color")) return OSAVal(0.0);
         return OSAVal((double)PackageManager::catalogColor(iN(0)));
     }
-    if (name == "store.url") {
+    if (IS("store.url")) {
         if (!needException("store.url")) return OSAVal("");
         return OSAVal(PackageManager::catalogUrl(iN(0)));
     }
-    if (name == "store.sha256") {
+    if (IS("store.sha256")) {
         if (!needException("store.sha256")) return OSAVal("");
         return OSAVal(PackageManager::catalogSha256(iN(0)));
     }
-    if (name == "store.error") {
+    if (IS("store.error")) {
         if (!needException("store.error")) return OSAVal("");
         return OSAVal(PackageManager::lastError());
     }
-    if (name == "store.versionCode") {
+    if (IS("store.versionCode")) {
         if (!needException("store.versionCode")) return OSAVal(0.0);
         return OSAVal((double)PackageManager::installedVersionCode(S(0)));
     }
-    if (name == "store.version") {
+    if (IS("store.version")) {
         if (!needException("store.version")) return OSAVal("");
         return OSAVal(PackageManager::installedVersion(S(0)));
     }
-    if (name == "store.restartRequired") {
+    if (IS("store.restartRequired")) {
         if (!needException("store.restartRequired")) return OSAVal(0.0);
         return OSAVal(PackageManager::restartRequired() ? 1.0 : 0.0);
     }
-    if (name == "store.install") {
+    if (IS("store.install")) {
         if (!needException("store.install")) return OSAVal(0.0);
         String id = S(2);
         String scope = argc >= 4 ? S(3) : "user";
@@ -6365,7 +6603,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         bool ok = PackageManager::installFromUrl(S(0), S(1), id, scope);
         return OSAVal(ok ? 1.0 : 0.0);
     }
-    if (name == "store.remove") {
+    if (IS("store.remove")) {
         if (!needException("store.remove")) return OSAVal(0.0);
         String id = S(0);
         String label = argc >= 2 ? S(1) : id;
@@ -6380,57 +6618,57 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     // configured feed; URL, target, hash and signature are never accepted as
     // install arguments. Every manifest is verified by the embedded release
     // key and every mutating action retains a native physical confirmation.
-    if (name == "ota.supported") {
+    if (IS("ota.supported")) {
         if (!needException("ota.supported")) return OSAVal(0.0);
         return OSAVal(FirmwareUpdate::supported() ? 1.0 : 0.0);
     }
-    if (name == "ota.check") {
+    if (IS("ota.check")) {
         if (!needException("ota.check")) return OSAVal(-1.0);
         clearRichMenuCache();
         PackageManager::clearCatalog();
         return OSAVal((double)FirmwareUpdate::check());
     }
-    if (name == "ota.available") {
+    if (IS("ota.available")) {
         if (!needException("ota.available")) return OSAVal(0.0);
         return OSAVal(FirmwareUpdate::available() ? 1.0 : 0.0);
     }
-    if (name == "ota.name") {
+    if (IS("ota.name")) {
         if (!needException("ota.name")) return OSAVal("");
         return OSAVal(FirmwareUpdate::remoteName());
     }
-    if (name == "ota.version") {
+    if (IS("ota.version")) {
         if (!needException("ota.version")) return OSAVal("");
         return OSAVal(FirmwareUpdate::remoteVersion());
     }
-    if (name == "ota.versionCode") {
+    if (IS("ota.versionCode")) {
         if (!needException("ota.versionCode")) return OSAVal(0.0);
         return OSAVal((double)FirmwareUpdate::remoteVersionCode());
     }
-    if (name == "ota.channel") {
+    if (IS("ota.channel")) {
         if (!needException("ota.channel")) return OSAVal("");
         return OSAVal(FirmwareUpdate::releaseChannel());
     }
-    if (name == "ota.type") {
+    if (IS("ota.type")) {
         if (!needException("ota.type")) return OSAVal("");
         return OSAVal(FirmwareUpdate::releaseType());
     }
-    if (name == "ota.description" || name == "ota.notes") {
+    if (IS("ota.description") || IS("ota.notes")) {
         if (!needException("ota.description")) return OSAVal("");
         return OSAVal(FirmwareUpdate::releaseDescription());
     }
-    if (name == "ota.publishedAt") {
+    if (IS("ota.publishedAt")) {
         if (!needException("ota.publishedAt")) return OSAVal("");
         return OSAVal(FirmwareUpdate::publishedAt());
     }
-    if (name == "ota.size") {
+    if (IS("ota.size")) {
         if (!needException("ota.size")) return OSAVal(0.0);
         return OSAVal((double)FirmwareUpdate::downloadSize());
     }
-    if (name == "ota.source") {
+    if (IS("ota.source")) {
         if (!needException("ota.source")) return OSAVal("");
         return OSAVal(FirmwareUpdate::sourceUrl());
     }
-    if (name == "ota.setSource") {
+    if (IS("ota.setSource")) {
         if (!needSettingsOta("ota.setSource")) return OSAVal(0.0);
         String source = S(0);
         String shown = source.length() > 0 ? source : String("Official OpenStore feed");
@@ -6439,11 +6677,11 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
                              "Cancel", "Change", true)) return OSAVal(0.0);
         return OSAVal(FirmwareUpdate::setSourceUrl(source) ? 1.0 : 0.0);
     }
-    if (name == "ota.error") {
+    if (IS("ota.error")) {
         if (!needException("ota.error")) return OSAVal("");
         return OSAVal(FirmwareUpdate::lastError());
     }
-    if (name == "ota.install") {
+    if (IS("ota.install")) {
         if (!needSettingsOta("ota.install")) return OSAVal(0.0);
         if (!FirmwareUpdate::available()) {
             return OSAVal(0.0);
@@ -6467,11 +6705,11 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         ESP.restart();
         return OSAVal(1.0);
     }
-    if (name == "ota.canRollback") {
+    if (IS("ota.canRollback")) {
         if (!needException("ota.canRollback")) return OSAVal(0.0);
         return OSAVal(FirmwareUpdate::canRollback() ? 1.0 : 0.0);
     }
-    if (name == "ota.rollback") {
+    if (IS("ota.rollback")) {
         if (!needSettingsOta("ota.rollback")) return OSAVal(0.0);
         if (!showSystemPopup("Restore previous firmware?", "Previous OTA slot",
                              "The device will restart immediately",
@@ -6483,7 +6721,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     }
 
     // sys.* — system mutation
-    if (name == "sys.brightness") {
+    if (IS("sys.brightness")) {
         if (!needException("sys.brightness")) return OSAVal();
         sysBrightness = constrain(iN(0), 10, 255);
         analogWrite(21, sysBrightness);
@@ -6491,34 +6729,33 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         Config::save();
         return OSAVal();
     }
-    if (name == "sys.theme") {
+    if (IS("sys.theme")) {
         if (!needException("sys.theme")) return OSAVal();
         sysTheme = iN(0) ? 1 : 0;
         Config::setInt("theme", sysTheme);
         Config::save();
         return OSAVal();
     }
-    if (name == "sys.wallpaper") {
+    if (IS("sys.wallpaper")) {
         if (!needException("sys.wallpaper")) return OSAVal();
         Config::set("wallpaper_path", S(0));
         Config::save();
         return OSAVal();
     }
-    if (name == "sys.reboot") {
+    if (IS("sys.reboot")) {
         if (!needException("sys.reboot")) return OSAVal();
         delay(120);
         ESP.restart();
         return OSAVal();
     }
-    if (name == "sys.notify") {
+    if (IS("sys.notify")) {
         if (!needException("sys.notify")) return OSAVal();
-        extern void osa_notify(const char*);
-        osa_notify(S(0).c_str());
+        Toast::show(tft, S(0));
         return OSAVal();
     }
     // app.launch(absPath) — unwinds this script and asks the host to load
     // another .osa instead of returning to home. Used by the Files app.
-    if (name == "app.launch") {
+    if (IS("app.launch")) {
         if (!needException("app.launch")) return OSAVal();
         pendingLaunch = S(0);
         exitFlag = true;
@@ -6526,17 +6763,17 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     }
 
     // cfg.* — global config (poza per-app kv.*)
-    if (name == "cfg.get") {
+    if (IS("cfg.get")) {
         if (!needException("cfg.get")) return OSAVal("");
         return OSAVal(Config::get(S(0), S(1, "")));
     }
-    if (name == "cfg.set") {
+    if (IS("cfg.set")) {
         if (!needException("cfg.set")) return OSAVal();
         Config::set(S(0), a[1].toString());
         Config::save();
         return OSAVal();
     }
-    if (name == "cfg.del") {
+    if (IS("cfg.del")) {
         if (!needException("cfg.del")) return OSAVal();
         // Config has no public delete — overwrite with empty as the practical
         // equivalent. Storage still keeps the key but consumers see "".
@@ -6546,7 +6783,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     }
 
     // fs.* — file system access *outside* the per-app sandbox
-    if (name == "fs.size") {
+    if (IS("fs.size")) {
         if (!needException("fs.size")) return OSAVal(-1.0);
         s_ioError = "";
         if (!isSdReady) { s_ioError = "No SD card"; return OSAVal(-1.0); }
@@ -6560,7 +6797,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         f.close();
         return OSAVal(size);
     }
-    if (name == "fs.read") {
+    if (IS("fs.read")) {
         if (!needException("fs.read")) return OSAVal("");
         if (!isSdReady) { s_ioError = "No SD card"; return OSAVal(""); }
         size_t offset = (size_t)max(0, iN(1));
@@ -6571,7 +6808,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
             return OSAVal("");
         return OSAVal(static_cast<String&&>(content));
     }
-    if (name == "fs.write") {
+    if (IS("fs.write")) {
         if (!needException("fs.write")) return OSAVal(0.0);
         if (!isSdReady) return OSAVal(0.0);
         String p = S(0);
@@ -6581,34 +6818,34 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         f.print(S(1)); f.close();
         return OSAVal(1.0);
     }
-    if (name == "fs.append") {
+    if (IS("fs.append")) {
         if (!needException("fs.append")) return OSAVal(0.0);
         if (!isSdReady) return OSAVal(0.0);
         File f = SD.open(S(0), FILE_APPEND); if (!f) return OSAVal(0.0);
         f.println(S(1)); f.close(); return OSAVal(1.0);
     }
-    if (name == "fs.exists") {
+    if (IS("fs.exists")) {
         if (!needException("fs.exists")) return OSAVal(0.0);
         if (!isSdReady) return OSAVal(0.0);
         return OSAVal(SD.exists(S(0).c_str()) ? 1.0 : 0.0);
     }
-    if (name == "fs.delete") {
+    if (IS("fs.delete")) {
         if (!needException("fs.delete")) return OSAVal(0.0);
         if (!isSdReady) return OSAVal(0.0);
         return OSAVal(SD.remove(S(0).c_str()) ? 1.0 : 0.0);
     }
-    if (name == "fs.mkdir") {
+    if (IS("fs.mkdir")) {
         if (!needException("fs.mkdir")) return OSAVal(0.0);
         if (!isSdReady) return OSAVal(0.0);
         return OSAVal(SD.mkdir(S(0).c_str()) ? 1.0 : 0.0);
     }
-    if (name == "fs.rmdir") {
+    if (IS("fs.rmdir")) {
         if (!needException("fs.rmdir")) return OSAVal(0.0);
         if (!isSdReady) return OSAVal(0.0);
         return OSAVal(SD.rmdir(S(0).c_str()) ? 1.0 : 0.0);
     }
     // fs.wipe(path) — recursive nuke. Mirrors SettingsApp::wipeSDCard.
-    if (name == "fs.wipe") {
+    if (IS("fs.wipe")) {
         if (!needException("fs.wipe")) return OSAVal(0.0);
         if (!isSdReady) return OSAVal(0.0);
         struct Rec {
@@ -6641,7 +6878,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     }
 
     // ntp.sync() — kick off an NTP fetch right now (requires Wi-Fi connected)
-    if (name == "ntp.sync") {
+    if (IS("ntp.sync")) {
         if (!needException("ntp.sync")) return OSAVal(0.0);
         if (WiFi.status() != WL_CONNECTED) return OSAVal(0.0);
         configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.cloudflare.com");
@@ -6655,14 +6892,14 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     }
 
     // ── Wi-Fi control + scan (privileged) ────────────────────────────────────
-    if (name == "wifi.enable") {
+    if (IS("wifi.enable")) {
         if (!needException("wifi.enable")) return OSAVal();
         sysWiFiEnabled = true;
         WiFi.mode(WIFI_STA);
         Config::setInt("wifi", 1); Config::save();
         return OSAVal();
     }
-    if (name == "wifi.disable") {
+    if (IS("wifi.disable")) {
         if (!needException("wifi.disable")) return OSAVal();
         sysWiFiEnabled = false;
         WiFi.disconnect(true, false);
@@ -6670,26 +6907,26 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         Config::setInt("wifi", 0); Config::save();
         return OSAVal();
     }
-    if (name == "wifi.isEnabled") return OSAVal(sysWiFiEnabled ? 1.0 : 0.0);
-    if (name == "wifi.scan") {
+    if (IS("wifi.isEnabled")) return OSAVal(sysWiFiEnabled ? 1.0 : 0.0);
+    if (IS("wifi.scan")) {
         if (!needException("wifi.scan")) return OSAVal(0.0);
         if (WiFi.getMode() == WIFI_OFF) WiFi.mode(WIFI_STA);
         int n = WiFi.scanNetworks();
         return OSAVal((double)(n < 0 ? 0 : n));
     }
-    if (name == "wifi.scanSsid") {
+    if (IS("wifi.scanSsid")) {
         if (!needException("wifi.scanSsid")) return OSAVal("");
         return OSAVal(WiFi.SSID(iN(0)));
     }
-    if (name == "wifi.scanRssi") {
+    if (IS("wifi.scanRssi")) {
         if (!needException("wifi.scanRssi")) return OSAVal(0.0);
         return OSAVal((double)WiFi.RSSI(iN(0)));
     }
-    if (name == "wifi.scanSecure") {
+    if (IS("wifi.scanSecure")) {
         if (!needException("wifi.scanSecure")) return OSAVal(0.0);
         return OSAVal(WiFi.encryptionType(iN(0)) != WIFI_AUTH_OPEN ? 1.0 : 0.0);
     }
-    if (name == "wifi.connect") {
+    if (IS("wifi.connect")) {
         if (!needException("wifi.connect")) return OSAVal(0.0);
         if (WiFi.getMode() == WIFI_OFF) WiFi.mode(WIFI_STA);
         WiFi.begin(S(0).c_str(), S(1, "").c_str());
@@ -6700,22 +6937,27 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         }
         return OSAVal(0.0);
     }
-    if (name == "wifi.disconnect") {
+    if (IS("wifi.disconnect")) {
         if (!needException("wifi.disconnect")) return OSAVal();
         WiFi.disconnect();
         return OSAVal();
     }
-    if (name == "wifi.save") {
+    if (IS("wifi.save")) {
         if (!needException("wifi.save")) return OSAVal();
-        // Stored encrypted using the same format Settings/main.cpp expect for
-        // auto-reconnect: "ssid|password" XOR-obfuscated via Crypto.
-        Config::set("net_0", Crypto::encrypt(S(0) + "|" + S(1, "")));
+        // Stored as "ssid|password" sealed with the per-device AES-GCM key;
+        // main.cpp decrypts it for auto-reconnect at boot.
+        String sealed = Crypto::encrypt(S(0) + "|" + S(1, ""));
+        if (sealed.length() == 0) {
+            setError(-1, "wifi.save: device key unavailable");
+            return OSAVal();
+        }
+        Config::set("net_0", sealed);
         Config::save();
         return OSAVal();
     }
 
     // ── Bluetooth control (privileged) ───────────────────────────────────────
-    if (name == "bt.enable") {
+    if (IS("bt.enable")) {
         if (!needException("bt.enable")) return OSAVal();
         if (!osaSetBluetoothEnabled(true)) {
             showSystemPopup("Bluetooth", osaBluetoothLastError(),
@@ -6725,17 +6967,17 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         Config::setInt("bluetooth", 1); Config::save();
         return OSAVal(1.0);
     }
-    if (name == "bt.disable") {
+    if (IS("bt.disable")) {
         if (!needException("bt.disable")) return OSAVal();
         osaSetBluetoothEnabled(false);
         Config::setInt("bluetooth", 0); Config::save();
         return OSAVal(1.0);
     }
-    if (name == "bt.enabled") return OSAVal(sysBTEnabled ? 1.0 : 0.0);
-    if (name == "bt.error") return OSAVal(String(osaBluetoothLastError()));
+    if (IS("bt.enabled")) return OSAVal(sysBTEnabled ? 1.0 : 0.0);
+    if (IS("bt.error")) return OSAVal(String(osaBluetoothLastError()));
 
     // ── sys.setTime(h, m, s, day, mon, year) — sets RTC ─────────────────────
-    if (name == "sys.setTime") {
+    if (IS("sys.setTime")) {
         if (!needException("sys.setTime")) return OSAVal();
         struct tm t = {};
         t.tm_hour = iN(0);
@@ -6752,12 +6994,14 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         return OSAVal();
     }
 
-    // ── crypto.* — same XOR scheme used by native Settings/passcode ──────────
-    if (name == "crypto.encrypt") {
+    // ── crypto.* — AES-256-GCM with the per-device key (see Crypto.h). The
+    // passcode and other Settings secrets use this; decrypt returns "" when
+    // the value was tampered with or written by a different device.
+    if (IS("crypto.encrypt")) {
         if (!needException("crypto.encrypt")) return OSAVal("");
         return OSAVal(Crypto::encrypt(S(0)));
     }
-    if (name == "crypto.decrypt") {
+    if (IS("crypto.decrypt")) {
         if (!needException("crypto.decrypt")) return OSAVal("");
         return OSAVal(Crypto::decrypt(S(0)));
     }
@@ -6828,7 +7072,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
             }
         };
 
-        if (name == "apps.scan") {
+        if (IS("apps.scan")) {
             if (!needException("apps.scan")) return OSAVal(0.0);
             clearAppsScanCache();
             if (isSdReady) {
@@ -6841,19 +7085,19 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
             }
             return OSAVal((double)s_appsCount);
         }
-        if (name == "apps.name") {
+        if (IS("apps.name")) {
             if (!needException("apps.name")) return OSAVal("");
             int i = iN(0);
             if (i < 0 || i >= s_appsCount) return OSAVal("");
             return OSAVal(s_appsNames[i]);
         }
-        if (name == "apps.path") {
+        if (IS("apps.path")) {
             if (!needException("apps.path")) return OSAVal("");
             int i = iN(0);
             if (i < 0 || i >= s_appsCount) return OSAVal("");
             return OSAVal(s_appsPaths[i]);
         }
-        if (name == "apps.needsPerm") {
+        if (IS("apps.needsPerm")) {
             if (!needException("apps.needsPerm")) return OSAVal(0.0);
             int i = iN(0);
             int bit = iN(1);
@@ -6861,7 +7105,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
             uint8_t mask = OSARuntime::readRequiredPermsFromFile(s_appsPaths[i]);
             return OSAVal((mask & bit) ? 1.0 : 0.0);
         }
-        if (name == "apps.hasPerm") {
+        if (IS("apps.hasPerm")) {
             if (!needException("apps.hasPerm")) return OSAVal(0.0);
             int i = iN(0);
             int bit = iN(1);
@@ -6869,7 +7113,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
             int stored = Config::getInt(OSARuntime::permKeyForPath(s_appsPaths[i]), 0);
             return OSAVal((stored & 0x0F & bit) ? 1.0 : 0.0);
         }
-        if (name == "apps.togglePerm") {
+        if (IS("apps.togglePerm")) {
             if (!needException("apps.togglePerm")) return OSAVal();
             int i = iN(0);
             int bit = iN(1);
@@ -6893,7 +7137,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     // ── bmp.thumb(absPath, x, y, w, h) — render 24-bit BMP scaled to w×h ─────
     // Same algorithm as SettingsApp::drawBmpThumbnail. Public (not privileged)
     // so any script can render images.
-    if (name == "bmp.thumb") {
+    if (IS("bmp.thumb")) {
         if (!isSdReady) return OSAVal(0.0);
         String path = S(0);
         int x = iN(1), y = iN(2), w = iN(3), h = iN(4);
@@ -6957,7 +7201,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     // -4 unsupported feature, -5 write fail, -6 bytecode full,
     // -7 number pool full, -8 string pool full, -9 identifier pool full,
     // -10 invalid jump patch.
-    if (name == "osa.compile") {
+    if (IS("osa.compile")) {
         if (!needException("osa.compile")) return OSAVal(-1.0);
         String src = S(0), dst = S(1);
         OSARuntime* tmp = new OSARuntime(tft, ts);
@@ -6978,7 +7222,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         return OSAVal(wrote ? 1.0 : -5.0);
     }
 
-    if (name == "fs.list") {
+    if (IS("fs.list")) {
         if (!needException("fs.list")) return OSAVal("");
         if (!isSdReady) return OSAVal("");
         File dir = SD.open(S(0));
@@ -7005,24 +7249,24 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     // ═════════════════════════════════════════════════════════════════════════
 
     // ── Drawing extras ───────────────────────────────────────────────────────
-    if (name == "triangle") {
+    if (IS("triangle")) {
         CV(fillTriangle(iN(0), iN(1), iN(2), iN(3), iN(4), iN(5), drawColor));
         return OSAVal();
     }
-    if (name == "tframe") {
+    if (IS("tframe")) {
         CV(drawTriangle(iN(0), iN(1), iN(2), iN(3), iN(4), iN(5), drawColor));
         return OSAVal();
     }
-    if (name == "rframe") {
+    if (IS("rframe")) {
         CV(drawRoundRect(iN(0), iN(1), iN(2), iN(3), iN(4), drawColor));
         return OSAVal();
     }
-    if (name == "gradient" || name == "gradienth") {
+    if (IS("gradient") || IS("gradienth")) {
         int x = iN(0), y = iN(1), w = iN(2), h = iN(3);
         int r1 = iN(4), g1 = iN(5), b1 = iN(6);
         int r2 = iN(7), g2 = iN(8), b2 = iN(9);
         if (h <= 0 || w <= 0) return OSAVal();
-        int length = name == "gradient" ? h : w;
+        int length = IS("gradient") ? h : w;
         int denominator = max(1, length - 1);
         for (int position = 0; position < length; ++position) {
             int inverse = denominator - position;
@@ -7030,7 +7274,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
             int green = (g1 * inverse + g2 * position) / denominator;
             int blue = (b1 * inverse + b2 * position) / denominator;
             uint16_t color = osaRgb565(red, green, blue);
-            if (name == "gradient") {
+            if (IS("gradient")) {
                 if (activeSprite) activeSprite->drawFastHLine(x, y + position, w, color);
                 else              tft->drawFastHLine(x, y + position, w, color);
             } else {
@@ -7042,27 +7286,27 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     }
 
     // ── Text metrics / alignment ─────────────────────────────────────────────
-    if (name == "textw") {
+    if (IS("textw")) {
         tft->setTextFont(textFont); tft->setTextSize(1);
         return OSAVal((double)tft->textWidth(S(0)));
     }
-    if (name == "texth") {
+    if (IS("texth")) {
         tft->setTextFont(textFont); tft->setTextSize(1);
         return OSAVal((double)tft->fontHeight());
     }
-    if (name == "textr") {
+    if (IS("textr")) {
         CV(setTextFont(textFont)); CV(setTextSize(1));
         CV(setTextColor(txtColor)); CV(setTextDatum(TR_DATUM));
         CV(drawString(S(2), iN(0), iN(1)));
         return OSAVal();
     }
-    if (name == "textmr") {
+    if (IS("textmr")) {
         CV(setTextFont(textFont)); CV(setTextSize(1));
         CV(setTextColor(txtColor)); CV(setTextDatum(MR_DATUM));
         CV(drawString(S(2), iN(0), iN(1)));
         return OSAVal();
     }
-    if (name == "textml") {
+    if (IS("textml")) {
         CV(setTextFont(textFont)); CV(setTextSize(1));
         CV(setTextColor(txtColor)); CV(setTextDatum(ML_DATUM));
         CV(drawString(S(2), iN(0), iN(1)));
@@ -7070,56 +7314,81 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     }
 
     // ── Wallpaper (shared cache from main.cpp) ───────────────────────────────
-    if (name == "wallpaper.draw") {
+    if (IS("wallpaper.draw")) {
         if (!activeSprite) Wallpaper::draw(tft);
         return OSAVal();
     }
-    if (name == "wallpaper.region") {
+    if (IS("wallpaper.region")) {
         if (!activeSprite)
             Wallpaper::drawRegion(tft, iN(0), iN(1), iN(2), iN(3));
         return OSAVal();
     }
 
     // ── Time formatting helpers ──────────────────────────────────────────────
-    if (name == "time.fmtHM" || name == "time.fmtHMS" || name == "time.fmtDate") {
+    if (IS("time.fmtHM") || IS("time.fmtHMS") || IS("time.fmtDate")) {
         time_t now; time(&now); struct tm t; localtime_r(&now, &t);
         char buf[24];
-        if (name == "time.fmtHM")  snprintf(buf, sizeof(buf), "%02d:%02d", t.tm_hour, t.tm_min);
-        if (name == "time.fmtHMS") snprintf(buf, sizeof(buf), "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
-        if (name == "time.fmtDate")snprintf(buf, sizeof(buf), "%02d.%02d.%d", t.tm_mday, t.tm_mon + 1, t.tm_year + 1900);
+        if (IS("time.fmtHM"))  snprintf(buf, sizeof(buf), "%02d:%02d", t.tm_hour, t.tm_min);
+        if (IS("time.fmtHMS")) snprintf(buf, sizeof(buf), "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
+        if (IS("time.fmtDate"))snprintf(buf, sizeof(buf), "%02d.%02d.%d", t.tm_mday, t.tm_mon + 1, t.tm_year + 1900);
         return OSAVal(String(buf));
     }
 
     // ── Battery / system info ────────────────────────────────────────────────
-    if (name == "battery") return OSAVal(97.0);   // mock; no fuel gauge on CYD
-    if (name == "wifi.rssi") {
+    // battery() — percentage from an optional ADC divider, -1 without one.
+    // The stock CYD has no gauge; a board with a LiPo on a divider sets
+    // battery_pin (ADC1 GPIO 32-39), battery_divider (ratio x100, e.g. 200
+    // for 1:2) and optionally battery_mv_min / battery_mv_max in config.ini.
+    if (IS("battery") || IS("battery.available") || IS("battery.mv")) {
+        int pin = Config::getInt("battery_pin", -1);
+        bool available = pin >= 32 && pin <= 39;
+        if (IS("battery.available")) return OSAVal(available ? 1.0 : 0.0);
+        if (!available) return OSAVal(-1.0);
+        static uint32_t cachedAt = 0;
+        static int cachedMv = -1;
+        uint32_t now = millis();
+        if (cachedMv < 0 || now - cachedAt > 2000U) {
+            uint32_t sum = 0;
+            for (int i = 0; i < 8; ++i) sum += analogReadMilliVolts((uint8_t)pin);
+            int divider = constrain(Config::getInt("battery_divider", 200), 100, 1000);
+            cachedMv = (int)((sum / 8U) * (uint32_t)divider / 100U);
+            cachedAt = now;
+        }
+        if (IS("battery.mv")) return OSAVal((double)cachedMv);
+        int minMv = Config::getInt("battery_mv_min", 3300);
+        int maxMv = Config::getInt("battery_mv_max", 4200);
+        if (maxMv <= minMv) return OSAVal(-1.0);
+        int percent = (int)(((long)(cachedMv - minMv) * 100L) / (maxMv - minMv));
+        return OSAVal((double)constrain(percent, 0, 100));
+    }
+    if (IS("wifi.rssi")) {
         if (WiFi.status() != WL_CONNECTED) return OSAVal(0.0);
         return OSAVal((double)WiFi.RSSI());
     }
 
     // ── Home enumeration (read-only) ─────────────────────────────────────────
-    if (name == "home.appCount") return OSAVal((double)home.appCount);
-    if (name == "home.appName") {
+    if (IS("home.appCount")) return OSAVal((double)home.appCount);
+    if (IS("home.appName")) {
         int i = iN(0);
         if (i < 0 || i >= home.appCount) return OSAVal("");
         return OSAVal(home.tiles[i].name);
     }
-    if (name == "home.appColor") {
+    if (IS("home.appColor")) {
         int i = iN(0);
         if (i < 0 || i >= home.appCount) return OSAVal(0.0);
         return OSAVal((double)home.tiles[i].color);
     }
-    if (name == "home.appIsFolder") {
+    if (IS("home.appIsFolder")) {
         int i = iN(0);
         if (i < 0 || i >= home.appCount) return OSAVal(0.0);
         return OSAVal(home.tiles[i].isFolder ? 1.0 : 0.0);
     }
-    if (name == "home.appPath") {
+    if (IS("home.appPath")) {
         int i = iN(0);
         if (i < 0 || i >= home.appCount) return OSAVal("");
         return OSAVal(home.tiles[i].scriptPath);
     }
-    if (name == "home.canUninstall") {
+    if (IS("home.canUninstall")) {
         int i = iN(0);
         if (i < 0 || i >= home.appCount || home.tiles[i].isFolder)
             return OSAVal(0.0);
@@ -7129,27 +7398,27 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
                        isLooseUserScript(path);
         return OSAVal(allowed ? 1.0 : 0.0);
     }
-    if (name == "home.folderCount") {
+    if (IS("home.folderCount")) {
         int i = iN(0);
         if (i < 0 || i >= home.appCount || !home.tiles[i].isFolder) return OSAVal(0.0);
         return OSAVal((double)home.tiles[i].childCount);
     }
-    if (name == "home.folderAppName" || name == "home.folderAppColor" ||
-        name == "home.folderAppPath") {
+    if (IS("home.folderAppName") || IS("home.folderAppColor") ||
+        IS("home.folderAppPath")) {
         int i = iN(0), j = iN(1);
-        bool wantsNum = (name == "home.folderAppColor");
+        bool wantsNum = (IS("home.folderAppColor"));
         if (i < 0 || i >= home.appCount || !home.tiles[i].isFolder)
             return wantsNum ? OSAVal(0.0) : OSAVal("");
         const HomeTile& f = home.tiles[i];
         if (j < 0 || j >= f.childCount)
             return wantsNum ? OSAVal(0.0) : OSAVal("");
-        if (name == "home.folderAppName")  return OSAVal(f.children[j].name);
-        if (name == "home.folderAppColor") return OSAVal((double)f.children[j].color);
+        if (IS("home.folderAppName"))  return OSAVal(f.children[j].name);
+        if (IS("home.folderAppColor")) return OSAVal((double)f.children[j].color);
         return OSAVal(f.children[j].scriptPath);
     }
 
     // ── Home mutations (privileged-ish — gate behind isException) ────────────
-    if (name == "home.swap") {
+    if (IS("home.swap")) {
         if (!isException) return OSAVal(0.0);
         int i = iN(0), j = iN(1);
         if (i < 0 || j < 0 || i >= home.appCount || j >= home.appCount) return OSAVal(0.0);
@@ -7158,15 +7427,15 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         home.tiles[j] = static_cast<HomeTile&&>(tmp);
         return OSAVal(1.0);
     }
-    if (name == "home.makeFolder") {
+    if (IS("home.makeFolder")) {
         if (!isException) return OSAVal(0.0);
         return OSAVal(osaMakeFolder(iN(0)) ? 1.0 : 0.0);
     }
-    if (name == "home.deleteFolder") {
+    if (IS("home.deleteFolder")) {
         if (!isException) return OSAVal(0.0);
         return OSAVal(osaDeleteFolder(iN(0)) ? 1.0 : 0.0);
     }
-    if (name == "home.uninstall") {
+    if (IS("home.uninstall")) {
         if (!isException) return OSAVal(0.0);
         int i = iN(0);
         if (i < 0 || i >= home.appCount || home.tiles[i].isFolder)
@@ -7210,16 +7479,16 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         else          home.removeScriptPath(path);
         return OSAVal(1.0);
     }
-    if (name == "home.addToFolder") {
+    if (IS("home.addToFolder")) {
         if (!isException) return OSAVal(0.0);
         return OSAVal(osaAddToFolder(iN(0), iN(1)) ? 1.0 : 0.0);
     }
-    if (name == "home.saveOrder") {
+    if (IS("home.saveOrder")) {
         if (!isException) return OSAVal();
         home.saveOrder();
         return OSAVal();
     }
-    if (name == "anim.openTile") {
+    if (IS("anim.openTile")) {
         if (!isException) return OSAVal();
         osaPlayOpenAnim(iN(0));
         return OSAVal();
@@ -7227,21 +7496,21 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
 
     // ── theme.* — current theme palette as packed RGB565 ─────────────────────
     // Apps use these to stay consistent with system widgets across dark/light.
-    if (name == "theme.bg")       return OSAVal((double)Theme::bg());
-    if (name == "theme.surface")  return OSAVal((double)Theme::surface());
-    if (name == "theme.header")   return OSAVal((double)Theme::header());
-    if (name == "theme.divider")  return OSAVal((double)Theme::divider());
-    if (name == "theme.divider2") return OSAVal((double)Theme::divider2());
-    if (name == "theme.text")     return OSAVal((double)Theme::text());
-    if (name == "theme.subtext")  return OSAVal((double)Theme::subtext());
-    if (name == "theme.hint")     return OSAVal((double)Theme::hint());
+    if (IS("theme.bg"))       return OSAVal((double)Theme::bg());
+    if (IS("theme.surface"))  return OSAVal((double)Theme::surface());
+    if (IS("theme.header"))   return OSAVal((double)Theme::header());
+    if (IS("theme.divider"))  return OSAVal((double)Theme::divider());
+    if (IS("theme.divider2")) return OSAVal((double)Theme::divider2());
+    if (IS("theme.text"))     return OSAVal((double)Theme::text());
+    if (IS("theme.subtext"))  return OSAVal((double)Theme::subtext());
+    if (IS("theme.hint"))     return OSAVal((double)Theme::hint());
 
     // Grid geometry — keeps the layout source of truth in C++.
-    if (name == "home.iconX") {
+    if (IS("home.iconX")) {
         int i = iN(0); int col = i % 4;
         return OSAVal((double)(12 + col * 55));
     }
-    if (name == "home.iconY") {
+    if (IS("home.iconY")) {
         int i = iN(0); int row = i / 4;
         return OSAVal((double)(30 + row * 80));
     }
@@ -7249,4 +7518,5 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     // Unknown built-in (user funcs were handled at the top)
     setError(-1, "Unknown: " + name);
     return OSAVal();
+#undef IS
 }

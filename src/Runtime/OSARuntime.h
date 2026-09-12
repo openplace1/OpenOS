@@ -92,8 +92,8 @@ struct OSABytecode {
 #define OSA_PERM_NOTIFY   0x01   // notify()
 #define OSA_PERM_NETWORK  0x02   // http.get / http.post — outbound network access
 #define OSA_PERM_SYSTEM   0x04   // setbright, setwallpaper
-#define OSA_PERM_OVERLAY  0x08   // overlay.draw — draw on top of the active app
-                                  //   (like Android "Draw over other apps")
+// 0x08 was reserved for an "overlay.draw" permission that never shipped;
+// keep the bit free so stored grant/deny masks do not change meaning.
 
 // Permission descriptor — used by Settings to render only declared toggles.
 struct OSAPermDesc {
@@ -174,7 +174,14 @@ public:
     int  bcAddStr(const String& s);
     int  bcAddName(const String& s);
     uint8_t bytecodeError() const { return lastCompileError; }
-    String*  bcLines()             { return lines; }
+    // Source line `index` as a String (a copy: the loader keeps the file in
+    // one buffer and hands out views). swapLineText() lets the compiler run a
+    // single-line if/while body through compileLineAt in place of the line.
+    String   lineText(int index) const;
+    String   swapLineText(int index, const String& text);
+    // Zero-copy view for scanners; nullptr when the line is not in the
+    // source buffer (override active or tree-walker Strings in use).
+    const char* lineView(int index) const;
     int      bcLineCount() const   { return lineCount; }
     int      bcFindMatchingEnd(int n);
     int      bcFindNextBranch(int n);
@@ -206,17 +213,33 @@ private:
     // the screen, while gfx.show keeps blitting the stashed buffer.
     TFT_eSprite*        stashSprite  = nullptr;
 
-    // Script storage
-    String lines[OSA_MAX_LINES];
-    int    lineCount = 0;
+    // Script source. The file is read into one buffer (`sourceText`, lines
+    // NUL-terminated and trimmed in place, `lineOffsets` indexing them) so a
+    // 20 KB script costs one allocation instead of five hundred small ones
+    // that would fragment the heap for the rest of the session. A successful
+    // compile frees the buffer. Only the tree-walker fallback materialises
+    // `lines` as Strings, because it rewrites lines while executing.
+    char*     sourceText = nullptr;
+    uint32_t* lineOffsets = nullptr;
+    String*   lines = nullptr;
+    int       lineCount = 0;
+    int       overrideIndex = -1;
+    String    overrideText;
+    bool    materializeLines();
+    void    releaseLines();
     String loadedScriptPath;
     int    loopStart = -1; // index of 'loop' line
     int    loopEnd   = -1; // index of matching 'end'
 
-    // Variables
+    // Variables. varNameIds[i] is the bytecode name-pool index slot i was
+    // created with, so OP_LOAD/STORE/DECLARE resolve a slot with an integer
+    // compare instead of a String compare per candidate. The tree-walker
+    // leaves it at -1 and matches by name. Kept as a parallel array: inside
+    // Var it would cost 8 bytes per slot after alignment instead of 2.
     struct Var { String name; OSAVal val; };
-    Var vars[OSA_MAX_VARS];
-    int varCount = 0;
+    Var     vars[OSA_MAX_VARS];
+    int16_t varNameIds[OSA_MAX_VARS] = {};
+    int     varCount = 0;
 
     // User functions
     struct Func {
@@ -226,6 +249,9 @@ private:
         int    bcStart = -1;   // pc where bytecode body starts (set by compile)
         String params[8];
         int    paramCount = 0;
+        // Name-pool index of each parameter (-1 when the body never reads
+        // it), so OP_CALL_USER can bind arguments through declareVarById.
+        int16_t paramIds[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
     };
     Func funcs[OSA_MAX_FUNCS];
     int  funcCount = 0;
@@ -318,6 +344,8 @@ private:
     // exec(): interprets bc.code[pcStart..pcEnd].
     bool compile();
     bool exec(int pcStart, int pcEnd);
+    // Fills Func::paramIds from the finished name pool (compile and loadOsac).
+    void resolveFuncParamIds();
     // Pass by value so temporary String results can be moved onto the VM stack
     // without allocating a second equally large buffer. Lvalues still make the
     // one copy required by OP_LOAD_VAR / OP_DUP.
@@ -349,6 +377,10 @@ private:
     // scopes are shadowed, not overwritten. Plain assignment (X = Y) keeps the
     // global-search behaviour of setVar.
     void   declareVar(const String& name, OSAVal val);
+    // Bytecode fast paths keyed by name-pool index (see varNameIds).
+    const OSAVal* findVarById(uint16_t nameId) const;
+    void   setVarById(uint16_t nameId, OSAVal val);
+    void   declareVarById(uint16_t nameId, OSAVal val);
 
     // ── Expression evaluator (recursive descent) ─────────────────────────────
     OSAVal eval(const String& expr);

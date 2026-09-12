@@ -1,4 +1,9 @@
 #include "PackageManager.h"
+#include "CatalogSignature.h"
+#include "HeapReserve.h"
+#include "OpenOSReleaseKeys.h"
+#include "ReleaseSignature.h"
+#include "SecureHttp.h"
 #include "../Config.h"
 #include "../OpenOSVersion.h"
 
@@ -12,8 +17,6 @@
 #include <new>
 
 extern bool isSdReady;
-extern bool sysBTEnabled;
-extern bool osaSuspendBluetoothForMemory(const char* reason);
 
 namespace PackageManager {
 namespace {
@@ -554,6 +557,38 @@ static bool buildCatalogIndex() {
     return true;
 }
 
+// The catalog is signed by the same offline ECDSA P-256 release key as the
+// firmware manifest. build_opk.py emits the compact object
+// {"schema":1,"apps":[...],"keyId":"..."}, signs "OPENOS-CATALOG-V1\n" +
+// that exact text, then inserts ,"signature":"..." as the last field.
+// Verification therefore hashes the document up to that field plus the
+// closing brace; no copy of the 24 KB document is needed.
+static bool verifyCatalogSignature(const String& document) {
+    size_t signedLength = 0;
+    String signature;
+    String why;
+    if (!CatalogSignature::split(document, signedLength, signature, why))
+        return fail(why);
+
+    JsonRange root = catalogRootRange(document);
+    String keyId = root.valid()
+                 ? catalogDecodeString(document,
+                                       catalogObjectField(document, root, "keyId"), 48)
+                 : String();
+    if (keyId != OpenOSReleaseKeys::KEY_ID)
+        return fail("Store catalog uses an unknown release key");
+
+    ReleaseSignature::Hasher hasher;
+    uint8_t digest[32];
+    if (!hasher.update(CatalogSignature::PREFIX) ||
+        !hasher.update(document, 0, signedLength) ||
+        !hasher.update("}") || !hasher.finish(digest))
+        return fail("Could not hash store catalog");
+    if (!ReleaseSignature::verifyDigest(digest, signature, why))
+        return fail(String("Store catalog ") + why);
+    return true;
+}
+
 static bool validateCatalogDocument(String& document, int& count) {
     String previous = static_cast<String&&>(s_catalog);
     int previousCount = s_catalogCount;
@@ -710,39 +745,17 @@ private:
     bool overflow = false;
 };
 
-static bool beginHttp(HTTPClient& http, WiFiClientSecure& client, const String& url) {
-    if (!url.startsWith("https://") || url.length() > 2048 ||
-        url.indexOf('\r') >= 0 || url.indexOf('\n') >= 0)
-        return fail("OpenStore requires a valid HTTPS URL");
-    http.setConnectTimeout(10000);
-    http.setTimeout(15000);
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    client.setInsecure();
-    return http.begin(client, url) || fail("Could not open HTTPS connection");
-}
-
-static void prepareHttpsMemory(const char* operation) {
-    // Classic Bluetooth and TLS compete for the same internal RAM on the
-    // no-PSRAM ESP32. Keep the user's setting enabled, but suspend the radio
-    // until OpenStore is closed; main.cpp restores it after returning Home.
-    if (sysBTEnabled) osaSuspendBluetoothForMemory(operation);
-    Serial.printf("[STORE] %s free=%u maxBlock=%u\n", operation,
-                  (unsigned)ESP.getFreeHeap(),
-                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-}
-
-static String httpErrorMessage(const char* resource, int status) {
-    String detail = HTTPClient::errorToString(status);
-    String message(resource);
-    message += " HTTPS failed (";
-    message += status;
-    message += "): ";
-    message += detail.length() > 0 ? detail : String("connection error");
-    return message;
+static bool validStoreUrl(const String& url) {
+    return url.startsWith("https://") && url.length() <= 2048 &&
+           url.indexOf('\r') < 0 && url.indexOf('\n') < 0;
 }
 
 static bool downloadPackageFile(const String& url) {
-    prepareHttpsMemory("package HTTPS");
+    if (!validStoreUrl(url)) return fail("OpenStore requires a valid HTTPS URL");
+    SecureHttp::prepareMemory("STORE", "package HTTPS");
+    SecureHttp::RadioAwake awake;
+    String why;
+    if (!SecureHttp::memoryAvailable(why)) return fail(why);
     removeFileIfPresent(DOWNLOAD_PATH);
     File destination = SD.open(DOWNLOAD_PATH, FILE_WRITE);
     if (!destination) return fail("Could not create package download file");
@@ -751,13 +764,13 @@ static bool downloadPackageFile(const String& url) {
     // extraction allocates its 32 KB deflate dictionary.
     HTTPClient http;
     WiFiClientSecure client;
-    if (!beginHttp(http, client, url)) {
-        destination.close(); SD.remove(DOWNLOAD_PATH); return false;
-    }
-    int status = http.GET();
+    SecureHttp::Request request;
+    request.attempts = 2;
+    request.readTimeoutMs = 20000;
+    int status = SecureHttp::get(http, client, url, request, why);
     if (status != HTTP_CODE_OK) {
         String message = status < 0
-            ? httpErrorMessage("Package", status)
+            ? String("Package download failed: ") + why
             : String("Package HTTP error ") + status;
         Serial.printf("[STORE] %s\n", message.c_str());
         http.end(); destination.close(); SD.remove(DOWNLOAD_PATH);
@@ -897,6 +910,7 @@ static bool copyStored(File& archive, File& output, const ZipEntry& entry) {
 }
 
 static bool inflateDeflated(File& archive, File& output, const ZipEntry& entry) {
+    HeapReserve::release("OPK extraction");
     uint8_t* dictionary = (uint8_t*)malloc(TINFL_LZ_DICT_SIZE);
     tinfl_decompressor* inflater = (tinfl_decompressor*)malloc(sizeof(tinfl_decompressor));
     if (!dictionary || !inflater) {
@@ -1136,8 +1150,12 @@ static void recoverRoot(const String& root) {
 static bool downloadCatalogDocument(String& document) {
     // Keep TLS/HTTP objects inside this helper so their buffers are gone before
     // JSON validation allocates temporary IDs and before an OPK download starts.
-    prepareHttpsMemory("catalog HTTPS");
+    SecureHttp::prepareMemory("STORE", "catalog HTTPS");
+    SecureHttp::RadioAwake awake;
+    String why;
+    if (!SecureHttp::memoryAvailable(why)) return fail(why);
     String source = catalogSourceUrl();
+    if (!validStoreUrl(source)) return fail("OpenStore requires a valid HTTPS URL");
     // GitHub's raw CDN can briefly serve an older branch snapshot directly
     // after publishing. A harmless query key also prevents that stale cache.
     if (source.startsWith("https://raw.githubusercontent.com/")) {
@@ -1146,46 +1164,35 @@ static bool downloadCatalogDocument(String& document) {
         source += millis();
     }
 
-    for (int attempt = 0; attempt < 2; ++attempt) {
-        HTTPClient http;
-        WiFiClientSecure client;
-        if (!beginHttp(http, client, source)) return false;
-        int status = http.GET();
-        if (status != HTTP_CODE_OK) {
-            String message = status < 0
-                ? httpErrorMessage("Catalog", status)
-                : String("Catalog HTTP error ") + status;
-            Serial.printf("[STORE] catalog attempt %d: %s free=%u maxBlock=%u\n",
-                          attempt + 1, message.c_str(),
-                          (unsigned)ESP.getFreeHeap(),
-                          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-            http.end();
-            if (status < 0 && attempt == 0) {
-                delay(350);
-                yield();
-                continue;
-            }
-            return fail(message);
-        }
-        int declared = http.getSize();
-        if (declared > (int)CATALOG_MAX_BYTES) {
-            http.end();
-            return fail("Store catalog exceeds 24 KB");
-        }
-        LimitedStringStream output(CATALOG_MAX_BYTES);
-        if (!output.begin(declared > 0 ? (size_t)declared : 1024)) {
-            http.end();
-            return fail("Not enough RAM for store catalog");
-        }
-        int received = http.writeToStream(&output);
+    HTTPClient http;
+    WiFiClientSecure client;
+    SecureHttp::Request request;
+    request.attempts = 3;
+    int status = SecureHttp::get(http, client, source, request, why);
+    if (status != HTTP_CODE_OK) {
+        String message = status < 0
+            ? String("Catalog download failed: ") + why
+            : String("Catalog HTTP error ") + status;
         http.end();
-        if (output.tooLarge()) return fail("Store catalog exceeds 24 KB");
-        if (output.outOfMemory()) return fail("Not enough RAM for store catalog");
-        if (received < 0) return fail("Could not read store catalog");
-        document = output.take();
-        return document.length() > 0 || fail("Store catalog is empty");
+        return fail(message);
     }
-    return fail("Catalog HTTPS failed");
+    int declared = http.getSize();
+    if (declared > (int)CATALOG_MAX_BYTES) {
+        http.end();
+        return fail("Store catalog exceeds 24 KB");
+    }
+    LimitedStringStream output(CATALOG_MAX_BYTES);
+    if (!output.begin(declared > 0 ? (size_t)declared : 1024)) {
+        http.end();
+        return fail("Not enough RAM for store catalog");
+    }
+    int received = http.writeToStream(&output);
+    http.end();
+    if (output.tooLarge()) return fail("Store catalog exceeds 24 KB");
+    if (output.outOfMemory()) return fail("Not enough RAM for store catalog");
+    if (received < 0) return fail("Could not read store catalog");
+    document = output.take();
+    return document.length() > 0 || fail("Store catalog is empty");
 }
 
 } // namespace
@@ -1258,14 +1265,15 @@ bool refreshCatalog() {
     if (!isSdReady) return fail("No SD card");
     if (WiFi.status() != WL_CONNECTED) return fail("Wi-Fi is not connected");
     clearCatalog();
-    if (sysBTEnabled) osaSuspendBluetoothForMemory("OpenStore catalog");
-    if (ESP.getFreeHeap() < CATALOG_MAX_BYTES + 12 * 1024) {
-        return fail("Not enough RAM for store catalog");
-    }
-    if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < 16U * 1024U)
-        return fail("Not enough contiguous RAM for store HTTPS");
+    // downloadCatalogDocument suspends Bluetooth and probes the heap once the
+    // radio memory is back, so the figure reflects what TLS will get.
     String document;
-    if (!downloadCatalogDocument(document)) return false;
+    bool downloaded = downloadCatalogDocument(document);
+    HeapReserve::reclaim();
+    if (!downloaded) return false;
+    // Authenticity first: an unsigned or re-signed catalog is rejected before
+    // any of its URLs or hashes are looked at, whatever the source URL.
+    if (!verifyCatalogSignature(document)) return false;
     int count = 0;
     if (!validateCatalogDocument(document, count))
         return fail("Store catalog has an invalid schema or entry");
