@@ -360,6 +360,7 @@ bool install(ProgressCallback progress, void* context) {
 
     if (!hashFinished) {
         Update.abort();
+        HeapReserve::reclaim();
         return fail(transferError.length() > 0 ? transferError
                                                : String("Could not finish firmware SHA-256"));
     }

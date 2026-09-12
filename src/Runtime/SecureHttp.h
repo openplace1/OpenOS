@@ -30,9 +30,15 @@ namespace SecureHttp {
 static constexpr size_t TLS_MIN_FREE_BYTES  = 46U * 1024U;
 // mbedTLS allocates MBEDTLS_SSL_IN_BUFFER_LEN (16384 + record overhead) twice.
 static constexpr size_t TLS_MIN_BLOCK_BYTES = 17U * 1024U;
-// Parsing the pinned root (RSA-4096, 1.4 KB DER) and the received chain for
-// verification needs a little more on top.
+// Parsing the pinned roots (RSA-4096) and verifying the chain needs more on
+// top — and, crucially, that work happens while both record buffers are still
+// held, so for a pinned host the *largest single region* has to hold both of
+// them plus this much. Two separate 17 KB blocks pass a naive probe and then
+// leave the RSA-4096 verification with nothing, which mbedTLS reports as
+// "certificate is not correctly signed by the trusted CA".
 static constexpr size_t TLS_PINNED_EXTRA_BYTES = 6U * 1024U;
+static constexpr size_t TLS_PINNED_REGION_BYTES =
+    2U * TLS_MIN_BLOCK_BYTES + TLS_PINNED_EXTRA_BYTES;
 
 // Keeps the Wi-Fi modem out of power save while the object lives. Modem
 // sleep adds up to ~100 ms per round trip and, with some access points,

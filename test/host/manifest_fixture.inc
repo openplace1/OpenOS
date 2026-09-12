@@ -8,18 +8,18 @@ static const char* INFO_JSON =
     "  \"channel\": \"stable\",\n"
     "  \"target\": \"denky32-wroom32\",\n"
     "  \"partitionScheme\": \"openos-dual-v1\",\n"
-    "  \"name\": \"OpenOS 1.2.1\",\n"
-    "  \"version\": \"1.2.1\",\n"
-    "  \"versionCode\": 4,\n"
+    "  \"name\": \"OpenOS 1.2.2\",\n"
+    "  \"version\": \"1.2.2\",\n"
+    "  \"versionCode\": 5,\n"
     "  \"minUpdaterVersionCode\": 1,\n"
-    "  \"releaseType\": \"security\",\n"
-    "  \"description\": \"Podpisany katalog OpenStore, przypi\xc4""\x99""cie root CA dla oficjalnego feedu, has\xc5""\x82""a Wi-Fi i passcode szyfrowane AES-GCM kluczem urz\xc4""\x85""dzenia, rotacja klucza release (2026-02), naprawa \\\"connection refused\\\" przy sprawdzaniu OTA, silnik 3D do 40 FPS, mniejsze zu\xc5""\xbc""ycie RAM, powiadomienia notify().\",\n"
+    "  \"releaseType\": \"patch\",\n"
+    "  \"description\": \"Pierwsza aktualizacja instalowana przez OTA. Sprawdzenie pamieci przed polaczeniem HTTPS wymaga teraz jednego ciaglego obszaru na oba bufory TLS i weryfikacje certyfikatu, wiec brak RAM nie udaje juz bledu certyfikatu; diagnostyka lancucha uruchamiana jest tylko na zadanie przez USB, a nieudana instalacja oddaje zarezerwowana pamiec.\",\n"
     "  \"publishedAt\": \"2026-09-12\",\n"
-    "  \"firmware\": \"firmware-4.bin\",\n"
-    "  \"size\": 1979248,\n"
-    "  \"sha256\": \"8f62bf8b2b57cf7ee6da5888836d99d4543d083c30e9c852f0537af07ace7b39\",\n"
+    "  \"firmware\": \"firmware-5.bin\",\n"
+    "  \"size\": 1979440,\n"
+    "  \"sha256\": \"abca8b98e30e7635ce73434c859a91e6d320929a7c0937cd872f4b64bc58ffad\",\n"
     "  \"keyId\": \"openos-release-2026-02\",\n"
-    "  \"signature\": \"MEUCIQC49YrpDdGLudwJpybOJ81mfDpm4gXGgzRF4A8bM1iC/gIgI84IC27KwIh57lci68c35qxc6LBMq2tti4Nz90jtrVc=\"\n"
+    "  \"signature\": \"MEUCIDeawGuOT6dTajdGn3ROvvs5UH16urG3YdendivDG/FXAiEAumqlz/WbhtlQOvoi9slVpZ7vGgZQZ49Ob/vf5X/v/G4=\"\n"
     "}\n";
 
 // canonical signature payload computed by the Python release tool rules
@@ -30,23 +30,23 @@ static const char* INFO_CANONICAL =
     "channel:6:stable\n"
     "target:15:denky32-wroom32\n"
     "partitionScheme:14:openos-dual-v1\n"
-    "name:12:OpenOS 1.2.1\n"
-    "version:5:1.2.1\n"
-    "versionCode:1:4\n"
+    "name:12:OpenOS 1.2.2\n"
+    "version:5:1.2.2\n"
+    "versionCode:1:5\n"
     "minUpdaterVersionCode:1:1\n"
-    "releaseType:8:security\n"
-    "description:288:Podpisany katalog OpenStore, przypi\xc4""\x99""cie root CA dla oficjalnego feedu, has\xc5""\x82""a Wi-Fi i passcode szyfrowane AES-GCM kluczem urz\xc4""\x85""dzenia, rotacja klucza release (2026-02), naprawa \"connection refused\" przy sprawdzaniu OTA, silnik 3D do 40 FPS, mniejsze zu\xc5""\xbc""ycie RAM, powiadomienia notify().\n"
+    "releaseType:5:patch\n"
+    "description:335:Pierwsza aktualizacja instalowana przez OTA. Sprawdzenie pamieci przed polaczeniem HTTPS wymaga teraz jednego ciaglego obszaru na oba bufory TLS i weryfikacje certyfikatu, wiec brak RAM nie udaje juz bledu certyfikatu; diagnostyka lancucha uruchamiana jest tylko na zadanie przez USB, a nieudana instalacja oddaje zarezerwowana pamiec.\n"
     "publishedAt:10:2026-09-12\n"
-    "firmware:14:firmware-4.bin\n"
-    "size:7:1979248\n"
-    "sha256:64:8f62bf8b2b57cf7ee6da5888836d99d4543d083c30e9c852f0537af07ace7b39\n"
+    "firmware:14:firmware-5.bin\n"
+    "size:7:1979440\n"
+    "sha256:64:abca8b98e30e7635ce73434c859a91e6d320929a7c0937cd872f4b64bc58ffad\n"
     "keyId:22:openos-release-2026-02\n";
 
 // values the parser must extract from INFO_JSON
-static const char* INFO_EXPECTED_NAME = "OpenOS 1.2.1";
-static const char* INFO_EXPECTED_FIRMWARE = "firmware-4.bin";
+static const char* INFO_EXPECTED_NAME = "OpenOS 1.2.2";
+static const char* INFO_EXPECTED_FIRMWARE = "firmware-5.bin";
 static const char* INFO_EXPECTED_KEY_ID = "openos-release-2026-02";
 static const char* INFO_EXPECTED_TARGET = "denky32-wroom32";
 static const char* INFO_EXPECTED_PARTITION = "openos-dual-v1";
-static const unsigned INFO_EXPECTED_VERSION_CODE = 4u;
-static const unsigned INFO_EXPECTED_SIZE = 1979248u;
+static const unsigned INFO_EXPECTED_VERSION_CODE = 5u;
+static const unsigned INFO_EXPECTED_SIZE = 1979440u;

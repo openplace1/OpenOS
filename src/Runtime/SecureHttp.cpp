@@ -49,12 +49,16 @@ static String describeConnectFailure(WiFiClientSecure& client, const String& hos
     message += " (-0x";
     message += String((unsigned)(-tlsError), HEX);
     message += ")";
-    // MBEDTLS_ERR_X509_CERT_VERIFY_FAILED: the chain did not reach the pinned
-    // root or the name did not match. Either an attack or a CA change; the
-    // serial log gets the exact chain and verify flags.
+    // MBEDTLS_ERR_X509_CERT_VERIFY_FAILED. Usually a CA change or an on-path
+    // proxy — but mbedTLS reports a failed allocation during the RSA
+    // verification the same way, so name both. OPENOS:TLSDIAG over USB prints
+    // the chain and the verify flags; it is not run automatically because it
+    // would open a second TLS session on an already tight heap.
     if (tlsError == -0x2700) {
-        message += " - server certificate is not issued by the pinned root CA";
-        diagnoseCertificateChain(host);
+        message += " - certificate not issued by the pinned root CA, or too "
+                   "little contiguous RAM to verify it (";
+        message += heapSummary();
+        message += ")";
     }
     return message;
 }
@@ -84,23 +88,41 @@ bool memoryAvailable(String& why, bool pinned) {
     HeapReserve::release("HTTPS");
     size_t freeBytes = ESP.getFreeHeap();
     size_t needed = TLS_MIN_FREE_BYTES + (pinned ? TLS_PINNED_EXTRA_BYTES : 0);
-    // mbedTLS allocates its two record buffers back to back. Probe for the
-    // second one while holding the first, so one large block that only fits
-    // a single buffer is not mistaken for enough.
-    bool twoBlocks = false;
-    void* first = heap_caps_malloc(TLS_MIN_BLOCK_BYTES, MALLOC_CAP_8BIT);
-    if (first) {
-        twoBlocks = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= TLS_MIN_BLOCK_BYTES;
-        free(first);
+    size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    bool blocksOk;
+    if (pinned) {
+        // Both buffers and the certificate verification come out of one
+        // region; requiring it up front turns a confusing certificate error
+        // into an honest memory error.
+        blocksOk = largest >= TLS_PINNED_REGION_BYTES;
+    } else {
+        // mbedTLS allocates its two record buffers back to back. Probe for the
+        // second one while holding the first, so one large block that only
+        // fits a single buffer is not mistaken for enough.
+        blocksOk = false;
+        void* first = heap_caps_malloc(TLS_MIN_BLOCK_BYTES, MALLOC_CAP_8BIT);
+        if (first) {
+            blocksOk = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >=
+                       TLS_MIN_BLOCK_BYTES;
+            free(first);
+        }
     }
-    if (freeBytes >= needed && twoBlocks) return true;
+    if (freeBytes >= needed && blocksOk) return true;
     why = "Not enough RAM for HTTPS (";
     why += heapSummary();
-    why += "; TLS needs ";
+    why += "; needs ";
     why += (unsigned)(needed / 1024U);
-    why += " KB with two ";
-    why += (unsigned)(TLS_MIN_BLOCK_BYTES / 1024U);
-    why += " KB blocks). Close Bluetooth or restart the device";
+    why += " KB free and ";
+    if (pinned) {
+        why += "one ";
+        why += (unsigned)(TLS_PINNED_REGION_BYTES / 1024U);
+        why += " KB region";
+    } else {
+        why += "two ";
+        why += (unsigned)(TLS_MIN_BLOCK_BYTES / 1024U);
+        why += " KB blocks";
+    }
+    why += "). Close Bluetooth or restart the device";
     return false;
 }
 
