@@ -8,18 +8,18 @@ static const char* INFO_JSON =
     "  \"channel\": \"stable\",\n"
     "  \"target\": \"denky32-wroom32\",\n"
     "  \"partitionScheme\": \"openos-dual-v1\",\n"
-    "  \"name\": \"OpenOS 1.4.0\",\n"
-    "  \"version\": \"1.4.0\",\n"
-    "  \"versionCode\": 21,\n"
+    "  \"name\": \"OpenOS 1.4.1\",\n"
+    "  \"version\": \"1.4.1\",\n"
+    "  \"versionCode\": 22,\n"
     "  \"minUpdaterVersionCode\": 1,\n"
-    "  \"releaseType\": \"minor\",\n"
-    "  \"description\": \"Redesigned system dialogs: a rounded card with a left-aligned heading, a muted body and pill buttons; the safe choice is highlighted when the action is destructive. OSA SDK 4 adds custom shapes (star, ngon, pie, pill, per-corner rrect4 and a 48-point path with fill, stroke, move, rotate and scale), anti-aliased drawing via smooth(1), the ui.dialog popup with custom labels, and immediate-mode widgets: ui.button, ui.switch, ui.checkbox, ui.radio, ui.progress, ui.card and ui.chip. confirm() honours its danger flag. The UI Kit app in OpenStore demonstrates all of it.\",\n"
+    "  \"releaseType\": \"patch\",\n"
+    "  \"description\": \"Fixes OpenStore reporting \\\"not enough RAM\\\" or hanging at \\\"Loading catalog\\\" after the first transfer, and Control Center not opening from a swipe-down. mbedTLS now allocates every byte of a TLS session from a dedicated 52 KB arena instead of the general heap, so a handshake no longer depends on the heap offering one large block and certificate pinning succeeds even inside a running app. The Control Center runtime is allocated from the same arena. The catalog is spooled to the SD card during download, body transfers have an inactivity limit instead of waiting for ever, and the main task stack was trimmed from 32 KB to 20 KB (measured peak under 7.5 KB), returning 12 KB to applications.\",\n"
     "  \"publishedAt\": \"2026-09-13\",\n"
-    "  \"firmware\": \"firmware-21.bin\",\n"
-    "  \"size\": 1995328,\n"
-    "  \"sha256\": \"3d986fadc46c6b6e76c71fcce58fd61b870971949982f5837517f9919ebd6f62\",\n"
+    "  \"firmware\": \"firmware-22.bin\",\n"
+    "  \"size\": 1997264,\n"
+    "  \"sha256\": \"7b9bca4ed1557502564a257cb9222c0513b4e336537a59250c4a682f47598214\",\n"
     "  \"keyId\": \"openos-release-2026-02\",\n"
-    "  \"signature\": \"MEYCIQDHlfbsI3C2/W3yt3SqScGjXKl0NASv9djbe7PurMdqoAIhANDBbpIhAGY+FxZysxiN7uGILadnkQnzxEyUBR5P9sxI\"\n"
+    "  \"signature\": \"MEUCIGILLMTes6YNEF0U9qrdSGBL+Zbj7sOVH0zVyCuiLYExAiEAg0c4w++OSvC4/67Jh9m3WnescTNYgvKjQW0cRjB6ysg=\"\n"
     "}\n";
 
 // canonical signature payload computed by the Python release tool rules
@@ -30,23 +30,23 @@ static const char* INFO_CANONICAL =
     "channel:6:stable\n"
     "target:15:denky32-wroom32\n"
     "partitionScheme:14:openos-dual-v1\n"
-    "name:12:OpenOS 1.4.0\n"
-    "version:5:1.4.0\n"
-    "versionCode:2:21\n"
+    "name:12:OpenOS 1.4.1\n"
+    "version:5:1.4.1\n"
+    "versionCode:2:22\n"
     "minUpdaterVersionCode:1:1\n"
-    "releaseType:5:minor\n"
-    "description:569:Redesigned system dialogs: a rounded card with a left-aligned heading, a muted body and pill buttons; the safe choice is highlighted when the action is destructive. OSA SDK 4 adds custom shapes (star, ngon, pie, pill, per-corner rrect4 and a 48-point path with fill, stroke, move, rotate and scale), anti-aliased drawing via smooth(1), the ui.dialog popup with custom labels, and immediate-mode widgets: ui.button, ui.switch, ui.checkbox, ui.radio, ui.progress, ui.card and ui.chip. confirm() honours its danger flag. The UI Kit app in OpenStore demonstrates all of it.\n"
+    "releaseType:5:patch\n"
+    "description:692:Fixes OpenStore reporting \"not enough RAM\" or hanging at \"Loading catalog\" after the first transfer, and Control Center not opening from a swipe-down. mbedTLS now allocates every byte of a TLS session from a dedicated 52 KB arena instead of the general heap, so a handshake no longer depends on the heap offering one large block and certificate pinning succeeds even inside a running app. The Control Center runtime is allocated from the same arena. The catalog is spooled to the SD card during download, body transfers have an inactivity limit instead of waiting for ever, and the main task stack was trimmed from 32 KB to 20 KB (measured peak under 7.5 KB), returning 12 KB to applications.\n"
     "publishedAt:10:2026-09-13\n"
-    "firmware:15:firmware-21.bin\n"
-    "size:7:1995328\n"
-    "sha256:64:3d986fadc46c6b6e76c71fcce58fd61b870971949982f5837517f9919ebd6f62\n"
+    "firmware:15:firmware-22.bin\n"
+    "size:7:1997264\n"
+    "sha256:64:7b9bca4ed1557502564a257cb9222c0513b4e336537a59250c4a682f47598214\n"
     "keyId:22:openos-release-2026-02\n";
 
 // values the parser must extract from INFO_JSON
-static const char* INFO_EXPECTED_NAME = "OpenOS 1.4.0";
-static const char* INFO_EXPECTED_FIRMWARE = "firmware-21.bin";
+static const char* INFO_EXPECTED_NAME = "OpenOS 1.4.1";
+static const char* INFO_EXPECTED_FIRMWARE = "firmware-22.bin";
 static const char* INFO_EXPECTED_KEY_ID = "openos-release-2026-02";
 static const char* INFO_EXPECTED_TARGET = "denky32-wroom32";
 static const char* INFO_EXPECTED_PARTITION = "openos-dual-v1";
-static const unsigned INFO_EXPECTED_VERSION_CODE = 21u;
-static const unsigned INFO_EXPECTED_SIZE = 1995328u;
+static const unsigned INFO_EXPECTED_VERSION_CODE = 22u;
+static const unsigned INFO_EXPECTED_SIZE = 1997264u;
