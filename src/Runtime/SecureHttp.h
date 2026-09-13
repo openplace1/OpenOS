@@ -95,14 +95,6 @@ bool memoryAvailable(String& why, bool pinned = false);
 // not in OpenOSTrustAnchors.h.
 const char* trustAnchorForHost(const String& host);
 
-// Connects to `host`:443 without verification, prints the certificate chain
-// the server presents and the result of verifying it against the pinned roots
-// (mbedTLS verify flags) — once with a free heap and once while two blocks
-// the size of the TLS record buffers are held, which is the situation the
-// real handshake verifies in. Available over the USB serial command
-// OPENOS:TLSDIAG; never run automatically, because it opens a second TLS
-// session.
-void diagnoseCertificateChain(const String& host);
 
 // Host part of an https:// URL without userinfo or port. Empty when invalid.
 String hostFromUrl(const String& url);

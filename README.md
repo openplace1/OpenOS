@@ -40,12 +40,13 @@ live. No reflash.
   - [UI widgets](#ui-widgets)
   - [Immediate-mode widgets](#immediate-mode-widgets)
   - [Notifications](#notifications)
+  - [Buffers, sockets and pixels](#buffers-sockets-and-pixels)
   - [App control](#app-control)
   - [Privileged — system](#privileged--system)
   - [Privileged — file system](#privileged--file-system)
   - [Privileged — OpenStore](#privileged--openstore)
   - [Privileged — firmware OTA](#privileged--firmware-ota)
-  - [Privileged — Wi-Fi and Bluetooth](#privileged--wi-fi-and-bluetooth)
+  - [Privileged — Wi-Fi](#privileged--wi-fi)
   - [Privileged — config](#privileged--config)
   - [Privileged — crypto](#privileged--crypto)
   - [Privileged — apps](#privileged--apps)
@@ -68,7 +69,7 @@ live. No reflash.
 | Backlight | GPIO 21, active high |
 | Touch | XPT2046 resistive on a separate remapped SPI bus: IRQ 36, MOSI 32, MISO 39, CLK 25, CS 33 |
 | Storage | microSD over HSPI: CS 5, MOSI 23, MISO 19, SCLK 18 |
-| Optional | Wi-Fi + Bluetooth (built into ESP32) |
+| Optional | Wi-Fi (built into ESP32; Bluetooth is not used — its stack was dropped in 1.6 to free ~180 KB of flash and 80 KB of RAM) |
 
 Tested on the "Cheap Yellow Display" (CYD) board.
 The TFT_eSPI setup is pinned in `platformio.ini`, so no global library
@@ -277,7 +278,7 @@ bootloader. Settings also exposes manual restore while the previous slot is
 still bootable.
 
 Manifest and firmware transfers go through `Runtime/SecureHttp`, shared with
-OpenStore. Before a handshake it pauses Classic Bluetooth, keeps the Wi-Fi
+OpenStore. Before a handshake it keeps the Wi-Fi
 modem out of power save, resolves the host up front and verifies that the
 heap can hold mbedTLS's two 16 KB record buffers (about 46 KB free with two
 17 KB blocks, 52 KB when a pinned root has to be parsed). `Runtime/HeapReserve`
@@ -328,7 +329,7 @@ Optional, must be near the top of the file.
 | Logic | `and`, `or`, `not` (`!` also accepted) |
 | Arithmetic | `+ - * / %` (`/` is float, use `int(a/b)` for integer) |
 
-Runtime limits per script: 128 KB source, 512 lines, 4096 bytes per source line,
+Runtime limits per script: 128 KB source, 768 lines, 4096 bytes per source line,
 96 variables, 24 user functions and 10 nested calls. Compiled bytecode is
 limited to 12288 bytes, 96 numeric constants, 224 string constants, 224 names and
 a 48-value operand stack. Exceeding a compiler pool is a hard compile error;
@@ -865,6 +866,33 @@ end
 |---|---|
 | `notify(msg)` | Non-blocking 22-px banner along the top edge for 1.5 s; stays visible over script drawing and restores the panel when it expires. Needs the `notify` permission |
 
+### Buffers, sockets and pixels
+
+Building blocks rather than features: with these a script can stream its
+screen, show a remote one, or speak any binary protocol. Sockets need the
+`network` permission (the same one as `http.*`). A script owns at most 8
+buffers of up to 64 KB (large ones come from the heap reserve), 4 TCP sockets
+and one UDP socket; everything is closed and freed when the script ends.
+[`Cast Receiver`](https://github.com/openplace1/OpenStore/blob/main/apps/castreceiver.osa)
+with `tools/cast_sender.py` is the worked example — a computer screen on the
+device over plain TCP.
+
+| Call | Effect / return |
+|---|---|
+| `buf.alloc(bytes)` / `buf.free(id)` / `buf.len(id)` | Byte buffer; `alloc` returns an id or `-1` |
+| `buf.get(id, i)` / `buf.set(id, i, v)` | One byte |
+| `buf.u16(id, i)` / `buf.setU16(id, i, v)` / `buf.u32(id, i)` / `buf.setU32(id, i, v)` | Little-endian integers |
+| `buf.fill(id, v, [from], [count])` / `buf.copy(dst, dstOff, src, srcOff, count)` | Bulk fill / copy |
+| `buf.str(id, [off], [count])` / `buf.write(id, off, string)` | Bytes as a string and back |
+| `screen.read(x, y, w, h, id, [off])` / `screen.write(x, y, w, h, id, [off])` | RGB565 pixels, two bytes each in memory order, rows top to bottom; returns the byte count |
+| `gfx.read(id, [off])` / `gfx.write(id, [off])` | The active sprite's pixel buffer in its own depth |
+| `net.connect(host, port, [timeoutMs])` | Outbound TCP; socket id or `-1` |
+| `net.listen(port)` / `net.accept()` / `net.stopListening()` | Inbound TCP; `accept` returns a socket id or `-1` without waiting |
+| `net.connected(s)` / `net.available(s)` / `net.remoteIP(s)` / `net.close(s)` | Socket state |
+| `net.send(s, id, [off], [count])` / `net.recv(s, id, [off], [max])` | Bytes through a buffer; `recv` returns what was waiting (`0` none, `-1` closed) |
+| `net.sendStr(s, string)` / `net.recvStr(s, [max])` | The same with strings |
+| `udp.begin(port)` / `udp.end()` / `udp.send(host, port, id, [off], [count])` / `udp.recv(id, [off])` / `udp.remoteIP()` / `udp.remotePort()` | One UDP socket |
+
 ### App control
 
 | Call | Effect |
@@ -875,10 +903,11 @@ end
 | `millis()` | ms since boot |
 | `micros()` | µs counter since boot |
 | `elapsed(startMs)` | Wrap-safe milliseconds elapsed since `startMs` |
-| `sdk.version()` | Numeric SDK compatibility level (currently `5`) |
-| `sdk.has(feature)` | Capability check, including `d3`, `d3.scene`, `sprite`, `touch`, `perf`, `http`, `json`, `opk`, `ota`, `shapes`, `path`, `widgets`, `icons`, `tabbar`, `smooth`, `store.compatibility` and `store.updateAll` |
-| `openos.version()` | Display version (currently `1.5.0`) |
-| `openos.versionCode()` | Numeric OpenOS compatibility level (currently `23`) |
+| `sdk.version()` | Numeric SDK compatibility level (currently `6`) |
+| `sdk.has(feature)` | Capability check, including `d3`, `d3.scene`, `sprite`, `touch`, `perf`, `http`, `json`, `opk`, `ota`, `shapes`, `path`, `widgets`, `icons`, `tabbar`, `smooth`, `net`, `buffers`, `pixels`, `store.compatibility` and `store.updateAll` |
+| `sys.info(key)` | Hardware and build facts: `chip`, `cores`, `cpu` (MHz), `flash`, `sketch`, `slot`, `ram`, `psram`, `idf`, `mac`, `board`, `partition`, `display`, `touch`, `sdtotal`, `sdused`, `sdtype`, `reset` |
+| `openos.version()` | Display version (currently `1.6.0`) |
+| `openos.versionCode()` | Numeric OpenOS compatibility level (currently `24`) |
 
 ### Privileged — system
 
@@ -980,7 +1009,7 @@ additionally restricted to Settings and always show a native confirmation.
 | `ota.canRollback()` / `ota.rollback()` | Query/confirm restoration of the previous bootable slot |
 | `ota.error()` | Last OTA error |
 
-### Privileged — Wi-Fi and Bluetooth
+### Privileged — Wi-Fi
 
 | Call | Description |
 |---|---|
@@ -992,8 +1021,7 @@ additionally restricted to Settings and always show a native confirmation.
 | `wifi.connect(ssid, pass)` | Returns `1` on success |
 | `wifi.disconnect()` | Drops connection |
 | `wifi.save(ssid, pass)` | Stores encrypted credentials in Config |
-| `bt.enable()` / `bt.disable()` / `bt.enabled()` | Bluetooth Classic toggle; enable/disable return `1` on success |
-| `bt.error()` | Last Bluetooth initialization error |
+| `bt.enable()` / `bt.disable()` / `bt.enabled()` / `bt.error()` | Kept as no-ops returning `0` / an explanation: Bluetooth left OpenOS in 1.6 |
 | `ntp.sync()` | Sync RTC via SNTP |
 
 ### Privileged — config
@@ -1048,6 +1076,8 @@ copies, not references.
 | `home.folderCount(i)` | Children count |
 | `home.folderAppName(i, j)` / `folderAppColor(i, j)` / `folderAppPath(i, j)` | Child fields |
 | `home.swap(i, j)` | Swap two tiles |
+| `home.move(from, to)` | Reorder by insertion (used when a tile is carried to another page) |
+| `anim.openAt(x, y, color565)` | Where the tile being launched sits on screen; the router zooms from there and back into it when the app closes |
 | `home.makeFolder(i)` | Wrap tile in a new folder; returns `1` on success |
 | `home.deleteFolder(i)` | Restore all children and remove folder; returns `0` if Home has too few free slots |
 | `home.uninstall(i)` | Confirm and uninstall a removable app; app data is preserved |
@@ -1073,7 +1103,7 @@ Two execution contexts:
 | File I/O | `fread/fwrite` under `/apps/<scriptname>/` | `fs.*` anywhere on SD |
 | KV store | `kv.get/set/del` per script | Plus `cfg.get/set/del` system-wide |
 | Crypto | — | `crypto.encrypt/decrypt` |
-| Wi-Fi / BT control | — | `wifi.*`, `bt.*`, `ntp.sync` |
+| Wi-Fi control | — | `wifi.*`, `ntp.sync` |
 | System | — | `sys.brightness/theme/setTime/reboot`, `setbright`, `setwallpaper` |
 | Home | Read tile data | Mutate (`swap`, `makeFolder`, `deleteFolder`, `addToFolder`, `uninstall`) |
 | Apps | — | `apps.scan/needsPerm/hasPerm/togglePerm` |
@@ -1128,7 +1158,7 @@ data store (home grid, wallpaper cache, theme palette).
 
 - [TFT_eSPI](https://github.com/Bodmer/TFT_eSPI) — display driver
 - [XPT2046_Touchscreen](https://github.com/PaulStoffregen/XPT2046_Touchscreen) — touch
-- arduino-esp32 (WiFi, Bluetooth, SD, HTTPClient)
+- arduino-esp32 (WiFi, SD, HTTPClient)
 
 ---
 

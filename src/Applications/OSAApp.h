@@ -28,6 +28,9 @@ public:
 
     bool   wantsOverlay() const  { return runtime.wantsOverlay; }
     void   clearWantsOverlay()   { runtime.wantsOverlay = false; }
+    // True for system scripts, the only ones that can add or remove scripts
+    // Home lists; the router rescans the card after one of them exits.
+    bool   isPrivileged() const  { return runtime.isPrivileged(); }
 
     void recycle() {
         scriptLoaded = false;

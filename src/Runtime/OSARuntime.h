@@ -4,7 +4,7 @@
 #include <XPT2046_Touchscreen.h>
 #include "OSA3D.h"
 
-#define OSA_MAX_LINES  512
+#define OSA_MAX_LINES  768
 #define OSA_MAX_VARS   96
 #define OSA_MAX_FUNCS  24
 #define OSA_STACK_MAX  10
@@ -150,6 +150,7 @@ public:
     // Set by checkOverlayGesture (swipe-down from top). Host opens Control
     // Center instead of going home when this is true on exit.
     bool    wantsOverlay = false;
+    bool    isPrivileged() const { return isException; }
 
     // Shared helpers used by Settings to keep perm-key derivation in sync.
     static String  permKeyForName(const String& appName);

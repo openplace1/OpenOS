@@ -8,11 +8,8 @@
 #include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
-#include <mbedtls/x509_crt.h>
 #include <string.h>
 
-extern bool sysBTEnabled;
-extern bool osaSuspendBluetoothForMemory(const char* reason);
 
 namespace SecureHttp {
 namespace {
@@ -86,7 +83,6 @@ RadioAwake::~RadioAwake() {
 void prepareMemory(const char* tag, const char* operation) {
     // Classic Bluetooth and TLS compete for the same internal RAM. Keep the
     // user's setting, but pause the radio; main.cpp resumes it after Home.
-    if (sysBTEnabled) osaSuspendBluetoothForMemory(operation);
     Serial.printf("[%s] %s free=%u maxBlock=%u\n", tag ? tag : "HTTPS",
                   operation ? operation : "HTTPS",
                   (unsigned)ESP.getFreeHeap(),
@@ -164,114 +160,6 @@ String hostFromUrl(const String& url) {
     return UrlUtil::hostFromHttpsUrl(url);
 }
 
-void diagnoseCertificateChain(const String& host) {
-    const char* anchor = trustAnchorForHost(host);
-    Serial.printf("[HTTPS] diag %s (%s) free=%u maxBlock=%u\n", host.c_str(),
-                  anchor ? "pinned" : "not pinned", (unsigned)ESP.getFreeHeap(),
-                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("[HTTPS] diag: Wi-Fi is not connected");
-        return;
-    }
-    // The probe below is a real TLS session, so it needs the same preparation
-    // a fetch gets; without it the diagnostic fails on its own memory.
-    HeapReserve::release("TLS diagnostic");
-
-    // Copy the presented chain out as DER, then drop the TLS session before
-    // verifying: the point of the diagnostic is to see whether verification
-    // succeeds when it is *not* competing with the two 16 KB record buffers.
-    static constexpr int MAX_CHAIN = 4;
-    uint8_t* der[MAX_CHAIN] = {nullptr, nullptr, nullptr, nullptr};
-    size_t derLength[MAX_CHAIN] = {0, 0, 0, 0};
-    int count = 0;
-    {
-        WiFiClientSecure probe;
-        probe.setInsecure();
-        probe.setHandshakeTimeout(20);
-        if (!probe.connect(host.c_str(), 443)) {
-            char detail[96] = {0};
-            int error = probe.lastError(detail, sizeof(detail));
-            Serial.printf("[HTTPS] diag: insecure connect failed (%d %s)\n", error, detail);
-            return;
-        }
-        const mbedtls_x509_crt* peer = probe.getPeerCertificate();
-        for (const mbedtls_x509_crt* cert = peer; cert && count < MAX_CHAIN;
-             cert = cert->next) {
-            char subject[128] = {0};
-            char issuer[128] = {0};
-            char algorithm[64] = {0};
-            mbedtls_x509_dn_gets(subject, sizeof(subject), &cert->subject);
-            mbedtls_x509_dn_gets(issuer, sizeof(issuer), &cert->issuer);
-            mbedtls_x509_sig_alg_gets(algorithm, sizeof(algorithm), &cert->sig_oid,
-                                      cert->sig_pk, cert->sig_md, cert->sig_opts);
-            Serial.printf("[HTTPS] diag cert %d: %u bits %s\n    subject %s\n    issuer  %s\n",
-                          count, (unsigned)mbedtls_pk_get_bitlen(&cert->pk), algorithm,
-                          subject, issuer);
-            der[count] = (uint8_t*)malloc(cert->raw.len);
-            if (!der[count]) break;
-            memcpy(der[count], cert->raw.p, cert->raw.len);
-            derLength[count] = cert->raw.len;
-            ++count;
-        }
-        if (!peer) Serial.println("[HTTPS] diag: server sent no certificate");
-        probe.stop();
-    }
-
-    if (anchor && count > 0) {
-        Serial.printf("[HTTPS] diag: session closed, free=%u maxBlock=%u\n",
-                      (unsigned)ESP.getFreeHeap(),
-                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-        mbedtls_x509_crt chain;
-        mbedtls_x509_crt_init(&chain);
-        mbedtls_x509_crt ca;
-        mbedtls_x509_crt_init(&ca);
-        bool built = true;
-        for (int i = 0; i < count && built; ++i)
-            built = mbedtls_x509_crt_parse_der(&chain, der[i], derLength[i]) == 0;
-        int parsed = mbedtls_x509_crt_parse(&ca, (const uint8_t*)anchor, strlen(anchor) + 1);
-        if (!built || parsed != 0) {
-            Serial.printf("[HTTPS] diag: rebuild failed (chain=%d anchors=-0x%04x)\n",
-                          built ? 1 : 0, (unsigned)-parsed);
-        } else {
-            uint32_t flags = 0;
-            int result = mbedtls_x509_crt_verify(&chain, &ca, nullptr, host.c_str(),
-                                                 &flags, nullptr, nullptr);
-            char info[320] = {0};
-            mbedtls_x509_crt_verify_info(info, sizeof(info), "    ", flags);
-            Serial.printf("[HTTPS] diag: verify with free heap -> ret=-0x%04x flags=0x%08x "
-                          "(free=%u maxBlock=%u)\n%s",
-                          (unsigned)-result, (unsigned)flags, (unsigned)ESP.getFreeHeap(),
-                          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT), info);
-
-            // Repeat under the memory the real handshake leaves behind: two
-            // allocations the size of mbedTLS's record buffers, held across
-            // the verification exactly as the SSL context holds them.
-            void* inBuffer = heap_caps_malloc(TLS_MIN_BLOCK_BYTES, MALLOC_CAP_8BIT);
-            void* outBuffer = heap_caps_malloc(TLS_MIN_BLOCK_BYTES, MALLOC_CAP_8BIT);
-            if (inBuffer && outBuffer) {
-                flags = 0;
-                result = mbedtls_x509_crt_verify(&chain, &ca, nullptr, host.c_str(),
-                                                 &flags, nullptr, nullptr);
-                memset(info, 0, sizeof(info));
-                mbedtls_x509_crt_verify_info(info, sizeof(info), "    ", flags);
-                Serial.printf("[HTTPS] diag: verify under TLS pressure -> ret=-0x%04x "
-                              "flags=0x%08x (free=%u maxBlock=%u)\n%s",
-                              (unsigned)-result, (unsigned)flags,
-                              (unsigned)ESP.getFreeHeap(),
-                              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
-                              info);
-            } else {
-                Serial.println("[HTTPS] diag: could not simulate TLS buffers");
-            }
-            free(inBuffer);
-            free(outBuffer);
-        }
-        mbedtls_x509_crt_free(&ca);
-        mbedtls_x509_crt_free(&chain);
-    }
-    for (int i = 0; i < count; ++i) free(der[i]);
-    HeapReserve::reclaim();
-}
 
 bool resolveHost(const String& host, IPAddress& address, String& why,
                  int attempts) {

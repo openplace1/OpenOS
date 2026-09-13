@@ -8,7 +8,6 @@
 #include <esp_system.h>
 #include <esp_bt.h>
 #include <esp_heap_caps.h>
-#include "BluetoothSerial.h"
 #include <new>
 
 #include "Config.h"
@@ -111,157 +110,18 @@ static OSAApp* g_underlyingApp = nullptr;  // activeApp captured before CC opene
 
 
 bool sysWiFiEnabled = false;
-bool sysBTEnabled = false;
 int sysBrightness = 255;
-BluetoothSerial SerialBT;
 
-static bool s_bleMemoryReleaseAttempted = false;
-static bool s_btSuspendedForMemory = false;
-static const char* s_bluetoothError = "";
-
-static void logBluetoothFailure(const char* message, esp_err_t error = ESP_OK) {
-    s_bluetoothError = message;
-    Serial.printf("[BT] %s err=%d free=%u maxBlock=%u\n", message, (int)error,
-                  (unsigned)ESP.getFreeHeap(),
-                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-}
-
-static void releaseUnusedBleMemory() {
-    if (s_bleMemoryReleaseAttempted) return;
-    s_bleMemoryReleaseAttempted = true;
-    esp_err_t result = esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
-    Serial.printf("[BT] release unused BLE memory: %d free=%u maxBlock=%u\n",
+// OpenOS 1.6 dropped Classic Bluetooth SPP: the stack cost ~180 KB of flash
+// and 80 KB of heap while enabled, on a board with neither to spare. The
+// controller's memory is handed back to the heap once at boot.
+static void releaseBluetoothMemory() {
+    esp_err_t result = esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);
+    Serial.printf("[BT] controller memory released: %d free=%u maxBlock=%u\n",
                   (int)result, (unsigned)ESP.getFreeHeap(),
                   (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 }
 
-// BluetoothSerial's bundled btStart() does not check the return value from
-// esp_bt_controller_init(). On allocation failure it can spin forever waiting
-// for a state change and eventually trip the watchdog. Initialize the Classic
-// controller here with checked return values, then let BluetoothSerial start
-// only the SPP host/profile layer.
-bool osaSetBluetoothEnabled(bool enabled) {
-    s_bluetoothError = "";
-    if (!enabled) {
-        SerialBT.end();
-        sysBTEnabled = false;
-        s_btSuspendedForMemory = false;
-        return true;
-    }
-
-    if (sysBTEnabled &&
-        esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_ENABLED)
-        return true;
-
-    releaseUnusedBleMemory();
-    esp_bt_controller_status_t status = esp_bt_controller_get_status();
-    if (status == ESP_BT_CONTROLLER_STATUS_IDLE) {
-        esp_bt_controller_config_t config = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-        config.mode = ESP_BT_MODE_CLASSIC_BT;
-        config.ble_max_conn = 0;
-        esp_err_t result = esp_bt_controller_init(&config);
-        if (result != ESP_OK) {
-            logBluetoothFailure("Not enough RAM to initialize Bluetooth", result);
-            sysBTEnabled = false;
-            return false;
-        }
-        status = esp_bt_controller_get_status();
-    }
-
-    if (status == ESP_BT_CONTROLLER_STATUS_INITED) {
-        esp_err_t result = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT);
-        if (result != ESP_OK) {
-            esp_bt_controller_deinit();
-            logBluetoothFailure("Bluetooth controller could not start", result);
-            sysBTEnabled = false;
-            return false;
-        }
-    }
-
-    if (esp_bt_controller_get_status() != ESP_BT_CONTROLLER_STATUS_ENABLED) {
-        logBluetoothFailure("Bluetooth controller entered an invalid state");
-        sysBTEnabled = false;
-        return false;
-    }
-
-    if (!SerialBT.begin("OpenOS")) {
-        SerialBT.end();
-        logBluetoothFailure("Bluetooth serial profile could not start");
-        sysBTEnabled = false;
-        return false;
-    }
-
-    sysBTEnabled = true;
-    s_btSuspendedForMemory = false;
-    Serial.printf("[BT] enabled free=%u maxBlock=%u\n",
-                  (unsigned)ESP.getFreeHeap(),
-                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-    return true;
-}
-
-// Classic BT takes roughly 80 KB on this no-PSRAM board. Keep the user's
-// enabled setting, but temporarily stop the controller when an app launch
-// would otherwise run out of heap. It is restarted after returning Home (or
-// after closing Control Center). No Config key is changed by suspension.
-static bool suspendBluetoothForMemory(const char* reason) {
-    if (!sysBTEnabled || s_btSuspendedForMemory ||
-        esp_bt_controller_get_status() != ESP_BT_CONTROLLER_STATUS_ENABLED)
-        return false;
-
-    Serial.printf("[BT] suspending for %s free=%u maxBlock=%u\n", reason,
-                  (unsigned)ESP.getFreeHeap(),
-                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-    SerialBT.end();
-    s_btSuspendedForMemory = true;
-    delay(30);
-    Serial.printf("[BT] suspended free=%u maxBlock=%u\n",
-                  (unsigned)ESP.getFreeHeap(),
-                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-    return true;
-}
-
-// PackageManager lives in a separate translation unit. Give it a narrow hook
-// to release Classic Bluetooth's large heap allocation before a TLS handshake
-// without exposing the BluetoothSerial instance or changing the saved setting.
-bool osaSuspendBluetoothForMemory(const char* reason) {
-    return suspendBluetoothForMemory(reason ? reason : "HTTPS");
-}
-
-static void prepareMemoryForScript(const String& path) {
-    if (!sysBTEnabled || s_btSuspendedForMemory ||
-        esp_bt_controller_get_status() != ESP_BT_CONTROLLER_STATUS_ENABLED)
-        return;
-
-    size_t sourceBytes = 0;
-    File source = SD.open(path);
-    if (source && !source.isDirectory()) sourceBytes = (size_t)source.size();
-    if (source) source.close();
-
-    // The source buffer, its line index, compiler temporaries, variables and
-    // initial UI strings all coexist briefly. Small apps stay connected;
-    // large apps get headroom.
-    const size_t required = sourceBytes + 24U * 1024U;
-    if (ESP.getFreeHeap() < required ||
-        heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < 12U * 1024U)
-        suspendBluetoothForMemory(path.c_str());
-}
-
-static void resumeBluetoothAfterMemoryUse() {
-    if (!s_btSuspendedForMemory) return;
-    if (!sysBTEnabled) {
-        s_btSuspendedForMemory = false;
-        return;
-    }
-    Serial.printf("[BT] resuming free=%u maxBlock=%u\n",
-                  (unsigned)ESP.getFreeHeap(),
-                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-    if (!osaSetBluetoothEnabled(true))
-        Serial.printf("[BT] resume failed: %s\n", s_bluetoothError);
-}
-
-const char* osaBluetoothLastError() {
-    return s_bluetoothError;
-}
 
 
 enum AppState {
@@ -579,8 +439,6 @@ static void runStagedFirmwareUpdate() {
 // Line-oriented commands on the USB serial port for a developer with the
 // board on a cable; nothing here changes state on the device.
 //   OPENOS:PING            firmware version and heap
-//   OPENOS:TLSDIAG [host]  certificate chain of host (default: OTA feed) and
-//                          the mbedTLS verify flags against the pinned root
 //   OPENOS:FETCH [url]     run the real SecureHttp::get path from the main
 //                          loop (default: the OpenStore catalog URL)
 void osaPollSerialCommands() {
@@ -596,12 +454,6 @@ void osaPollSerialCommands() {
                               (unsigned)ESP.getFreeHeap(),
                               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
                               (unsigned)uxTaskGetStackHighWaterMark(nullptr));
-            } else if (strncmp(line, "OPENOS:TLSDIAG", 14) == 0) {
-                String host = String(line + 14);
-                host.trim();
-                if (host.length() == 0) host = "raw.githubusercontent.com";
-                SecureHttp::diagnoseCertificateChain(host);
-                Serial.println("OPENOS:TLSDIAG-DONE");
             } else if (strncmp(line, "OPENOS:FETCH", 12) == 0) {
                 String url = String(line + 12);
                 url.trim();
@@ -661,13 +513,7 @@ static void applySystemState() {
         WiFi.mode(WIFI_OFF);
     }
 
-    // OpenOS currently exposes Classic Bluetooth SPP only. Reclaim the BLE
-    // controller block early, before the heap becomes fragmented by apps.
-    releaseUnusedBleMemory();
-    if (!osaSetBluetoothEnabled(sysBTEnabled) && isSdReady) {
-        Config::setInt("bluetooth", 0);
-        Config::save();
-    }
+    releaseBluetoothMemory();
 }
 
 // ─── Folder helpers (operate on HomeTile values) ────────────────────────────
@@ -768,9 +614,10 @@ bool osaAddToFolder(int folderIdx, int appIdx) { return addAppToFolderImpl(folde
 // cannot start it without actually launching anything.
 void osaPlayOpenAnim(int idx) {
     if (idx < 0 || idx >= home.appCount) return;
-    home.lastLaunchX     = 12 + (idx % 4) * 55 + 23;
-    home.lastLaunchY     = 30 + (idx / 4) * 80 + 23;
+    home.lastLaunchX     = 12 + (idx % 12 % 4) * 55;
+    home.lastLaunchY     = 30 + (idx % 12 / 4) * 80;
     home.lastLaunchColor = home.tiles[idx].color;
+    home.lastLaunchValid = true;
 }
 
 // The launched tile grows into the whole screen in its own colour, and that
@@ -803,11 +650,27 @@ static void playOpenAnimation(int fromX, int fromY, int fromSize, uint16_t color
 // and plays the zoom. Launches that did not come from a tile (OpenStore,
 // app.launch from another script) get no animation.
 static void animateLaunchFromHome(const String& scriptPath) {
+    if (home.lastLaunchValid) {
+        // home.osa said where the tile is (it knows the page and folder).
+        String label;
+        for (int i = 0; i < home.appCount && label.length() == 0; ++i) {
+            const HomeTile& tile = home.tiles[i];
+            if (!tile.isFolder && tile.scriptPath == scriptPath) label = tile.name;
+            else if (tile.isFolder && tile.children)
+                for (int j = 0; j < tile.childCount; ++j)
+                    if (tile.children[j].scriptPath == scriptPath) { label = tile.children[j].name; break; }
+        }
+        playOpenAnimation(home.lastLaunchX, home.lastLaunchY, 46, home.lastLaunchColor, label);
+        return;
+    }
     for (int i = 0; i < home.appCount; ++i) {
         const HomeTile& tile = home.tiles[i];
         if (!tile.isFolder && tile.scriptPath == scriptPath) {
-            playOpenAnimation(12 + (i % 4) * 55, 30 + (i / 4) * 80, 46,
-                              tile.color, tile.name);
+            home.lastLaunchX = 12 + (i % 12 % 4) * 55;
+            home.lastLaunchY = 30 + (i % 12 / 4) * 80;
+            home.lastLaunchColor = tile.color;
+            home.lastLaunchValid = true;
+            playOpenAnimation(home.lastLaunchX, home.lastLaunchY, 46, tile.color, tile.name);
             return;
         }
         if (tile.isFolder && tile.children) {
@@ -823,23 +686,104 @@ static void animateLaunchFromHome(const String& scriptPath) {
     }
 }
 
-// Loads /system/apps/home.osa into osaApp and shows it. Called on boot,
-// after lockscreen unlock, and after every app exit.
-static void loadHomeScript() {
+// The reverse of playOpenAnimation: the app's colour shrinks back into its
+// tile over the Home ground colour, then Home paints itself on top and the
+// real tile lands exactly where the colour ended. Only the strips uncovered
+// by each step are painted, so nothing flickers. Ground is the flat
+// wallpaper colour when that is what Home uses; with a bitmap wallpaper the
+// theme background stands in until Home draws.
+// The reverse of playOpenAnimation, in two halves around the Home reload
+// so nothing waits on a bare screen: the app's last frame is covered by its
+// tile colour at once (the "fold"), Home loads behind that colour, then the
+// colour shrinks into the tile over the Home ground and Home paints itself
+// on top, its real tile landing exactly where the colour ended. Only the
+// strips each step uncovers are painted, so nothing flickers. Ground is the
+// flat wallpaper colour when that is what Home uses; with a bitmap wallpaper
+// the theme background stands in until Home draws.
+static void closeAnimationFold() {
+    if (!home.lastLaunchValid) return;
+    tft.fillScreen(home.lastLaunchColor);
+}
+
+static void closeAnimationShrink() {
+    if (!home.lastLaunchValid) return;
+    home.lastLaunchValid = false;
+    const uint16_t color = home.lastLaunchColor;
+    const uint16_t ground = Wallpaper::lastColor ? Wallpaper::lastColor : Theme::bg();
+    const int toX = home.lastLaunchX, toY = home.lastLaunchY, toSize = 46;
+    int prevX = 0, prevY = 0, prevW = 240, prevH = 320;
+    const int frames = 6;
+    for (int i = 1; i <= frames; ++i) {
+        float t = (float)i / (float)frames;
+        t = t * t;
+        int x = (int)(0 + (toX - 0) * t);
+        int y = (int)(0 + (toY - 0) * t);
+        int w = (int)(240 + (toSize - 240) * t);
+        int h = (int)(320 + (toSize - 320) * t);
+        int r = (int)(2 + (12 - 2) * t);
+        if (y > prevY) tft.fillRect(prevX, prevY, prevW, y - prevY, ground);
+        if (y + h < prevY + prevH) tft.fillRect(prevX, y + h, prevW, prevY + prevH - (y + h), ground);
+        if (x > prevX) tft.fillRect(prevX, y, x - prevX, h, ground);
+        if (x + w < prevX + prevW) tft.fillRect(x + w, y, prevX + prevW - (x + w), h, ground);
+        tft.fillRect(x, y, r, r, ground);
+        tft.fillRect(x + w - r, y, r, r, ground);
+        tft.fillRect(x, y + h - r, r, r, ground);
+        tft.fillRect(x + w - r, y + h - r, r, r, ground);
+        tft.fillRoundRect(x, y, w, h, r, color);
+        prevX = x; prevY = y; prevW = w; prevH = h;
+        delay(8);
+    }
+}
+
+// Home's card scan reads a dozen manifests and headers (~2.5 s), so it runs
+// at boot and only again after something that can add or remove a script:
+// a package install or removal, or a privileged script writing, deleting or
+// compiling an .osa/.osac file. Those call osaHomeContentChanged().
+static bool g_homeRescanNeeded = true;
+
+void osaHomeContentChanged() {
+    g_homeRescanNeeded = true;
+}
+
+// Loads /system/apps/home.osa into osaApp without drawing it; showHome()
+// paints. Split so the close animation can run between the two.
+static bool prepareHomeScript() {
     osaApp.recycle();
     HeapReserve::reclaim();
     // OpenStore keeps one bounded catalog String while it is open. Home never
-    // needs that document, so release it before rediscovery and BT resume.
+    // needs that document, so release it before rediscovery.
     PackageManager::clearCatalog();
-    // App source/runtime memory has just been released, so this is the safest
-    // point to restore a controller paused for a large app.
-    resumeBluetoothAfterMemoryUse();
-    // Incremental scan: files copied/installed while OpenOS is running appear
-    // the next time Home is shown. Home::addScript deduplicates grid/folders.
-    registerOsaShortcuts();
+    if (g_homeRescanNeeded) {
+        // Incremental scan: files copied/installed while OpenOS was running
+        // appear now. Home::addScript deduplicates grid/folders.
+        uint32_t started = millis();
+        registerOsaShortcuts();
+        g_homeRescanNeeded = false;
+        Serial.printf("[HOME] rescan %u ms\n", (unsigned)(millis() - started));
+    }
     String homePath = PackageManager::resolveSystemEntry(
         "openos.home", "/system/apps/home.osa");
-    if (osaApp.loadScript(homePath)) {
+    return osaApp.loadScript(homePath);
+}
+
+static void loadHomeScript();
+
+// Fold, reload Home behind the colour, shrink, paint.
+static void returnHomeFromApp() {
+    closeAnimationFold();
+    if (prepareHomeScript()) {
+        closeAnimationShrink();
+        activeApp = &osaApp;
+        osaApp.show();
+        return;
+    }
+    home.lastLaunchValid = false;
+    loadHomeScript();
+}
+
+// Called on boot, after lockscreen unlock, and after every app exit.
+static void loadHomeScript() {
+    if (prepareHomeScript()) {
         activeApp = &osaApp;
         osaApp.show();
     } else {
@@ -857,9 +801,6 @@ static void openControlCenter(AppState returnState) {
     g_underlyingApp = activeApp;
     isSwipeDown = false;
     isGlobalSwiping = false;
-    const size_t overlayNeed = sizeof(OSAApp) + 16U * 1024U;
-    if (ESP.getFreeHeap() < overlayNeed)
-        suspendBluetoothForMemory("Control Center");
     if (!osaOverlayApp) osaOverlayApp = createOverlayApp();
     String controlCenterPath = PackageManager::resolveSystemEntry(
         "openos.controlcenter", "/system/apps/controlcenter.osa");
@@ -876,7 +817,6 @@ static void openControlCenter(AppState returnState) {
                           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
         }
         destroyOverlayApp();
-        resumeBluetoothAfterMemoryUse();
     }
 }
 
@@ -888,7 +828,6 @@ static void closeControlCenter() {
     // script content goes back to the reserve (a TLS session or a sprite
     // needs every byte of it).
     destroyOverlayApp();
-    resumeBluetoothAfterMemoryUse();
     if (activeApp != nullptr) {
         // Underlying app (or home script) is still loaded — just repaint.
         activeApp->show();
@@ -955,7 +894,6 @@ void setup() {
         sysWallpaperEnabled = (Config::getInt("wallpaper", 1) != 0);
         sysTheme            = Config::getInt("theme", 0);
         sysWiFiEnabled      = (Config::getInt("wifi", 0) != 0);
-        sysBTEnabled        = (Config::getInt("bluetooth", 0) != 0);
     }
 
     applySystemState();
@@ -963,7 +901,7 @@ void setup() {
     // The device secret must come from the hardware RNG, which is only a
     // true random source while an RF stack runs. Bring the Wi-Fi STA up for
     // the first-boot draw when the user keeps the radio off, then stop it.
-    bool radioForEntropy = !sysWiFiEnabled && !sysBTEnabled && !Crypto::hasDeviceSecret();
+    bool radioForEntropy = !sysWiFiEnabled && !Crypto::hasDeviceSecret();
     if (radioForEntropy) WiFi.mode(WIFI_STA);
     Crypto::begin();
     if (radioForEntropy) {
@@ -1086,7 +1024,6 @@ void loop() {
             if (next.length() > 0) animateLaunchFromHome(next);
             osaApp.recycle();
             if (next.length() > 0) {
-                prepareMemoryForScript(next);
                 if (osaApp.loadScript(next)) {
                     activeApp    = &osaApp;
                     currentState = STATE_IN_APP;
@@ -1121,7 +1058,7 @@ void loop() {
                     activeApp = nullptr;
                     currentState = STATE_HOMESCREEN;
                     isGlobalSwiping = false;
-                    loadHomeScript();
+                    returnHomeFromApp();
                     return;
                 }
             }
@@ -1150,7 +1087,6 @@ void loop() {
                 osaApp.clearPendingLaunch();
                 if (next.length() > 0) {
                     Serial.printf("[ROUTER] launch from app: '%s'\n", next.c_str());
-                    prepareMemoryForScript(next);
                     if (osaApp.loadScript(next)) {
                         activeApp = &osaApp;
                         currentState = STATE_IN_APP;
@@ -1163,7 +1099,7 @@ void loop() {
                 }
                 activeApp = nullptr;
                 currentState = STATE_HOMESCREEN;
-                loadHomeScript();
+                returnHomeFromApp();
                 return;
             }
         }

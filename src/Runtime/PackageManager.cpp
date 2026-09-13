@@ -16,6 +16,9 @@
 #include <mbedtls/sha256.h>
 #include <new>
 
+// main.cpp: Home rescans its tiles after the next return.
+extern void osaHomeContentChanged();
+
 extern bool isSdReady;
 
 namespace PackageManager {
@@ -1146,6 +1149,7 @@ static bool commitArchive(const String& archivePath, const OPKManifest& manifest
     }
     if (hadPrevious) removeTree(backup);
     s_restartRequired = true;
+    osaHomeContentChanged();
     return true;
 }
 
@@ -1713,6 +1717,7 @@ bool removeUserPackage(const String& id) {
     if (SD.exists(path.c_str())) return fail("Could not remove package");
     s_installedCacheReady = false;
     s_restartRequired = true;
+    osaHomeContentChanged();
     return true;
 }
 

@@ -174,6 +174,19 @@ int Home::removeScriptsUnder(const String& pathPrefix) {
     return removed;
 }
 
+bool Home::moveTile(int from, int to) {
+    if (from < 0 || to < 0 || from >= appCount || to >= appCount) return false;
+    if (from == to) return true;
+    HomeTile moving = static_cast<HomeTile&&>(tiles[from]);
+    if (from < to) {
+        for (int i = from; i < to; ++i) tiles[i] = static_cast<HomeTile&&>(tiles[i + 1]);
+    } else {
+        for (int i = from; i > to; --i) tiles[i] = static_cast<HomeTile&&>(tiles[i - 1]);
+    }
+    tiles[to] = static_cast<HomeTile&&>(moving);
+    return true;
+}
+
 void Home::saveOrder() {
     String order;
     for (int i = 0; i < appCount; i++) {

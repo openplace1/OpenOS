@@ -34,15 +34,23 @@ struct HomeTile {
 // and gesture handling via home.* runtime builtins.
 class Home {
 public:
-    static const int MAX_APPS = 16;
+    // Three pages of twelve; home.osa lays them out and pages through them.
+    static const int MAX_APPS = 36;
 
     HomeTile tiles[MAX_APPS];
     int      appCount = 0;
 
-    // Set by anim.openTile; read by main.cpp on close transitions.
-    int      lastLaunchX     = 120;
-    int      lastLaunchY     = 160;
+    // Where the last launch came from on screen (tile top-left, 46 px) and
+    // its colour: set by anim.openAt / anim.openTile from home.osa, used by
+    // main.cpp for the open zoom and, on the way back, the close zoom.
+    int      lastLaunchX     = 97;
+    int      lastLaunchY     = 137;
     uint16_t lastLaunchColor = TFT_WHITE;
+    bool     lastLaunchValid = false;
+
+    // Reorder: take the tile at `from` out and insert it at `to`, shifting
+    // the ones between. Both indices within [0, appCount).
+    bool moveTile(int from, int to);
 
     Home(TFT_eSPI* tftInstance, XPT2046_Touchscreen* tsInstance);
 

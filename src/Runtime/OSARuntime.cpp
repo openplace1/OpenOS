@@ -1,5 +1,6 @@
 #include "OSARuntime.h"
 #include "FirmwareUpdate.h"
+#include "OSANet.h"
 #include "HeapReserve.h"
 #include "PackageManager.h"
 #include "SecureHttp.h"
@@ -14,7 +15,7 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
-#include <BluetoothSerial.h>
+#include <esp_system.h>
 #include <math.h>
 #include <new>
 
@@ -102,10 +103,7 @@ extern int  sysTheme;
 extern int  sysBrightness;
 extern bool sysNtpSynced;
 extern bool sysWiFiEnabled;
-extern bool sysBTEnabled;
 extern Home home;
-extern bool osaSetBluetoothEnabled(bool enabled);
-extern const char* osaBluetoothLastError();
 // Folder + home animation helpers exposed by main.cpp. Used by OSA-side
 // home.osa so the script can trigger the same folder/open-anim UX without
 // owning the C++ Home/Folder data structures itself.
@@ -113,6 +111,14 @@ extern bool osaMakeFolder(int idx);
 extern bool osaDeleteFolder(int idx);
 extern bool osaAddToFolder(int folderIdx, int appIdx);
 extern void osaPlayOpenAnim(int idx);
+extern void osaHomeContentChanged();
+
+// A privileged script touched a file Home might list.
+static void noteScriptPathChanged(const String& path) {
+    String lower = path;
+    lower.toLowerCase();
+    if (lower.endsWith(".osa") || lower.endsWith(".osac")) osaHomeContentChanged();
+}
 
 // ─── Inline keyboard (formerly OSKeyboard) ───────────────────────────────────
 // Was a standalone Applications/OSKeyboard.* class — now lives here as a
@@ -858,6 +864,21 @@ static bool osaDrawIcon(TFT_eSPI* c, const String& name, int cx, int cy,
     return false;
 }
 
+static const char* osaResetReasonName() {
+    switch (esp_reset_reason()) {
+        case ESP_RST_POWERON: return "power on";
+        case ESP_RST_SW: return "software";
+        case ESP_RST_PANIC: return "panic";
+        case ESP_RST_INT_WDT: return "interrupt watchdog";
+        case ESP_RST_TASK_WDT: return "task watchdog";
+        case ESP_RST_WDT: return "watchdog";
+        case ESP_RST_DEEPSLEEP: return "deep sleep";
+        case ESP_RST_BROWNOUT: return "brownout";
+        case ESP_RST_SDIO: return "SDIO";
+        default: return "unknown";
+    }
+}
+
 static uint16_t osaMix565(uint16_t first, uint16_t second, float amount) {
     if (!isfinite(amount)) amount = 0.0f;
     if (amount < 0.0f) amount = 0.0f;
@@ -1581,7 +1602,46 @@ static void wS(File& f, const String& s) {
     w16(f, n);
     for (uint16_t i = 0; i < n; i++) f.write((uint8_t)s[i]);
 }
-static bool readExact(File& f, void* dst, size_t len) {
+// A 512-byte read-ahead over a File. The SD library's one-byte read() costs
+// a full VFS round trip each, which made a cached 5 KB bytecode load take
+// longer than compiling; reading in blocks brings it to a few milliseconds.
+struct OsacReader {
+    File& file;
+    uint8_t buffer[512];
+    size_t filled = 0;
+    size_t cursor = 0;
+    size_t consumed = 0;   // bytes handed out so far == file position
+    explicit OsacReader(File& f) : file(f) {}
+    bool refill() {
+        int got = file.read(buffer, sizeof(buffer));
+        if (got <= 0) { filled = cursor = 0; return false; }
+        filled = (size_t)got;
+        cursor = 0;
+        return true;
+    }
+    int read() {
+        if (cursor >= filled && !refill()) return -1;
+        ++consumed;
+        return buffer[cursor++];
+    }
+    int read(uint8_t* out, size_t count) {
+        size_t done = 0;
+        while (done < count) {
+            if (cursor >= filled && !refill()) break;
+            size_t take = min(count - done, filled - cursor);
+            memcpy(out + done, buffer + cursor, take);
+            cursor += take;
+            done += take;
+        }
+        consumed += done;
+        return (int)done;
+    }
+    size_t position() const { return consumed; }
+    size_t size() { return (size_t)file.size(); }
+    void close() { file.close(); }
+};
+
+static bool readExact(OsacReader& f, void* dst, size_t len) {
     return len == 0 || f.read((uint8_t*)dst, len) == (int)len;
 }
 static bool readLineLimited(File& f, String& out, size_t maximum) {
@@ -1601,25 +1661,25 @@ static bool readLineLimited(File& f, String& out, size_t maximum) {
     }
     return true;
 }
-static bool r8(File& f, uint8_t& out) {
+static bool r8(OsacReader& f, uint8_t& out) {
     int v = f.read();
     if (v < 0) return false;
     out = (uint8_t)v;
     return true;
 }
-static bool r16(File& f, uint16_t& out) {
+static bool r16(OsacReader& f, uint16_t& out) {
     uint8_t a, b;
     if (!r8(f, a) || !r8(f, b)) return false;
     out = (uint16_t)a | ((uint16_t)b << 8);
     return true;
 }
-static bool r32(File& f, uint32_t& out) {
+static bool r32(OsacReader& f, uint32_t& out) {
     uint16_t low, high;
     if (!r16(f, low) || !r16(f, high)) return false;
     out = (uint32_t)low | ((uint32_t)high << 16);
     return true;
 }
-static bool rD(File& f, double& out) {
+static bool rD(OsacReader& f, double& out) {
     return readExact(f, &out, sizeof(out));
 }
 
@@ -1633,7 +1693,7 @@ static void sourceStampOf(const String& path, uint32_t& size, uint32_t& mtime) {
     mtime = (uint32_t)f.getLastWrite();
     f.close();
 }
-static bool rS(File& f, String& out, uint16_t maxLen) {
+static bool rS(OsacReader& f, String& out, uint16_t maxLen) {
     uint16_t n;
     if (!r16(f, n) || n > maxLen ||
         (uint32_t)f.position() + n > (uint32_t)f.size()) return false;
@@ -1746,8 +1806,9 @@ String OSARuntime::bytecodeCachePath(const String& scriptPath) {
 
 bool OSARuntime::loadOsac(const String& srcPath, const SourceStamp* expectSource) {
     if (!isSdReady) { if (!expectSource) setError(0, "No SD card"); return false; }
-    File f = SD.open(srcPath);
-    if (!f) { if (!expectSource) setError(0, "Not found: " + srcPath); return false; }
+    File file = SD.open(srcPath);
+    if (!file) { if (!expectSource) setError(0, "Not found: " + srcPath); return false; }
+    OsacReader f(file);
     if ((size_t)f.size() > 96 * 1024) {
         f.close(); setError(0, ".osac exceeds 96 KB"); return false;
     }
@@ -2935,6 +2996,7 @@ void OSARuntime::reset() {
     releaseStringStorage(pendingLaunch);
     clearRichMenuCache();
     clearAppsScanCache();
+    OSANet::reset();
     if (activeSprite) {
         activeSprite->deleteSprite();
         delete activeSprite;
@@ -4361,15 +4423,19 @@ static bool readOsacHeader(const String& path, String& appName,
                             uint16_t& appColor, bool& isApp,
                             bool& isException, uint8_t& perms) {
     if (!isSdReady) return false;
-    File f = SD.open(path);
-    if (!f) return false;
+    File file = SD.open(path);
+    if (!file) return false;
+    OsacReader f(file);
     char magic[4];
     if (!readExact(f, magic, sizeof(magic))) { f.close(); return false; }
     if (magic[0] != 'O' || magic[1] != 'S' || magic[2] != 'A' || magic[3] != 'C') {
         f.close(); return false;
     }
     uint8_t version, appFlag, serializedException;
+    uint32_t stampSize, stampMtime;
+    uint16_t builtBy;
     if (!r8(f, version) || version != OSAC_VERSION ||
+        !r32(f, stampSize) || !r32(f, stampMtime) || !r16(f, builtBy) ||
         !rS(f, appName, 64) || !r16(f, appColor) ||
         !r8(f, appFlag) || !r8(f, serializedException) || !r8(f, perms)) {
         f.close(); return false;
@@ -4380,6 +4446,47 @@ static bool readOsacHeader(const String& path, String& appName,
     f.close();
     return true;
 }
+
+// The header directives (#app, #isApp, #appColor, #perm) live in the block
+// of '#' lines at the top of a script. Reading that block in one 2 KB read
+// and stopping at the first line of code replaced four whole-file, byte-wise
+// scans per script: Home's rescan of fourteen scripts took 2.6 s that way
+// and a cached Home load 480 ms.
+struct HeaderBlock {
+    char data[2048];
+    int  length = 0;
+    int  cursor = 0;
+    bool load(const String& path) {
+        length = cursor = 0;
+        if (!isSdReady) return false;
+        File f = SD.open(path);
+        if (!f) return false;
+        int got = f.read((uint8_t*)data, sizeof(data) - 1);
+        f.close();
+        if (got < 0) return false;
+        length = got;
+        data[length] = 0;
+        return true;
+    }
+    // Next trimmed header line; false at the first line of code or the end.
+    bool next(String& out) {
+        while (cursor < length) {
+            int start = cursor;
+            while (cursor < length && data[cursor] != '\n') ++cursor;
+            int end = cursor;
+            if (cursor < length) ++cursor;
+            while (start < end && (data[start] == ' ' || data[start] == '\t' || data[start] == '\r')) ++start;
+            while (end > start && (data[end - 1] == ' ' || data[end - 1] == '\t' || data[end - 1] == '\r')) --end;
+            if (end == start) continue;
+            if (data[start] != '#') return false;
+            out = "";
+            if (!out.reserve((unsigned)(end - start))) return false;
+            out.concat(data + start, (unsigned)(end - start));
+            return true;
+        }
+        return false;
+    }
+};
 
 String OSARuntime::readAppNameFromFile(const String& path) {
     String fallback;
@@ -4393,24 +4500,17 @@ String OSARuntime::readAppNameFromFile(const String& path) {
         return fallback;
     }
 
-    if (!isSdReady) return fallback;
-    File f = SD.open(path);
-    if (!f) return fallback;
-
-    // Scan the whole file — #app may not be the first line (comments, blanks).
-    while (f.available()) {
-        String raw;
-        if (!readLineLimited(f, raw, OSA_MAX_LINE_BYTES)) { f.close(); return fallback; }
-        raw.trim();
+    HeaderBlock header;
+    if (!header.load(path)) return fallback;
+    String raw;
+    while (header.next(raw)) {
         if (raw.startsWith("#app ")) {
             String nm = raw.substring(5); nm.trim();
             if (nm.startsWith("\"")) nm = nm.substring(1);
             if (nm.endsWith("\""))   nm = nm.substring(0, nm.length() - 1);
-            f.close();
             return nm.length() > 0 ? nm : fallback;
         }
     }
-    f.close();
     return fallback;
 }
 
@@ -4421,15 +4521,11 @@ uint8_t OSARuntime::readRequiredPermsFromFile(const String& path) {
         if (readOsacHeader(path, n, c, isApp, isE, p)) return p;
         return 0;
     }
-    if (!isSdReady) return 0;
-    File f = SD.open(path);
-    if (!f) return 0;
-
+    HeaderBlock header;
+    if (!header.load(path)) return 0;
     uint8_t mask = 0;
-    while (f.available()) {
-        String raw;
-        if (!readLineLimited(f, raw, OSA_MAX_LINE_BYTES)) { f.close(); return 0; }
-        raw.trim();
+    String raw;
+    while (header.next(raw)) {
         if (!raw.startsWith("#perm ") && raw != "#perm") continue;
         if (raw.length() <= 6) continue;
         String list = raw.substring(6);
@@ -4442,7 +4538,6 @@ uint8_t OSARuntime::readRequiredPermsFromFile(const String& path) {
             }
         }
     }
-    f.close();
     return mask;
 }
 
@@ -4453,19 +4548,14 @@ bool OSARuntime::readIsAppFromFile(const String& path) {
         if (readOsacHeader(path, n, c, isApp, isE, p)) return isApp;
         return false;
     }
-    if (!isSdReady) return false;
-    File f = SD.open(path);
-    if (!f) return false;
-    while (f.available()) {
-        String raw;
-        if (!readLineLimited(f, raw, OSA_MAX_LINE_BYTES)) { f.close(); return false; }
-        raw.trim();
+    HeaderBlock header;
+    if (!header.load(path)) return false;
+    String raw;
+    while (header.next(raw)) {
         if (!raw.startsWith("#isApp")) continue;
         String v = raw.substring(6); v.trim(); v.toLowerCase();
-        f.close();
         return v == "true" || v == "1" || v == "yes";
     }
-    f.close();
     return false;
 }
 
@@ -4501,13 +4591,10 @@ uint16_t OSARuntime::readIconColorFromFile(const String& path, uint16_t fallback
         if (readOsacHeader(path, n, c, isApp, isE, p) && c != 0) return c;
         return fallback;
     }
-    if (!isSdReady) return fallback;
-    File f = SD.open(path);
-    if (!f) return fallback;
-    while (f.available()) {
-        String raw;
-        if (!readLineLimited(f, raw, OSA_MAX_LINE_BYTES)) { f.close(); return fallback; }
-        raw.trim();
+    HeaderBlock header;
+    if (!header.load(path)) return fallback;
+    String raw;
+    while (header.next(raw)) {
         if (!raw.startsWith("#appColor")) continue;
         String v = raw.substring(9); v.trim();
         // Accept "#RRGGBB", #RRGGBB, RRGGBB, with optional quotes.
@@ -4515,19 +4602,17 @@ uint16_t OSARuntime::readIconColorFromFile(const String& path, uint16_t fallback
         if (v.endsWith("\""))   v = v.substring(0, v.length() - 1);
         v.trim();
         if (v.startsWith("#"))  v = v.substring(1);
-        if (v.length() != 6) { f.close(); return fallback; }
+        if (v.length() != 6) return fallback;
         for (int i = 0; i < 6; i++) {
-            if (!isxdigit(v[i])) { f.close(); return fallback; }
+            if (!isxdigit(v[i])) return fallback;
         }
         long hex = strtol(v.c_str(), nullptr, 16);
         uint8_t r = (hex >> 16) & 0xFF;
         uint8_t g = (hex >> 8)  & 0xFF;
         uint8_t b =  hex        & 0xFF;
-        f.close();
         // TFT_eSPI::color565 packs as ((r&0xF8)<<8)|((g&0xFC)<<3)|(b>>3).
         return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
     }
-    f.close();
     return fallback;
 }
 
@@ -5497,7 +5582,8 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
                          feature == "shapes" || feature == "path" ||
                          feature == "widgets" || feature == "smooth" ||
                          feature == "d3.scene" || feature == "icons" ||
-                         feature == "tabbar";
+                         feature == "tabbar" || feature == "net" ||
+                         feature == "buffers" || feature == "pixels";
         return OSAVal(available ? 1.0 : 0.0);
     }
     if (IS("openos.version"))
@@ -5563,6 +5649,40 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     if (IS("theme"))  return OSAVal((double)sysTheme);
     if (IS("uptime")) return OSAVal((double)(millis() / 1000));
     if (IS("freeram")) return OSAVal((double)ESP.getFreeHeap());
+    // sys.info(key) — hardware and build facts for an About screen.
+    if (IS("sys.info")) {
+        String key = S(0);
+        key.toLowerCase();
+        if (key == "chip") {
+            return OSAVal(String(ESP.getChipModel()) + " rev " + ESP.getChipRevision());
+        }
+        if (key == "cores") return OSAVal((double)ESP.getChipCores());
+        if (key == "cpu") return OSAVal((double)ESP.getCpuFreqMHz());
+        if (key == "flash") return OSAVal((double)ESP.getFlashChipSize());
+        if (key == "sketch") return OSAVal((double)ESP.getSketchSize());
+        if (key == "slot") return OSAVal((double)0x1F0000);
+        if (key == "ram") return OSAVal((double)ESP.getHeapSize());
+        if (key == "psram") return OSAVal((double)ESP.getPsramSize());
+        if (key == "idf") return OSAVal(String(ESP.getSdkVersion()));
+        if (key == "mac") return OSAVal(WiFi.macAddress());
+        if (key == "board") return OSAVal(String(OpenOSBuild::OTA_TARGET));
+        if (key == "partition") return OSAVal(String(OpenOSBuild::OTA_PARTITION_SCHEME));
+        if (key == "display") return OSAVal(String("ILI9341 240x320"));
+        if (key == "touch") return OSAVal(String("XPT2046"));
+        if (key == "sdtotal") return OSAVal(isSdReady ? (double)SD.totalBytes() : 0.0);
+        if (key == "sdused") return OSAVal(isSdReady ? (double)SD.usedBytes() : 0.0);
+        if (key == "sdtype") {
+            if (!isSdReady) return OSAVal(String("none"));
+            switch (SD.cardType()) {
+                case CARD_MMC: return OSAVal(String("MMC"));
+                case CARD_SD: return OSAVal(String("SDSC"));
+                case CARD_SDHC: return OSAVal(String("SDHC"));
+                default: return OSAVal(String("unknown"));
+            }
+        }
+        if (key == "reset") return OSAVal(String(osaResetReasonName()));
+        return OSAVal(String());
+    }
     if (IS("sdready")) return OSAVal(isSdReady ? 1.0 : 0.0);
     if (IS("getbright")) return OSAVal((double)sysBrightness);
     if (IS("getwallpaper")) return OSAVal(Config::get("wallpaper_path", ""));
@@ -7686,6 +7806,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         if (!needException("fs.write")) return OSAVal(0.0);
         if (!isSdReady) return OSAVal(0.0);
         String p = S(0);
+        noteScriptPathChanged(p);
         SD.remove(p.c_str());
         File f = SD.open(p, FILE_WRITE);
         if (!f) return OSAVal(0.0);
@@ -7706,6 +7827,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     if (IS("fs.delete")) {
         if (!needException("fs.delete")) return OSAVal(0.0);
         if (!isSdReady) return OSAVal(0.0);
+        noteScriptPathChanged(S(0));
         return OSAVal(SD.remove(S(0).c_str()) ? 1.0 : 0.0);
     }
     if (IS("fs.mkdir")) {
@@ -7722,6 +7844,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     if (IS("fs.wipe")) {
         if (!needException("fs.wipe")) return OSAVal(0.0);
         if (!isSdReady) return OSAVal(0.0);
+        osaHomeContentChanged();
         struct Rec {
             static void walk(const String& dirPath) {
                 File dir = SD.open(dirPath);
@@ -7830,25 +7953,9 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         return OSAVal();
     }
 
-    // ── Bluetooth control (privileged) ───────────────────────────────────────
-    if (IS("bt.enable")) {
-        if (!needException("bt.enable")) return OSAVal();
-        if (!osaSetBluetoothEnabled(true)) {
-            showSystemPopup("Bluetooth", osaBluetoothLastError(),
-                            "Bluetooth remains off", "", "OK", false);
-            return OSAVal(0.0);
-        }
-        Config::setInt("bluetooth", 1); Config::save();
-        return OSAVal(1.0);
-    }
-    if (IS("bt.disable")) {
-        if (!needException("bt.disable")) return OSAVal();
-        osaSetBluetoothEnabled(false);
-        Config::setInt("bluetooth", 0); Config::save();
-        return OSAVal(1.0);
-    }
-    if (IS("bt.enabled")) return OSAVal(sysBTEnabled ? 1.0 : 0.0);
-    if (IS("bt.error")) return OSAVal(String(osaBluetoothLastError()));
+    // ── Bluetooth — removed in 1.6; kept as no-ops so older scripts run ─────
+    if (IS("bt.enable") || IS("bt.disable") || IS("bt.enabled")) return OSAVal(0.0);
+    if (IS("bt.error")) return OSAVal(String("Bluetooth is not available in this build"));
 
     // ── sys.setTime(h, m, s, day, mon, year) — sets RTC ─────────────────────
     if (IS("sys.setTime")) {
@@ -8078,6 +8185,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     if (IS("osa.compile")) {
         if (!needException("osa.compile")) return OSAVal(-1.0);
         String src = S(0), dst = S(1);
+        noteScriptPathChanged(dst);
         OSARuntime* tmp = new OSARuntime(tft, ts);
         if (!tmp) return OSAVal(-2.0);
         if (!tmp->loadScript(src)) {
@@ -8121,6 +8229,167 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     // ═════════════════════════════════════════════════════════════════════════
     // Extended SDK — drawing extras, gestures, animation, home access
     // ═════════════════════════════════════════════════════════════════════════
+
+    // ── Byte buffers, sockets and pixel access ─────────────────────────────
+    // Building blocks rather than features: with these a script can stream
+    // its screen, show a remote one, or speak any binary protocol.
+    if (name.startsWith("buf.")) {
+        int id = iN(0);
+        uint8_t* data = OSANet::bufData(id);
+        size_t length = OSANet::bufLength(id);
+        if (IS("buf.alloc")) return OSAVal((double)OSANet::bufAlloc((size_t)max(0, iN(0))));
+        if (IS("buf.free")) return OSAVal(OSANet::bufFree(id) ? 1.0 : 0.0);
+        if (IS("buf.len")) return OSAVal((double)length);
+        if (!data) return OSAVal(-1.0);
+        if (IS("buf.get")) {
+            int i = iN(1);
+            if (i < 0 || (size_t)i >= length) return OSAVal(-1.0);
+            return OSAVal((double)data[i]);
+        }
+        if (IS("buf.set")) {
+            int i = iN(1);
+            if (i < 0 || (size_t)i >= length) return OSAVal(0.0);
+            data[i] = (uint8_t)iN(2);
+            return OSAVal(1.0);
+        }
+        if (IS("buf.u16") || IS("buf.setU16")) {
+            int i = iN(1);
+            if (i < 0 || (size_t)i + 2 > length) return OSAVal(-1.0);
+            if (IS("buf.u16")) return OSAVal((double)(data[i] | (data[i + 1] << 8)));
+            uint32_t v = (uint32_t)N(2);
+            data[i] = (uint8_t)v; data[i + 1] = (uint8_t)(v >> 8);
+            return OSAVal(1.0);
+        }
+        if (IS("buf.u32") || IS("buf.setU32")) {
+            int i = iN(1);
+            if (i < 0 || (size_t)i + 4 > length) return OSAVal(-1.0);
+            if (IS("buf.u32"))
+                return OSAVal((double)((uint32_t)data[i] | ((uint32_t)data[i + 1] << 8) |
+                                       ((uint32_t)data[i + 2] << 16) | ((uint32_t)data[i + 3] << 24)));
+            uint32_t v = (uint32_t)N(2);
+            data[i] = (uint8_t)v; data[i + 1] = (uint8_t)(v >> 8);
+            data[i + 2] = (uint8_t)(v >> 16); data[i + 3] = (uint8_t)(v >> 24);
+            return OSAVal(1.0);
+        }
+        if (IS("buf.fill")) {
+            int from = constrain(iN(2, 0), 0, (int)length);
+            int count = constrain(iN(3, (int)length - from), 0, (int)length - from);
+            memset(data + from, iN(1), (size_t)count);
+            return OSAVal((double)count);
+        }
+        if (IS("buf.copy")) {
+            // buf.copy(dst, dstOff, src, srcOff, count)
+            uint8_t* src = OSANet::bufData(iN(2));
+            size_t srcLength = OSANet::bufLength(iN(2));
+            int dstOff = iN(1), srcOff = iN(3), count = iN(4);
+            if (!src || dstOff < 0 || srcOff < 0 || count < 0 ||
+                (size_t)dstOff + count > length || (size_t)srcOff + count > srcLength)
+                return OSAVal(0.0);
+            memmove(data + dstOff, src + srcOff, (size_t)count);
+            return OSAVal((double)count);
+        }
+        if (IS("buf.str")) {
+            int off = iN(1, 0), count = iN(2, (int)length - iN(1, 0));
+            if (off < 0 || count < 0 || (size_t)off + count > length) return OSAVal("");
+            String out;
+            if (!out.reserve((unsigned)count)) return OSAVal("");
+            out.concat((const char*)data + off, (unsigned)count);
+            return OSAVal(out);
+        }
+        if (IS("buf.write")) {
+            int off = iN(1, 0);
+            String text = S(2);
+            if (off < 0 || (size_t)off + text.length() > length) return OSAVal(0.0);
+            memcpy(data + off, text.c_str(), text.length());
+            return OSAVal((double)text.length());
+        }
+        setError(-1, "Unknown: " + name);
+        return OSAVal();
+    }
+    if (IS("screen.read") || IS("screen.write")) {
+        // screen.read(x, y, w, h, buf, [off]) / screen.write(...) — RGB565,
+        // two bytes per pixel as stored in memory, rows top to bottom.
+        int id = iN(4), off = max(0, iN(5, 0));
+        uint8_t* data = OSANet::bufData(id);
+        size_t length = OSANet::bufLength(id);
+        if (!data || (size_t)off > length) return OSAVal(0.0);
+        if (IS("screen.read"))
+            return OSAVal((double)OSANet::screenRead(tft, iN(0), iN(1), iN(2), iN(3),
+                                                     data + off, length - off));
+        return OSAVal((double)OSANet::screenWrite(tft, iN(0), iN(1), iN(2), iN(3),
+                                                  data + off, length - off));
+    }
+    if (IS("gfx.read") || IS("gfx.write")) {
+        int id = iN(0), off = max(0, iN(1, 0));
+        uint8_t* data = OSANet::bufData(id);
+        size_t length = OSANet::bufLength(id);
+        if (!data || !activeSprite || (size_t)off > length) return OSAVal(0.0);
+        if (IS("gfx.read"))
+            return OSAVal((double)OSANet::spriteRead(activeSprite, data + off, length - off));
+        return OSAVal((double)OSANet::spriteWrite(activeSprite, data + off, length - off));
+    }
+    if (name.startsWith("net.") || name.startsWith("udp.")) {
+        if (!checkPerm(OSA_PERM_NETWORK, "Network", "Open network connections over Wi-Fi"))
+            return OSAVal(-1.0);
+        if (IS("net.connect"))
+            return OSAVal((double)OSANet::tcpConnect(S(0), (uint16_t)iN(1), (uint32_t)max(500, iN(2, 5000))));
+        if (IS("net.listen")) return OSAVal(OSANet::tcpListen((uint16_t)iN(0)) ? 1.0 : 0.0);
+        if (IS("net.stopListening")) { OSANet::tcpStopListening(); return OSAVal(); }
+        if (IS("net.accept")) return OSAVal((double)OSANet::tcpAccept());
+        if (IS("net.connected")) return OSAVal(OSANet::tcpConnected(iN(0)) ? 1.0 : 0.0);
+        if (IS("net.available")) return OSAVal((double)OSANet::tcpAvailable(iN(0)));
+        if (IS("net.close")) { OSANet::tcpClose(iN(0)); return OSAVal(); }
+        if (IS("net.remoteIP")) return OSAVal(OSANet::tcpRemoteIP(iN(0)));
+        if (IS("net.send") || IS("net.recv")) {
+            // (sock, buf, [off], [count])
+            int id = iN(1), off = max(0, iN(2, 0));
+            uint8_t* data = OSANet::bufData(id);
+            size_t length = OSANet::bufLength(id);
+            if (!data || (size_t)off > length) return OSAVal(-1.0);
+            size_t room = length - off;
+            size_t count = argc >= 4 ? (size_t)max(0, iN(3)) : room;
+            if (count > room) count = room;
+            if (IS("net.send")) return OSAVal((double)OSANet::tcpSend(iN(0), data + off, count));
+            return OSAVal((double)OSANet::tcpReceive(iN(0), data + off, count));
+        }
+        if (IS("net.sendStr")) {
+            String text = S(1);
+            return OSAVal((double)OSANet::tcpSend(iN(0), (const uint8_t*)text.c_str(), text.length()));
+        }
+        if (IS("net.recvStr")) {
+            int maximum = constrain(iN(1, 256), 1, 1024);
+            uint8_t* temp = (uint8_t*)malloc((size_t)maximum);
+            if (!temp) return OSAVal("");
+            int got = OSANet::tcpReceive(iN(0), temp, (size_t)maximum);
+            String out;
+            if (got > 0 && out.reserve((unsigned)got)) out.concat((const char*)temp, (unsigned)got);
+            free(temp);
+            return OSAVal(out);
+        }
+        if (IS("udp.begin")) return OSAVal(OSANet::udpBegin((uint16_t)iN(0)) ? 1.0 : 0.0);
+        if (IS("udp.end")) { OSANet::udpEnd(); return OSAVal(); }
+        if (IS("udp.send")) {
+            // udp.send(host, port, buf, [off], [count])
+            int id = iN(2), off = max(0, iN(3, 0));
+            uint8_t* data = OSANet::bufData(id);
+            size_t length = OSANet::bufLength(id);
+            if (!data || (size_t)off > length) return OSAVal(-1.0);
+            size_t count = argc >= 5 ? (size_t)max(0, iN(4)) : length - off;
+            if (count > length - off) count = length - off;
+            return OSAVal((double)OSANet::udpSend(S(0), (uint16_t)iN(1), data + off, count));
+        }
+        if (IS("udp.recv")) {
+            int id = iN(0), off = max(0, iN(1, 0));
+            uint8_t* data = OSANet::bufData(id);
+            size_t length = OSANet::bufLength(id);
+            if (!data || (size_t)off > length) return OSAVal(-1.0);
+            return OSAVal((double)OSANet::udpReceive(data + off, length - off));
+        }
+        if (IS("udp.remoteIP")) return OSAVal(OSANet::udpRemoteIP());
+        if (IS("udp.remotePort")) return OSAVal((double)OSANet::udpRemotePort());
+        setError(-1, "Unknown: " + name);
+        return OSAVal();
+    }
 
     // ── Drawing extras ───────────────────────────────────────────────────────
     if (IS("smooth")) { drawSmooth = iN(0, 1) != 0; return OSAVal(); }
@@ -8418,6 +8687,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         return OSAVal(osaDeleteFolder(iN(0)) ? 1.0 : 0.0);
     }
     if (IS("home.uninstall")) {
+        osaHomeContentChanged();
         if (!isException) return OSAVal(0.0);
         int i = iN(0);
         if (i < 0 || i >= home.appCount || home.tiles[i].isFolder)
@@ -8474,6 +8744,22 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         if (!isException) return OSAVal();
         osaPlayOpenAnim(iN(0));
         return OSAVal();
+    }
+    // anim.openAt(x, y, color565) — where on screen the tile being launched
+    // sits (top-left of the 46 px tile) and its colour; the router zooms
+    // from there and back into it when the app closes.
+    if (IS("anim.openAt")) {
+        if (!isException) return OSAVal();
+        home.lastLaunchX = constrain(iN(0), -46, 240);
+        home.lastLaunchY = constrain(iN(1), -46, 320);
+        home.lastLaunchColor = (uint16_t)iN(2);
+        home.lastLaunchValid = true;
+        return OSAVal();
+    }
+    // home.move(from, to) — reorder by insertion, unlike home.swap.
+    if (IS("home.move")) {
+        if (!isException) return OSAVal(0.0);
+        return OSAVal(home.moveTile(iN(0), iN(1)) ? 1.0 : 0.0);
     }
 
     // ── theme.* — current theme palette as packed RGB565 ─────────────────────
