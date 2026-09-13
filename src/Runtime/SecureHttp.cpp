@@ -321,10 +321,12 @@ int get(HTTPClient& http, WiFiClientSecure& client, const String& url,
         const bool usePin = anchor != nullptr && !pinRejected;
         if (usePin) client.setCACert(anchor);
         else        client.setInsecure();
-        Serial.printf("[HTTPS] connect %s%s free=%u maxBlock=%u\n", host.c_str(),
+        Serial.printf("[HTTPS] connect %s%s free=%u maxBlock=%u stackFree=%u\n",
+                      host.c_str(),
                       usePin ? " (pinned)" : (anchor ? " (pin rejected, unpinned)" : ""),
                       (unsigned)ESP.getFreeHeap(),
-                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+                      (unsigned)uxTaskGetStackHighWaterMark(nullptr));
         client.setHandshakeTimeout(request.handshakeTimeoutS);
         http.setConnectTimeout((int32_t)request.connectTimeoutMs);
         http.setTimeout((uint16_t)request.readTimeoutMs);

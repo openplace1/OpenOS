@@ -8,18 +8,18 @@ static const char* INFO_JSON =
     "  \"channel\": \"stable\",\n"
     "  \"target\": \"denky32-wroom32\",\n"
     "  \"partitionScheme\": \"openos-dual-v1\",\n"
-    "  \"name\": \"OpenOS 1.2.7\",\n"
-    "  \"version\": \"1.2.7\",\n"
-    "  \"versionCode\": 10,\n"
+    "  \"name\": \"OpenOS 1.2.8\",\n"
+    "  \"version\": \"1.2.8\",\n"
+    "  \"versionCode\": 11,\n"
     "  \"minUpdaterVersionCode\": 1,\n"
     "  \"releaseType\": \"patch\",\n"
-    "  \"description\": \"Instalacja OTA otwiera zapis do pamieci flash zanim powstanie sesja TLS. Bufor sektora i bufor transferu potrzebuja po 4 KB ciaglej pamieci, ktorej otwarte polaczenie juz nie zostawia - biblioteka Update zglaszala to jako blad bez tresci (\\\"No Error\\\").\",\n"
+    "  \"description\": \"Log polaczenia HTTPS pokazuje teraz takze zapas stosu, co pozwala porownac warunki, w ktorych weryfikacja przypietego certyfikatu raz przechodzi, a raz jest odrzucana i wymusza polaczenie bez przypiecia.\",\n"
     "  \"publishedAt\": \"2026-09-13\",\n"
-    "  \"firmware\": \"firmware-10.bin\",\n"
-    "  \"size\": 1982448,\n"
-    "  \"sha256\": \"fe4a33608455e9874056e683a35c544f5d8dba39eaf4d7aed6709bb12a35a21b\",\n"
+    "  \"firmware\": \"firmware-11.bin\",\n"
+    "  \"size\": 1982480,\n"
+    "  \"sha256\": \"1b700b027f6efea47e040af89f44b3d8aa4c3b24d32e6258f7beb9e812057489\",\n"
     "  \"keyId\": \"openos-release-2026-02\",\n"
-    "  \"signature\": \"MEQCIDsbT9L73S3j0EuVrA/GZI71EI9WOZEDbRr8vKPvHzK9AiAg4Z1kPhG3u7M5cLC2pAYr6SHYXMVB2LcyeZTZJKsOqQ==\"\n"
+    "  \"signature\": \"MEUCIHjn02J75zrQh0UrIE1Icz5QGbUrHRDWm4RnMIQzC7OcAiEA0oJHfJeSm5GRilC4KxCNIAvwmrptobWvdWaRiRXiBbc=\"\n"
     "}\n";
 
 // canonical signature payload computed by the Python release tool rules
@@ -30,23 +30,23 @@ static const char* INFO_CANONICAL =
     "channel:6:stable\n"
     "target:15:denky32-wroom32\n"
     "partitionScheme:14:openos-dual-v1\n"
-    "name:12:OpenOS 1.2.7\n"
-    "version:5:1.2.7\n"
-    "versionCode:2:10\n"
+    "name:12:OpenOS 1.2.8\n"
+    "version:5:1.2.8\n"
+    "versionCode:2:11\n"
     "minUpdaterVersionCode:1:1\n"
     "releaseType:5:patch\n"
-    "description:251:Instalacja OTA otwiera zapis do pamieci flash zanim powstanie sesja TLS. Bufor sektora i bufor transferu potrzebuja po 4 KB ciaglej pamieci, ktorej otwarte polaczenie juz nie zostawia - biblioteka Update zglaszala to jako blad bez tresci (\"No Error\").\n"
+    "description:203:Log polaczenia HTTPS pokazuje teraz takze zapas stosu, co pozwala porownac warunki, w ktorych weryfikacja przypietego certyfikatu raz przechodzi, a raz jest odrzucana i wymusza polaczenie bez przypiecia.\n"
     "publishedAt:10:2026-09-13\n"
-    "firmware:15:firmware-10.bin\n"
-    "size:7:1982448\n"
-    "sha256:64:fe4a33608455e9874056e683a35c544f5d8dba39eaf4d7aed6709bb12a35a21b\n"
+    "firmware:15:firmware-11.bin\n"
+    "size:7:1982480\n"
+    "sha256:64:1b700b027f6efea47e040af89f44b3d8aa4c3b24d32e6258f7beb9e812057489\n"
     "keyId:22:openos-release-2026-02\n";
 
 // values the parser must extract from INFO_JSON
-static const char* INFO_EXPECTED_NAME = "OpenOS 1.2.7";
-static const char* INFO_EXPECTED_FIRMWARE = "firmware-10.bin";
+static const char* INFO_EXPECTED_NAME = "OpenOS 1.2.8";
+static const char* INFO_EXPECTED_FIRMWARE = "firmware-11.bin";
 static const char* INFO_EXPECTED_KEY_ID = "openos-release-2026-02";
 static const char* INFO_EXPECTED_TARGET = "denky32-wroom32";
 static const char* INFO_EXPECTED_PARTITION = "openos-dual-v1";
-static const unsigned INFO_EXPECTED_VERSION_CODE = 10u;
-static const unsigned INFO_EXPECTED_SIZE = 1982448u;
+static const unsigned INFO_EXPECTED_VERSION_CODE = 11u;
+static const unsigned INFO_EXPECTED_SIZE = 1982480u;
