@@ -8,18 +8,18 @@ static const char* INFO_JSON =
     "  \"channel\": \"stable\",\n"
     "  \"target\": \"denky32-wroom32\",\n"
     "  \"partitionScheme\": \"openos-dual-v1\",\n"
-    "  \"name\": \"OpenOS 1.2.9\",\n"
-    "  \"version\": \"1.2.9\",\n"
-    "  \"versionCode\": 12,\n"
+    "  \"name\": \"OpenOS 1.2.10\",\n"
+    "  \"version\": \"1.2.10\",\n"
+    "  \"versionCode\": 13,\n"
     "  \"minUpdaterVersionCode\": 1,\n"
-    "  \"releaseType\": \"patch\",\n"
-    "  \"description\": \"Rezerwa pamieci jest teraz odzyskiwana w najwiekszym dostepnym rozmiarze, wiec nie przepada do konca pracy urzadzenia, gdy raz sie rozdrobni. Odrzucenie przypietego certyfikatu jest zapamietywane, a wymagania pamieciowe przypiecia nie blokuja juz transferu, ktory bez niego przeszedlby bez problemu - to blokowalo pobieranie firmware.\",\n"
+    "  \"releaseType\": \"minor\",\n"
+    "  \"description\": \"Nowe ota.checked() pozwala ekranowi aktualizacji pokazac wynik sprawdzenia takze po wyjsciu z Ustawien i powrocie - wczesniej przycisk instalacji opisany byl jako niedostepny, mimo ze aktualizacja byla gotowa. Wymaga zaktualizowanego pakietu Ustawien.\",\n"
     "  \"publishedAt\": \"2026-09-13\",\n"
-    "  \"firmware\": \"firmware-12.bin\",\n"
-    "  \"size\": 1982784,\n"
-    "  \"sha256\": \"0647c94f1f9e94901f71c0872773c409b938baac6f051217cc2acaa7641a39c0\",\n"
+    "  \"firmware\": \"firmware-13.bin\",\n"
+    "  \"size\": 1982864,\n"
+    "  \"sha256\": \"d6bae2c8a7da0ec1deec76dedc51dbd455e6ecaecdb0a4c2cef73dd5f48cd2fa\",\n"
     "  \"keyId\": \"openos-release-2026-02\",\n"
-    "  \"signature\": \"MEQCIE6gSR1SarmIg/76Re7CVn0IUfVxIMfIh4K68N2aK1tKAiBnGnXknesyd84rtmgsGsF4jJMYUyNkcWs+YaH9/rEgtA==\"\n"
+    "  \"signature\": \"MEUCIDun+sOijS3cV0WEcX9os8vUn3rNjUZZYiVZYavDCVhoAiEAqqUEoXyS/cGKZpwycIAW9m7UCNDJ3dne3Xlr1FmXCqo=\"\n"
     "}\n";
 
 // canonical signature payload computed by the Python release tool rules
@@ -30,23 +30,23 @@ static const char* INFO_CANONICAL =
     "channel:6:stable\n"
     "target:15:denky32-wroom32\n"
     "partitionScheme:14:openos-dual-v1\n"
-    "name:12:OpenOS 1.2.9\n"
-    "version:5:1.2.9\n"
-    "versionCode:2:12\n"
+    "name:13:OpenOS 1.2.10\n"
+    "version:6:1.2.10\n"
+    "versionCode:2:13\n"
     "minUpdaterVersionCode:1:1\n"
-    "releaseType:5:patch\n"
-    "description:334:Rezerwa pamieci jest teraz odzyskiwana w najwiekszym dostepnym rozmiarze, wiec nie przepada do konca pracy urzadzenia, gdy raz sie rozdrobni. Odrzucenie przypietego certyfikatu jest zapamietywane, a wymagania pamieciowe przypiecia nie blokuja juz transferu, ktory bez niego przeszedlby bez problemu - to blokowalo pobieranie firmware.\n"
+    "releaseType:5:minor\n"
+    "description:251:Nowe ota.checked() pozwala ekranowi aktualizacji pokazac wynik sprawdzenia takze po wyjsciu z Ustawien i powrocie - wczesniej przycisk instalacji opisany byl jako niedostepny, mimo ze aktualizacja byla gotowa. Wymaga zaktualizowanego pakietu Ustawien.\n"
     "publishedAt:10:2026-09-13\n"
-    "firmware:15:firmware-12.bin\n"
-    "size:7:1982784\n"
-    "sha256:64:0647c94f1f9e94901f71c0872773c409b938baac6f051217cc2acaa7641a39c0\n"
+    "firmware:15:firmware-13.bin\n"
+    "size:7:1982864\n"
+    "sha256:64:d6bae2c8a7da0ec1deec76dedc51dbd455e6ecaecdb0a4c2cef73dd5f48cd2fa\n"
     "keyId:22:openos-release-2026-02\n";
 
 // values the parser must extract from INFO_JSON
-static const char* INFO_EXPECTED_NAME = "OpenOS 1.2.9";
-static const char* INFO_EXPECTED_FIRMWARE = "firmware-12.bin";
+static const char* INFO_EXPECTED_NAME = "OpenOS 1.2.10";
+static const char* INFO_EXPECTED_FIRMWARE = "firmware-13.bin";
 static const char* INFO_EXPECTED_KEY_ID = "openos-release-2026-02";
 static const char* INFO_EXPECTED_TARGET = "denky32-wroom32";
 static const char* INFO_EXPECTED_PARTITION = "openos-dual-v1";
-static const unsigned INFO_EXPECTED_VERSION_CODE = 12u;
-static const unsigned INFO_EXPECTED_SIZE = 1982784u;
+static const unsigned INFO_EXPECTED_VERSION_CODE = 13u;
+static const unsigned INFO_EXPECTED_SIZE = 1982864u;

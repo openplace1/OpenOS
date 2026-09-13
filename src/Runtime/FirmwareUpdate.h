@@ -22,6 +22,10 @@ bool setSourceUrl(const String& requested);
 // version is current/newer, and -1 on network, schema or signature failure.
 int check();
 bool available();
+// True once check() has fetched and validated a manifest in this session,
+// whatever the outcome. The cached result outlives the script that asked for
+// it, so Settings can render the right state after leaving and coming back.
+bool checked();
 bool supported();
 
 String remoteName();

@@ -6645,6 +6645,10 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         if (!needException("ota.available")) return OSAVal(0.0);
         return OSAVal(FirmwareUpdate::available() ? 1.0 : 0.0);
     }
+    if (IS("ota.checked")) {
+        if (!needException("ota.checked")) return OSAVal(0.0);
+        return OSAVal(FirmwareUpdate::checked() ? 1.0 : 0.0);
+    }
     if (IS("ota.name")) {
         if (!needException("ota.name")) return OSAVal("");
         return OSAVal(FirmwareUpdate::remoteName());

@@ -220,6 +220,8 @@ int check() {
 
 bool available() { return s_manifestReady && s_updateAvailable; }
 
+bool checked() { return s_manifestReady; }
+
 bool supported() {
     const esp_partition_t* running = esp_ota_get_running_partition();
     const esp_partition_t* next = esp_ota_get_next_update_partition(nullptr);

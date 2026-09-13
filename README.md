@@ -760,6 +760,7 @@ additionally restricted to Settings and always show a native confirmation.
 | `ota.supported()` | `1` only when the running and inactive partitions are the expected dual OTA slots |
 | `ota.check()` | `1` newer release, `0` current/newer local version, `-1` error |
 | `ota.available()` | `1` after a successful check found a newer signed release |
+| `ota.checked()` | `1` once a check has run in this session; survives leaving the app |
 | `ota.name()` / `ota.version()` / `ota.versionCode()` | Signed release identity |
 | `ota.channel()` / `ota.type()` | `stable|beta|dev` and `major|minor|patch|security` |
 | `ota.description()` / `ota.notes()` | Signed release notes |
