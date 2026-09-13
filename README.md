@@ -22,6 +22,7 @@ live. No reflash.
 - [Firmware OTA updates](#firmware-ota-updates)
 - [SDK reference](#sdk-reference)
   - [Screen drawing](#screen-drawing)
+  - [Custom shapes](#custom-shapes)
   - [Colours](#colours)
   - [Text](#text)
   - [Touch and gestures](#touch-and-gestures)
@@ -37,6 +38,7 @@ live. No reflash.
   - [Wallpaper](#wallpaper)
   - [Theme palette](#theme-palette)
   - [UI widgets](#ui-widgets)
+  - [Immediate-mode widgets](#immediate-mode-widgets)
   - [Notifications](#notifications)
   - [App control](#app-control)
   - [Privileged — system](#privileged--system)
@@ -393,10 +395,57 @@ plain `String` instances.
 | `tframe(x1,y1,x2,y2,x3,y3)` | Outline triangle |
 | `quad(x1,y1,x2,y2,x3,y3,x4,y4)` | Filled quadrilateral |
 | `qframe(x1,y1,x2,y2,x3,y3,x4,y4)` | Outline quadrilateral |
-| `arc(x,y,r,width,start,end[,bg565])` | Arc in degrees |
+| `arc(x,y,r,width,start,end[,bg565])` | Arc in degrees, clockwise from 6 o'clock |
+| `pie(x,y,r,start,end)` | Filled sector, same angle convention as `arc` |
+| `pill(x, y, w, h)` / `pillframe(x, y, w, h)` | Fully rounded rectangle — the shape of a modern button |
+| `rrect4(x,y,w,h,tl,tr,br,bl)` | Filled rounded rect with one radius per corner |
+| `rframe4(x,y,w,h,tl,tr,br,bl)` | Outline of the same |
+| `star(x,y,points,outerR,innerR[,rot])` | Filled star; `rot` in degrees clockwise |
+| `sframe(x,y,points,outerR,innerR[,rot[,width]])` | Outline star |
+| `ngon(x,y,sides,r[,rot])` | Filled regular polygon |
+| `nframe(x,y,sides,r[,rot[,width]])` | Outline regular polygon |
 | `gradient(x,y,w,h,r1,g1,b1,r2,g2,b2)` | Vertical RGB gradient |
 | `gradienth(x,y,w,h,r1,g1,b1,r2,g2,b2)` | Horizontal RGB gradient |
+| `smooth(on)` | `1` makes `rrect`, `rframe`, `circle`, `ring`, `pill` and `pie` blend their edges against what is already on screen. Off by default: every blended pixel is a read-back over SPI when drawing straight to the panel, so use it for chrome, not for per-frame sprites |
 | `screenw()` / `screenh()` | Returns `240` / `320` |
+
+### Custom shapes
+
+One path of up to 48 points, filled under the even-odd rule so concave and
+self-intersecting outlines render the way a vector tool would draw them.
+Points are kept as floats, so a shape can be built once and transformed every
+frame without drift.
+
+| Call | Effect |
+|---|---|
+| `path.begin()` | Start a new path |
+| `path.to(x, y)` | Append a point; returns the point count |
+| `path.count()` | Number of points |
+| `path.x(i)` / `path.y(i)` | Read a point back, e.g. for hit tests |
+| `path.fill()` | Fill the polygon with the draw colour |
+| `path.stroke([width], [closed])` | Outline it; `width > 1` is anti-aliased, `closed` defaults to `1` |
+| `path.move(dx, dy)` | Translate every point |
+| `path.rotate(cx, cy, deg)` | Rotate every point about a centre, clockwise |
+| `path.scale(cx, cy, fx, [fy])` | Scale about a centre |
+
+```
+# A spaceship that turns with the finger
+path.begin()
+path.to(0, -14)
+path.to(10, 12)
+path.to(0, 6)
+path.to(-10, 12)
+path.move(120, 160)
+loop
+  cls()
+  path.rotate(120, 160, 3)
+  setcolor(255, 149, 0)
+  path.fill()
+  setcolor(255, 255, 255)
+  path.stroke(2)
+  wait(30)
+end
+```
 
 ### Colours
 
@@ -680,7 +729,8 @@ swiped away.
 | `ui.backHeader(title)` | Header with a `< Back` button |
 | `ui.backTapped()` | Non-blocking — `1` if `< Back` zone tapped |
 | `ui.alert(title, body)` | OK popup; text wraps automatically |
-| `confirm(title, body, [danger])` | `1` OK / `0` Cancel; red button when `danger=1` |
+| `confirm(title, body, [danger])` | `1` OK / `0` Cancel; `danger=1` styles OK as destructive |
+| `ui.dialog(title, body, left, right, [danger])` | System popup with your own labels; `1` right / `0` left or swiped away. Empty `left` gives a single button |
 | `ui.menu(items_pipe, title, [showBack])` | Pick from a `\|`-separated list; index or `-1` |
 | `ui.menuStart(title, [showBack])` | Begin a rich Settings-style menu |
 | `ui.menuRow(label, letter, r, g, b, value)` | Add a row |
@@ -691,6 +741,51 @@ swiped away.
 | `ui.numpad(prompt, maxDigits)` | Entered digits as string, or `""` |
 | `input(prompt, default, [multiLine])` | Text input with on-screen keyboard |
 | `bmp.thumb(path, x, y, w, h)` | Draw a downsampled 24-bit BMP |
+
+Popups are drawn as a rounded card with a left-aligned heading, a muted body
+and pill buttons. When the right button is destructive (`danger=1`) the safe
+button is the filled one; otherwise the action is.
+
+### Immediate-mode widgets
+
+These only draw — into the sprite when one is open — and never block. Pair
+them with `touch.tap(x, y, w, h)` or `touch.in()` for input, and redraw a
+widget when its state changes rather than every frame. Colours follow the
+theme; the accent is the system blue.
+
+| Call | Effect |
+|---|---|
+| `ui.button(x, y, w, h, label, [style], [pressed])` | Pill button. `style` 0 filled accent (default), 1 soft grey, 2 soft grey with red text, 3 outlined, 4 filled red; `pressed=1` darkens it |
+| `ui.switch(x, y, on, [w], [h])` | Toggle switch, 46×28 by default |
+| `ui.checkbox(x, y, size, checked, [label], [bg565])` | Rounded checkbox with an optional label to the right |
+| `ui.radio(cx, cy, r, selected, [label], [bg565])` | Radio button centred on `cx, cy` |
+| `ui.progress(x, y, w, h, value, [max])` | Pill progress track; `value/max` clamped to `0..1` |
+| `ui.card(x, y, w, h, [r])` | Raised surface for grouping content |
+| `ui.chip(x, y, label, [selected])` | Pill tag; returns its width so a row can be laid out in one pass |
+
+`bg565` is the colour behind a checkbox or radio, needed to clear the mark
+when it turns off; it defaults to `theme.surface()`.
+
+```
+var on = 0
+ui.header("Wi-Fi")
+ui.card(12, 60, 216, 56)
+fontsize(2)
+textcolor565(theme.text())
+textml(28, 88, "Enabled")
+ui.switch(170, 74, on)
+ui.button(20, 260, 200, 44, "Forget network", 2)
+loop
+  if touch.tap(150, 60, 78, 56) == 1 then
+    on = 1 - on
+    ui.switch(170, 74, on)
+  end
+  if touch.tap(20, 260, 200, 44) == 1 then
+    if ui.dialog("Forget this network?", "You will need the password again.", "Cancel", "Forget", 1) == 1 then exit() end
+  end
+  wait(30)
+end
+```
 
 ### Notifications
 
@@ -708,10 +803,10 @@ swiped away.
 | `millis()` | ms since boot |
 | `micros()` | µs counter since boot |
 | `elapsed(startMs)` | Wrap-safe milliseconds elapsed since `startMs` |
-| `sdk.version()` | Numeric SDK compatibility level (currently `3`) |
-| `sdk.has(feature)` | Capability check, including `d3`, `sprite`, `touch`, `perf`, `http`, `json`, `opk`, `ota`, `store.compatibility` and `store.updateAll` |
-| `openos.version()` | Display version (currently `1.1.0`) |
-| `openos.versionCode()` | Numeric OpenOS compatibility level (currently `2`) |
+| `sdk.version()` | Numeric SDK compatibility level (currently `4`) |
+| `sdk.has(feature)` | Capability check, including `d3`, `sprite`, `touch`, `perf`, `http`, `json`, `opk`, `ota`, `shapes`, `path`, `widgets`, `smooth`, `store.compatibility` and `store.updateAll` |
+| `openos.version()` | Display version (currently `1.4.0`) |
+| `openos.versionCode()` | Numeric OpenOS compatibility level (currently `21`) |
 
 ### Privileged — system
 

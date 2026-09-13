@@ -8,18 +8,18 @@ static const char* INFO_JSON =
     "  \"channel\": \"stable\",\n"
     "  \"target\": \"denky32-wroom32\",\n"
     "  \"partitionScheme\": \"openos-dual-v1\",\n"
-    "  \"name\": \"OpenOS 1.3.2\",\n"
-    "  \"version\": \"1.3.2\",\n"
-    "  \"versionCode\": 20,\n"
+    "  \"name\": \"OpenOS 1.4.0\",\n"
+    "  \"version\": \"1.4.0\",\n"
+    "  \"versionCode\": 21,\n"
     "  \"minUpdaterVersionCode\": 1,\n"
-    "  \"releaseType\": \"patch\",\n"
-    "  \"description\": \"Limit bezczynnosci przy pobieraniu obrazu podniesiony z 15 do 60 sekund. Kazde zapisane 4 KB kasuje sektor pamieci flash, a okno odbiorcze TCP ma niecale 6 KB, wiec transfer z natury idzie skokowo i krotki limit przerywal poprawne pobieranie. Postep jest teraz raportowany na port szeregowy.\",\n"
+    "  \"releaseType\": \"minor\",\n"
+    "  \"description\": \"Redesigned system dialogs: a rounded card with a left-aligned heading, a muted body and pill buttons; the safe choice is highlighted when the action is destructive. OSA SDK 4 adds custom shapes (star, ngon, pie, pill, per-corner rrect4 and a 48-point path with fill, stroke, move, rotate and scale), anti-aliased drawing via smooth(1), the ui.dialog popup with custom labels, and immediate-mode widgets: ui.button, ui.switch, ui.checkbox, ui.radio, ui.progress, ui.card and ui.chip. confirm() honours its danger flag. The UI Kit app in OpenStore demonstrates all of it.\",\n"
     "  \"publishedAt\": \"2026-09-13\",\n"
-    "  \"firmware\": \"firmware-20.bin\",\n"
-    "  \"size\": 1981696,\n"
-    "  \"sha256\": \"cfe2a8f3dd0e6a08bfa33c2383ad0ec72bec685015a7466373973f3c4eaa45c9\",\n"
+    "  \"firmware\": \"firmware-21.bin\",\n"
+    "  \"size\": 1995328,\n"
+    "  \"sha256\": \"3d986fadc46c6b6e76c71fcce58fd61b870971949982f5837517f9919ebd6f62\",\n"
     "  \"keyId\": \"openos-release-2026-02\",\n"
-    "  \"signature\": \"MEUCIQDdcVhArulzL6geqJyryadq86w2Ka8yQ+BTQUm2MDQnJgIgQApgBQjA0IX/wfoH+5x1ZdzPBScg4jsWpkcMrBgqpI4=\"\n"
+    "  \"signature\": \"MEYCIQDHlfbsI3C2/W3yt3SqScGjXKl0NASv9djbe7PurMdqoAIhANDBbpIhAGY+FxZysxiN7uGILadnkQnzxEyUBR5P9sxI\"\n"
     "}\n";
 
 // canonical signature payload computed by the Python release tool rules
@@ -30,23 +30,23 @@ static const char* INFO_CANONICAL =
     "channel:6:stable\n"
     "target:15:denky32-wroom32\n"
     "partitionScheme:14:openos-dual-v1\n"
-    "name:12:OpenOS 1.3.2\n"
-    "version:5:1.3.2\n"
-    "versionCode:2:20\n"
+    "name:12:OpenOS 1.4.0\n"
+    "version:5:1.4.0\n"
+    "versionCode:2:21\n"
     "minUpdaterVersionCode:1:1\n"
-    "releaseType:5:patch\n"
-    "description:291:Limit bezczynnosci przy pobieraniu obrazu podniesiony z 15 do 60 sekund. Kazde zapisane 4 KB kasuje sektor pamieci flash, a okno odbiorcze TCP ma niecale 6 KB, wiec transfer z natury idzie skokowo i krotki limit przerywal poprawne pobieranie. Postep jest teraz raportowany na port szeregowy.\n"
+    "releaseType:5:minor\n"
+    "description:569:Redesigned system dialogs: a rounded card with a left-aligned heading, a muted body and pill buttons; the safe choice is highlighted when the action is destructive. OSA SDK 4 adds custom shapes (star, ngon, pie, pill, per-corner rrect4 and a 48-point path with fill, stroke, move, rotate and scale), anti-aliased drawing via smooth(1), the ui.dialog popup with custom labels, and immediate-mode widgets: ui.button, ui.switch, ui.checkbox, ui.radio, ui.progress, ui.card and ui.chip. confirm() honours its danger flag. The UI Kit app in OpenStore demonstrates all of it.\n"
     "publishedAt:10:2026-09-13\n"
-    "firmware:15:firmware-20.bin\n"
-    "size:7:1981696\n"
-    "sha256:64:cfe2a8f3dd0e6a08bfa33c2383ad0ec72bec685015a7466373973f3c4eaa45c9\n"
+    "firmware:15:firmware-21.bin\n"
+    "size:7:1995328\n"
+    "sha256:64:3d986fadc46c6b6e76c71fcce58fd61b870971949982f5837517f9919ebd6f62\n"
     "keyId:22:openos-release-2026-02\n";
 
 // values the parser must extract from INFO_JSON
-static const char* INFO_EXPECTED_NAME = "OpenOS 1.3.2";
-static const char* INFO_EXPECTED_FIRMWARE = "firmware-20.bin";
+static const char* INFO_EXPECTED_NAME = "OpenOS 1.4.0";
+static const char* INFO_EXPECTED_FIRMWARE = "firmware-21.bin";
 static const char* INFO_EXPECTED_KEY_ID = "openos-release-2026-02";
 static const char* INFO_EXPECTED_TARGET = "denky32-wroom32";
 static const char* INFO_EXPECTED_PARTITION = "openos-dual-v1";
-static const unsigned INFO_EXPECTED_VERSION_CODE = 20u;
-static const unsigned INFO_EXPECTED_SIZE = 1981696u;
+static const unsigned INFO_EXPECTED_VERSION_CODE = 21u;
+static const unsigned INFO_EXPECTED_SIZE = 1995328u;

@@ -279,6 +279,10 @@ private:
     uint16_t drawColor = TFT_WHITE;
     uint16_t txtColor  = TFT_WHITE;
     uint8_t  textFont  = 2;
+    // smooth(1): rrect/rframe/circle/ring/pill blend their edges against
+    // whatever is already on screen. Off by default because every blended
+    // pixel is a read-back over SPI when drawing straight to the panel.
+    bool     drawSmooth = false;
 
     // Execution flags
     bool   exitFlag     = false;

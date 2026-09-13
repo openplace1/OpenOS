@@ -493,6 +493,146 @@ static void osaUnpack565(uint16_t color, int& red, int& green, int& blue) {
     blue = (color & 0x1F) * 255 / 31;
 }
 
+// ─── Custom shapes ───────────────────────────────────────────────────────────
+// Polygons are filled with horizontal spans under the even-odd rule, so a
+// concave or self-intersecting outline renders the way a vector tool would
+// draw it. Points are kept as floats so a script can rotate or scale a shape
+// every frame without rounding drift. One path is shared by all scripts;
+// only one runs at a time.
+
+static const int OSA_PATH_MAX = 48;
+static float s_pathX[OSA_PATH_MAX];
+static float s_pathY[OSA_PATH_MAX];
+static int   s_pathCount = 0;
+
+static void osaFillPolygon(TFT_eSPI* canvas, const float* xs, const float* ys,
+                           int count, int clipBottom, uint16_t color) {
+    if (count < 3) return;
+    float minY = ys[0], maxY = ys[0];
+    for (int i = 1; i < count; ++i) {
+        if (ys[i] < minY) minY = ys[i];
+        if (ys[i] > maxY) maxY = ys[i];
+    }
+    int top = max((int)floorf(minY), 0);
+    int bottom = min((int)ceilf(maxY), clipBottom - 1);
+    float crossings[OSA_PATH_MAX];
+    for (int y = top; y <= bottom; ++y) {
+        float sample = (float)y + 0.5f;
+        int n = 0;
+        for (int i = 0; i < count; ++i) {
+            int j = (i + 1) % count;
+            float y0 = ys[i], y1 = ys[j];
+            if ((y0 <= sample) == (y1 <= sample)) continue;
+            float x = xs[i] + (sample - y0) * (xs[j] - xs[i]) / (y1 - y0);
+            // Insertion sort keeps the span pairs ordered left to right.
+            int k = n++;
+            while (k > 0 && crossings[k - 1] > x) {
+                crossings[k] = crossings[k - 1];
+                --k;
+            }
+            crossings[k] = x;
+        }
+        for (int k = 0; k + 1 < n; k += 2) {
+            int xa = (int)ceilf(crossings[k] - 0.5f);
+            int xb = (int)floorf(crossings[k + 1] - 0.5f);
+            if (xb >= xa) canvas->drawFastHLine(xa, y, xb - xa + 1, color);
+        }
+    }
+}
+
+static void osaStrokePolygon(TFT_eSPI* canvas, const float* xs, const float* ys,
+                             int count, float width, bool closed, uint16_t color) {
+    if (count < 2) return;
+    int segments = closed ? count : count - 1;
+    for (int i = 0; i < segments; ++i) {
+        int j = (i + 1) % count;
+        if (width > 1.0f)
+            canvas->drawWideLine(xs[i], ys[i], xs[j], ys[j], width, color);
+        else
+            canvas->drawLine((int)lroundf(xs[i]), (int)lroundf(ys[i]),
+                             (int)lroundf(xs[j]), (int)lroundf(ys[j]), color);
+    }
+}
+
+// Outline of a star (inner > 0) or a regular polygon (inner == 0). The first
+// point sits straight above the centre before `rotation` degrees, clockwise,
+// are applied.
+static int osaShapePoints(float cx, float cy, int corners, float outer,
+                          float inner, float rotation, float* xs, float* ys) {
+    corners = constrain(corners, 3, OSA_PATH_MAX / 2);
+    int count = inner > 0.0f ? corners * 2 : corners;
+    float step = 2.0f * (float)M_PI / (float)count;
+    float base = -(float)M_PI / 2.0f + rotation * (float)M_PI / 180.0f;
+    for (int i = 0; i < count; ++i) {
+        float radius = (inner > 0.0f && (i & 1)) ? inner : outer;
+        float angle = base + step * (float)i;
+        xs[i] = cx + cosf(angle) * radius;
+        ys[i] = cy + sinf(angle) * radius;
+    }
+    return count;
+}
+
+// Horizontal inset of a quarter circle on the `row`-th pixel row counted from
+// the outer edge of the corner.
+static int osaCornerInset(int radius, int row) {
+    float dy = (float)radius - (float)row - 0.5f;
+    float dx = sqrtf(max(0.0f, (float)radius * (float)radius - dy * dy));
+    return max(0, (int)((float)radius - dx + 0.5f));
+}
+
+static void osaClampCorners(int w, int h, int& tl, int& tr, int& br, int& bl) {
+    int limit = max(0, min(w, h) / 2);
+    tl = constrain(tl, 0, limit);
+    tr = constrain(tr, 0, limit);
+    br = constrain(br, 0, limit);
+    bl = constrain(bl, 0, limit);
+}
+
+// Rounded rectangle with a radius per corner (top-left, top-right,
+// bottom-right, bottom-left), for tabs, speech bubbles and card headers.
+static void osaFillRoundRect4(TFT_eSPI* canvas, int x, int y, int w, int h,
+                              int tl, int tr, int br, int bl, uint16_t color) {
+    if (w <= 0 || h <= 0) return;
+    osaClampCorners(w, h, tl, tr, br, bl);
+    int topBand = max(tl, tr), bottomBand = max(bl, br);
+    if (h > topBand + bottomBand)
+        canvas->fillRect(x, y + topBand, w, h - topBand - bottomBand, color);
+    for (int row = 0; row < topBand; ++row) {
+        int left = row < tl ? osaCornerInset(tl, row) : 0;
+        int right = row < tr ? osaCornerInset(tr, row) : 0;
+        int span = w - left - right;
+        if (span > 0) canvas->drawFastHLine(x + left, y + row, span, color);
+    }
+    for (int row = 0; row < bottomBand; ++row) {
+        int left = row < bl ? osaCornerInset(bl, row) : 0;
+        int right = row < br ? osaCornerInset(br, row) : 0;
+        int span = w - left - right;
+        if (span > 0) canvas->drawFastHLine(x + left, y + h - 1 - row, span, color);
+    }
+}
+
+static void osaDrawRoundRect4(TFT_eSPI* canvas, int x, int y, int w, int h,
+                              int tl, int tr, int br, int bl, uint16_t color) {
+    if (w <= 0 || h <= 0) return;
+    osaClampCorners(w, h, tl, tr, br, bl);
+    canvas->drawFastHLine(x + tl, y, w - tl - tr, color);
+    canvas->drawFastHLine(x + bl, y + h - 1, w - bl - br, color);
+    canvas->drawFastVLine(x, y + tl, h - tl - bl, color);
+    canvas->drawFastVLine(x + w - 1, y + tr, h - tr - br, color);
+    if (tl > 0) canvas->drawCircleHelper(x + tl, y + tl, tl, 1, color);
+    if (tr > 0) canvas->drawCircleHelper(x + w - tr - 1, y + tr, tr, 2, color);
+    if (br > 0) canvas->drawCircleHelper(x + w - br - 1, y + h - br - 1, br, 4, color);
+    if (bl > 0) canvas->drawCircleHelper(x + bl, y + h - bl - 1, bl, 8, color);
+}
+
+// System accent colours shared by the popup and the ui.* widgets.
+static inline uint16_t osaBlue()  { return 0x03DF; }   // 0, 122, 255
+static inline uint16_t osaRed()   { return 0xF9C6; }   // 255, 59, 48
+static inline uint16_t osaGreen() { return 0x362B; }   // 52, 199, 89
+static inline uint16_t osaSoftFill() {
+    return Theme::dark() ? Theme::c(58, 58, 64) : Theme::c(236, 236, 240);
+}
+
 static uint16_t osaMix565(uint16_t first, uint16_t second, float amount) {
     if (!isfinite(amount)) amount = 0.0f;
     if (amount < 0.0f) amount = 0.0f;
@@ -4098,49 +4238,105 @@ bool OSARuntime::checkPerm(uint8_t bit, const String& label, const String& detai
 
 bool OSARuntime::showSystemPopup(const String& title, const String& body1, const String& body2,
                                   const String& leftBtn, const String& rightBtn, bool rightDanger) {
-    const int cx = 20, cw = 200, cr = 14;
-    const int bodyMaxWidth = cw - 28;
-    const int maxBodyLines = 8;
-    const int bodyLineHeight = 14;
+    // A rounded card with a left-aligned heading, a muted body and one or two
+    // pill buttons side by side. For a destructive choice the safe button is
+    // the filled one so the eye lands on it first; otherwise the action is.
+    const bool dark = Theme::dark();
+    const int cx = 16, cw = 208, cr = 22, pad = 18;
+    const int textW = cw - 2 * pad;
+    const int buttonH = 40, buttonGap = 10;
+    const int maxBodyLines = 6, bodyLineHeight = 18;
+
+    // The heading takes the large font when it fits in two lines and a
+    // doubled-up font 2 otherwise, so a long question stays readable without
+    // eating the whole card.
+    String titleLines[3];
+    tft->setTextSize(1);
+    tft->setTextFont(4);
+    int titleCount = popupWrapBody(tft, title, "", titleLines, 3, textW);
+    int titleFont = 4, titleLineHeight = 28;
+    if (titleCount > 2) {
+        tft->setTextFont(2);
+        titleCount = popupWrapBody(tft, title, "", titleLines, 3, textW - 1);
+        titleFont = 2;
+        titleLineHeight = 19;
+    }
 
     String bodyLines[maxBodyLines];
-    tft->setTextFont(1); tft->setTextSize(1);
-    int bodyLineCount = popupWrapBody(tft, body1, body2, bodyLines,
-                                      maxBodyLines, bodyMaxWidth);
-    const int contentHeight = 91 + bodyLineCount * bodyLineHeight;
-    const int ch = max(126, contentHeight);
+    tft->setTextFont(2);
+    int bodyCount = (body1.length() > 0 || body2.length() > 0)
+        ? popupWrapBody(tft, body1, body2, bodyLines, maxBodyLines, textW) : 0;
+
+    const int titleH = titleCount * titleLineHeight;
+    const int bodyH = bodyCount > 0 ? 8 + bodyCount * bodyLineHeight : 0;
+    const int ch = pad + titleH + bodyH + 18 + buttonH + pad;
     const int cy = (320 - ch) / 2;
 
-    // Snapshot the popup region so we can restore the underlying script UI on dismiss.
-    // (~60 KB for a 200x150 area — well under the heap budget.) Falls back to redraw
-    // hint if the allocation fails on a tight system.
+    // Snapshot the covered region so the script's screen comes back intact
+    // on dismiss. ~60-100 KB; when the heap cannot offer that the popup simply
+    // stays until the script repaints.
     uint16_t* snapshot = (uint16_t*)malloc((size_t)cw * ch * sizeof(uint16_t));
     if (snapshot) tft->readRect(cx, cy, cw, ch, snapshot);
 
-    tft->fillRoundRect(cx, cy, cw, ch, cr, TFT_WHITE);
-    tft->drawRoundRect(cx, cy, cw, ch, cr, tft->color565(220, 220, 222));
+    const uint16_t card = dark ? tft->color565(40, 40, 46) : TFT_WHITE;
+    const uint16_t edge = dark ? tft->color565(66, 66, 72) : tft->color565(222, 222, 228);
+    const uint16_t heading = dark ? TFT_WHITE : tft->color565(20, 20, 22);
+    const uint16_t muted = dark ? tft->color565(168, 168, 176) : tft->color565(110, 110, 118);
+    const uint16_t grey = osaSoftFill();
 
-    tft->setTextFont(2); tft->setTextSize(1); tft->setTextDatum(MC_DATUM);
-    tft->setTextColor(tft->color565(20, 20, 22));
-    tft->drawString(popupFitLine(tft, title, cw - 24), 120, cy + 24);
+    // Corners are blended against whatever the script left on screen.
+    tft->fillSmoothRoundRect(cx, cy, cw, ch, cr, card);
+    tft->drawSmoothRoundRect(cx, cy, cr, cr, cw, ch, edge, card);
 
-    tft->setTextFont(1);
-    tft->setTextColor(tft->color565(110, 110, 118));
-    for (int i = 0; i < bodyLineCount; ++i)
-        tft->drawString(bodyLines[i], 120, cy + 48 + i * bodyLineHeight);
+    tft->setTextDatum(TL_DATUM);
+    tft->setTextColor(heading);
+    tft->setTextFont(titleFont);
+    int textY = cy + pad;
+    for (int i = 0; i < titleCount; ++i) {
+        tft->drawString(titleLines[i], cx + pad, textY);
+        // Font 2 has no bold face; a one-pixel echo gives it the weight.
+        if (titleFont == 2) tft->drawString(titleLines[i], cx + pad + 1, textY);
+        textY += titleLineHeight;
+    }
 
-    const int divY = cy + ch - 44;
-    tft->drawFastHLine(cx, divY, cw, tft->color565(218, 218, 222));
-    tft->drawFastVLine(cx + cw / 2, divY, 44, tft->color565(218, 218, 222));
+    if (bodyCount > 0) {
+        textY += 8;
+        tft->setTextFont(2);
+        tft->setTextColor(muted);
+        for (int i = 0; i < bodyCount; ++i) {
+            tft->drawString(bodyLines[i], cx + pad, textY);
+            textY += bodyLineHeight;
+        }
+    }
 
+    const bool twoButtons = leftBtn.length() > 0;
+    const int buttonY = cy + ch - pad - buttonH;
+    const int buttonW = twoButtons ? (textW - buttonGap) / 2 : textW;
+    struct PopupButton { int x; uint16_t fill; uint16_t ink; String label; };
+    PopupButton buttons[2];
+    int buttonCount = 0;
+    if (twoButtons) {
+        if (rightDanger) {
+            buttons[0] = { cx + pad, osaBlue(), TFT_WHITE, leftBtn };
+            buttons[1] = { cx + pad + buttonW + buttonGap, grey, osaRed(), rightBtn };
+        } else {
+            buttons[0] = { cx + pad, grey, heading, leftBtn };
+            buttons[1] = { cx + pad + buttonW + buttonGap, osaBlue(), TFT_WHITE, rightBtn };
+        }
+        buttonCount = 2;
+    } else {
+        buttons[0] = { cx + pad, osaBlue(), TFT_WHITE, rightBtn };
+        buttonCount = 1;
+    }
     tft->setTextFont(2);
-    tft->setTextColor(tft->color565(0, 122, 255));
-    tft->drawString(popupFitLine(tft, leftBtn, cw / 2 - 16),
-                    cx + cw / 4, cy + ch - 22);
-    uint16_t rCol = rightDanger ? tft->color565(255, 59, 48) : tft->color565(52, 199, 89);
-    tft->setTextColor(rCol);
-    tft->drawString(popupFitLine(tft, rightBtn, cw / 2 - 16),
-                    cx + cw * 3 / 4, cy + ch - 22);
+    tft->setTextDatum(MC_DATUM);
+    for (int i = 0; i < buttonCount; ++i) {
+        tft->fillSmoothRoundRect(buttons[i].x, buttonY, buttonW, buttonH,
+                                 buttonH / 2, buttons[i].fill, card);
+        tft->setTextColor(buttons[i].ink);
+        tft->drawString(popupFitLine(tft, buttons[i].label, buttonW - 16),
+                        buttons[i].x + buttonW / 2, buttonY + buttonH / 2);
+    }
 
     delay(180);
     bool right = false;
@@ -4151,15 +4347,24 @@ bool OSARuntime::showSystemPopup(const String& title, const String& body1, const
         TS_Point p = ts->getPoint();
         int tx = map(p.x, 300, 3800, 0, 240);
         int ty = map(p.y, 300, 3800, 0, 320);
-        if (ty < divY || ty > cy + ch || tx < cx || tx > cx + cw) continue;
-        right = (tx > cx + cw / 2);
+        // The whole strip holding the buttons counts, split down the middle.
+        if (ty < buttonY - 10 || ty > cy + ch || tx < cx || tx > cx + cw) continue;
+        int hit = (buttonCount == 2 && tx < cx + cw / 2) ? 0 : buttonCount - 1;
+        right = (buttonCount == 1) || hit == 1;
+        // Pressed feedback while the finger is down.
+        const PopupButton& b = buttons[hit];
+        tft->fillSmoothRoundRect(b.x, buttonY, buttonW, buttonH, buttonH / 2,
+                                 osaMix565(b.fill, TFT_BLACK, 0.18f), card);
+        tft->setTextColor(b.ink);
+        tft->drawString(popupFitLine(tft, b.label, buttonW - 16),
+                        b.x + buttonW / 2, buttonY + buttonH / 2);
         while (ts->touched()) yield();
         delay(60);
         break;
     }
 
-    // Restore screen so the popup truly "goes away" instead of sitting on top
-    // of the script's UI until the next full repaint.
+    // Restore the screen so the popup truly goes away instead of sitting on
+    // top of the script's UI until its next full repaint.
     if (snapshot) {
         tft->pushImage(cx, cy, cw, ch, snapshot);
         free(snapshot);
@@ -4223,6 +4428,11 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         return (i < argc) ? a[i].toString() : def;
     };
     auto iN = [&](int i, int def = 0) -> int { return (int)N(i, def); };
+    // Same target CV() dispatches to, for helpers that take the canvas as a
+    // parameter. TFT_eSprite overrides the pixel and line primitives, so
+    // everything built on them lands in the sprite.
+    TFT_eSPI* const canvas = activeSprite ? static_cast<TFT_eSPI*>(activeSprite) : tft;
+    const int canvasH = activeSprite ? activeSprite->height() : tft->height();
 
     // ── Screen drawing ────────────────────────────────────────────────────────
 
@@ -4265,7 +4475,8 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         return OSAVal();
     }
     if (IS("rrect")) {
-        CV(fillRoundRect(iN(0), iN(1), iN(2), iN(3), iN(4), drawColor));
+        if (drawSmooth) canvas->fillSmoothRoundRect(iN(0), iN(1), iN(2), iN(3), iN(4), drawColor);
+        else            CV(fillRoundRect(iN(0), iN(1), iN(2), iN(3), iN(4), drawColor));
         return OSAVal();
     }
     if (IS("frame")) {
@@ -4273,11 +4484,13 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         return OSAVal();
     }
     if (IS("circle")) {
-        CV(fillCircle(iN(0), iN(1), iN(2), drawColor));
+        if (drawSmooth) canvas->fillSmoothCircle(iN(0), iN(1), iN(2), drawColor);
+        else            CV(fillCircle(iN(0), iN(1), iN(2), drawColor));
         return OSAVal();
     }
     if (IS("ring")) {
-        CV(drawCircle(iN(0), iN(1), iN(2), drawColor));
+        if (drawSmooth) canvas->drawSmoothCircle(iN(0), iN(1), iN(2), drawColor, 0x00FFFFFF);
+        else            CV(drawCircle(iN(0), iN(1), iN(2), drawColor));
         return OSAVal();
     }
     if (IS("line")) {
@@ -4855,10 +5068,11 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     }
     if (IS("exit"))   { exitFlag = true; return OSAVal(); }
     if (IS("confirm")) {
-        // confirm(title, body) or confirm(body) → 1 if OK, 0 if Cancel
+        // confirm(title, body, [danger]) or confirm(body) → 1 if OK, 0 if Cancel
         String t = (argc >= 2) ? S(0) : appName;
         String b = (argc >= 2) ? S(1) : S(0);
-        return OSAVal(showSystemPopup(t, b, "", "Cancel", "OK", false) ? 1.0 : 0.0);
+        bool danger = argc >= 3 && iN(2) != 0;
+        return OSAVal(showSystemPopup(t, b, "", "Cancel", "OK", danger) ? 1.0 : 0.0);
     }
     if (IS("millis")) return OSAVal((double)millis());
     if (IS("micros")) return OSAVal((double)micros());
@@ -4873,7 +5087,9 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
                          feature == "opk" ||
                          feature == "store.compatibility" ||
                          feature == "store.updateall" ||
-                         feature == "ota";
+                         feature == "ota" ||
+                         feature == "shapes" || feature == "path" ||
+                         feature == "widgets" || feature == "smooth";
         return OSAVal(available ? 1.0 : 0.0);
     }
     if (IS("openos.version"))
@@ -5800,6 +6016,150 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     if (IS("ui.alert")) {
         showSystemPopup(S(0), S(1), "", "", "OK", false);
         return OSAVal();
+    }
+
+    // ui.dialog(title, body, leftLabel, rightLabel, [danger]) — the system
+    // popup with the script's own labels; 1 for the right button, 0 for the
+    // left or a swipe away. An empty left label gives a single button.
+    if (IS("ui.dialog")) {
+        return OSAVal(showSystemPopup(S(0), S(1), "", S(2), S(3), iN(4) != 0) ? 1.0 : 0.0);
+    }
+
+    // ── Immediate-mode widgets ───────────────────────────────────────────────
+    // These only draw, into the sprite when one is open. Pair them with
+    // touch.tap(x, y, w, h) or touch.in() for input, and redraw a widget when
+    // its state changes rather than every frame.
+
+    // ui.button(x, y, w, h, label, [style], [pressed])
+    //   style 0 filled accent, 1 soft grey, 2 soft grey with red text,
+    //   3 outlined, 4 filled red. pressed=1 darkens the fill.
+    if (IS("ui.button")) {
+        int x = iN(0), y = iN(1), w = max(1, iN(2)), h = max(1, iN(3));
+        int style = iN(5, 0);
+        bool pressed = iN(6, 0) != 0;
+        uint16_t fill = osaBlue(), ink = TFT_WHITE;
+        switch (style) {
+            case 1: fill = osaSoftFill(); ink = Theme::text(); break;
+            case 2: fill = osaSoftFill(); ink = osaRed(); break;
+            case 3: fill = osaBlue(); ink = osaBlue(); break;
+            case 4: fill = osaRed(); ink = TFT_WHITE; break;
+            default: break;
+        }
+        if (pressed) fill = osaMix565(fill, TFT_BLACK, 0.18f);
+        int r = min(w, h) / 2;
+        if (style == 3) {
+            // The ring blends against the colour just inside it; that pixel is
+            // sampled above the label so text never leaks into the guess.
+            uint16_t behind = canvas->readPixel(x + w / 2, y + 4);
+            canvas->drawSmoothRoundRect(x, y, r, r - 1, w, h, fill, behind);
+            if (pressed) ink = osaMix565(ink, TFT_BLACK, 0.18f);
+        } else {
+            canvas->fillSmoothRoundRect(x, y, w, h, r, fill);
+        }
+        canvas->setTextFont(2); canvas->setTextSize(1);
+        canvas->setTextDatum(MC_DATUM); canvas->setTextColor(ink);
+        canvas->drawString(popupFitLine(canvas, S(4), w - 16), x + w / 2, y + h / 2);
+        return OSAVal();
+    }
+
+    // ui.switch(x, y, on, [w], [h]) — a toggle drawn in place, 46x28 by default.
+    if (IS("ui.switch")) {
+        int x = iN(0), y = iN(1);
+        bool on = iN(2) != 0;
+        int w = max(20, iN(3, 46)), h = max(12, iN(4, 28));
+        uint16_t track = on ? osaGreen() : Theme::toggleOff();
+        canvas->fillSmoothRoundRect(x, y, w, h, h / 2, track);
+        int knobR = h / 2 - 3;
+        int knobX = on ? x + w - h / 2 : x + h / 2;
+        canvas->fillSmoothCircle(knobX, y + h / 2, knobR, TFT_WHITE, track);
+        return OSAVal();
+    }
+
+    // ui.checkbox(x, y, size, checked, [label], [bg565])
+    // ui.radio(cx, cy, r, selected, [label], [bg565])
+    //   bg565 is the colour behind the control, needed to clear the mark when
+    //   it turns off; defaults to the theme surface.
+    if (IS("ui.checkbox")) {
+        int x = iN(0), y = iN(1), size = max(12, iN(2, 22));
+        bool checked = iN(3) != 0;
+        uint16_t behind = argc >= 6 ? (uint16_t)iN(5) : Theme::surface();
+        int r = max(4, size / 4);
+        if (checked) {
+            canvas->fillSmoothRoundRect(x, y, size, size, r, osaBlue());
+            float x1 = x + size * 0.26f, y1 = y + size * 0.52f;
+            float x2 = x + size * 0.43f, y2 = y + size * 0.70f;
+            float x3 = x + size * 0.76f, y3 = y + size * 0.32f;
+            float stroke = max(2.0f, (float)size / 9.0f);
+            canvas->drawWideLine(x1, y1, x2, y2, stroke, TFT_WHITE, osaBlue());
+            canvas->drawWideLine(x2, y2, x3, y3, stroke, TFT_WHITE, osaBlue());
+        } else {
+            canvas->fillSmoothRoundRect(x, y, size, size, r, behind);
+            canvas->drawSmoothRoundRect(x, y, r, r - 1, size, size, Theme::divider(), behind);
+        }
+        if (argc >= 5 && S(4).length() > 0) {
+            canvas->setTextFont(2); canvas->setTextSize(1);
+            canvas->setTextDatum(ML_DATUM); canvas->setTextColor(Theme::text());
+            canvas->drawString(S(4), x + size + 10, y + size / 2);
+        }
+        return OSAVal();
+    }
+    if (IS("ui.radio")) {
+        int x = iN(0), y = iN(1), r = max(6, iN(2, 11));
+        bool selected = iN(3) != 0;
+        uint16_t behind = argc >= 6 ? (uint16_t)iN(5) : Theme::surface();
+        uint16_t ringColor = selected ? osaBlue() : Theme::divider();
+        canvas->fillSmoothCircle(x, y, r, ringColor);
+        canvas->fillSmoothCircle(x, y, r - 2, behind, ringColor);
+        if (selected) canvas->fillSmoothCircle(x, y, r / 2, osaBlue(), behind);
+        if (argc >= 5 && S(4).length() > 0) {
+            canvas->setTextFont(2); canvas->setTextSize(1);
+            canvas->setTextDatum(ML_DATUM); canvas->setTextColor(Theme::text());
+            canvas->drawString(S(4), x + r + 10, y);
+        }
+        return OSAVal();
+    }
+
+    // ui.progress(x, y, w, h, value, [max]) — a pill track with an accent fill.
+    if (IS("ui.progress")) {
+        int x = iN(0), y = iN(1), w = max(2, iN(2)), h = max(2, iN(3));
+        double maxValue = N(5, 1.0);
+        if (!(maxValue > 0.0)) maxValue = 1.0;
+        double fraction = N(4) / maxValue;
+        if (!(fraction > 0.0)) fraction = 0.0;
+        if (fraction > 1.0) fraction = 1.0;
+        uint16_t track = Theme::toggleOff();
+        canvas->fillSmoothRoundRect(x, y, w, h, h / 2, track);
+        int fillW = (int)(w * fraction + 0.5);
+        if (fillW > 0) {
+            if (fillW < h) fillW = h;
+            canvas->fillSmoothRoundRect(x, y, fillW, h, h / 2, osaBlue(), track);
+        }
+        return OSAVal();
+    }
+
+    // ui.card(x, y, w, h, [r]) — a raised surface for grouping content.
+    if (IS("ui.card")) {
+        int x = iN(0), y = iN(1), w = max(1, iN(2)), h = max(1, iN(3));
+        int r = max(0, iN(4, 16));
+        canvas->fillSmoothRoundRect(x, y, w, h, r, Theme::surface());
+        if (!Theme::dark() && r > 0)
+            canvas->drawSmoothRoundRect(x, y, r, r, w, h, Theme::divider2(), Theme::surface());
+        return OSAVal();
+    }
+
+    // ui.chip(x, y, label, [selected]) — a pill tag; returns its width so a
+    // row of chips can be laid out in one pass.
+    if (IS("ui.chip")) {
+        int x = iN(0), y = iN(1);
+        bool selected = iN(3) != 0;
+        String label = S(2);
+        canvas->setTextFont(2); canvas->setTextSize(1);
+        int w = canvas->textWidth(label) + 24, h = 28;
+        canvas->fillSmoothRoundRect(x, y, w, h, h / 2, selected ? osaBlue() : osaSoftFill());
+        canvas->setTextDatum(MC_DATUM);
+        canvas->setTextColor(selected ? TFT_WHITE : Theme::text());
+        canvas->drawString(label, x + w / 2, y + h / 2);
+        return OSAVal((double)w);
     }
 
     // ui.menu(itemsPiped, title) — vertical list, returns selected index or -1
@@ -7263,6 +7623,112 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     // ═════════════════════════════════════════════════════════════════════════
 
     // ── Drawing extras ───────────────────────────────────────────────────────
+    if (IS("smooth")) { drawSmooth = iN(0, 1) != 0; return OSAVal(); }
+    // pill(x, y, w, h) — a fully rounded rectangle, the shape of a modern
+    // button or a progress track.
+    if (IS("pill") || IS("pillframe")) {
+        int w = max(1, iN(2)), h = max(1, iN(3));
+        int r = min(w, h) / 2;
+        if (IS("pill")) {
+            if (drawSmooth) canvas->fillSmoothRoundRect(iN(0), iN(1), w, h, r, drawColor);
+            else            CV(fillRoundRect(iN(0), iN(1), w, h, r, drawColor));
+        } else {
+            if (drawSmooth) canvas->drawSmoothRoundRect(iN(0), iN(1), r, r, w, h, drawColor, 0x00FFFFFF);
+            else            CV(drawRoundRect(iN(0), iN(1), w, h, r, drawColor));
+        }
+        return OSAVal();
+    }
+    // rrect4(x, y, w, h, tl, tr, br, bl) — one radius per corner.
+    if (IS("rrect4")) {
+        osaFillRoundRect4(canvas, iN(0), iN(1), iN(2), iN(3),
+                          iN(4), iN(5), iN(6), iN(7), drawColor);
+        return OSAVal();
+    }
+    if (IS("rframe4")) {
+        osaDrawRoundRect4(canvas, iN(0), iN(1), iN(2), iN(3),
+                          iN(4), iN(5), iN(6), iN(7), drawColor);
+        return OSAVal();
+    }
+    // pie(x, y, r, start, end) — filled sector; angles as for arc(), degrees
+    // clockwise from 6 o'clock.
+    if (IS("pie")) {
+        int radius = max(1, iN(2));
+        int start = iN(3) % 360; if (start < 0) start += 360;
+        int end = iN(4) % 360; if (end < 0) end += 360;
+        if (drawSmooth) canvas->drawSmoothArc(iN(0), iN(1), radius, 0, start, end, drawColor, 0x00FFFFFF, false);
+        else            CV(drawArc(iN(0), iN(1), radius, 0, start, end, drawColor, 0, false));
+        return OSAVal();
+    }
+    // star(x, y, points, outerR, innerR, [rotation]) and
+    // ngon(x, y, sides, r, [rotation]) — filled; sframe/nframe outline them
+    // with an optional stroke width as the last argument.
+    if (IS("star") || IS("sframe") || IS("ngon") || IS("nframe")) {
+        bool star = IS("star") || IS("sframe");
+        bool fill = IS("star") || IS("ngon");
+        float xs[OSA_PATH_MAX], ys[OSA_PATH_MAX];
+        int count = star
+            ? osaShapePoints((float)N(0), (float)N(1), iN(2), (float)N(3),
+                             max(0.0f, (float)N(4)), (float)N(5), xs, ys)
+            : osaShapePoints((float)N(0), (float)N(1), iN(2), (float)N(3),
+                             0.0f, (float)N(4), xs, ys);
+        if (fill) osaFillPolygon(canvas, xs, ys, count, canvasH, drawColor);
+        else      osaStrokePolygon(canvas, xs, ys, count,
+                                   (float)N(star ? 6 : 5, 1), true, drawColor);
+        return OSAVal();
+    }
+    // path.begin() / path.to(x, y) ... path.fill() or path.stroke([width],
+    // [closed]) — an arbitrary polygon of up to 48 points. path.move,
+    // path.rotate and path.scale transform the points in place so a shape
+    // can be built once and animated.
+    if (IS("path.begin")) { s_pathCount = 0; return OSAVal(); }
+    if (IS("path.to")) {
+        if (s_pathCount < OSA_PATH_MAX) {
+            s_pathX[s_pathCount] = (float)N(0);
+            s_pathY[s_pathCount] = (float)N(1);
+            ++s_pathCount;
+        }
+        return OSAVal((double)s_pathCount);
+    }
+    if (IS("path.count")) return OSAVal((double)s_pathCount);
+    if (IS("path.x") || IS("path.y")) {
+        int index = iN(0);
+        if (index < 0 || index >= s_pathCount) return OSAVal(0.0);
+        return OSAVal((double)(IS("path.x") ? s_pathX[index] : s_pathY[index]));
+    }
+    if (IS("path.fill")) {
+        osaFillPolygon(canvas, s_pathX, s_pathY, s_pathCount, canvasH, drawColor);
+        return OSAVal();
+    }
+    if (IS("path.stroke")) {
+        osaStrokePolygon(canvas, s_pathX, s_pathY, s_pathCount,
+                         (float)N(0, 1), iN(1, 1) != 0, drawColor);
+        return OSAVal();
+    }
+    if (IS("path.move")) {
+        float dx = (float)N(0), dy = (float)N(1);
+        for (int i = 0; i < s_pathCount; ++i) { s_pathX[i] += dx; s_pathY[i] += dy; }
+        return OSAVal();
+    }
+    if (IS("path.rotate")) {
+        float cx = (float)N(0), cy = (float)N(1);
+        float angle = (float)N(2) * (float)M_PI / 180.0f;
+        float c = cosf(angle), sn = sinf(angle);
+        for (int i = 0; i < s_pathCount; ++i) {
+            float x = s_pathX[i] - cx, y = s_pathY[i] - cy;
+            s_pathX[i] = cx + x * c - y * sn;
+            s_pathY[i] = cy + x * sn + y * c;
+        }
+        return OSAVal();
+    }
+    if (IS("path.scale")) {
+        float cx = (float)N(0), cy = (float)N(1);
+        float fx = (float)N(2, 1), fy = (float)N(3, (double)fx);
+        for (int i = 0; i < s_pathCount; ++i) {
+            s_pathX[i] = cx + (s_pathX[i] - cx) * fx;
+            s_pathY[i] = cy + (s_pathY[i] - cy) * fy;
+        }
+        return OSAVal();
+    }
     if (IS("triangle")) {
         CV(fillTriangle(iN(0), iN(1), iN(2), iN(3), iN(4), iN(5), drawColor));
         return OSAVal();
@@ -7272,7 +7738,9 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         return OSAVal();
     }
     if (IS("rframe")) {
-        CV(drawRoundRect(iN(0), iN(1), iN(2), iN(3), iN(4), drawColor));
+        int r = max(1, iN(4));
+        if (drawSmooth) canvas->drawSmoothRoundRect(iN(0), iN(1), r, r, iN(2), iN(3), drawColor, 0x00FFFFFF);
+        else            CV(drawRoundRect(iN(0), iN(1), iN(2), iN(3), iN(4), drawColor));
         return OSAVal();
     }
     if (IS("gradient") || IS("gradienth")) {
