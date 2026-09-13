@@ -268,6 +268,24 @@ bool install(ProgressCallback progress, void* context) {
     if (!validHttpsUrl(s_manifest.resolvedFirmwareUrl))
         return fail("OTA firmware URL is invalid");
 
+    // Both 4 KB buffers are claimed before the TLS session exists. Update's
+    // own sector buffer used to be allocated after the handshake, when the
+    // record buffers had taken the large region, and the Arduino library
+    // reports that failure as a begin() returning false with no error set.
+    uint8_t* buffer = (uint8_t*)malloc(4096);
+    if (!buffer) return fail("Not enough contiguous RAM for the OTA buffer");
+    if (progress) progress("Preparing", 0, s_manifest.size, context);
+    if (!Update.begin(s_manifest.size, U_FLASH)) {
+        String detail = Update.errorString();
+        // UPDATE_ERROR_OK here means begin() bailed out without recording a
+        // reason; the only such path is its own 4 KB allocation failing.
+        if (detail == "No Error")
+            detail = String("not enough contiguous RAM for the flash writer (free ") +
+                     (unsigned)(ESP.getFreeHeap() / 1024U) + " KB)";
+        free(buffer);
+        return fail(String("Could not start OTA: ") + detail);
+    }
+
     HTTPClient http;
     WiFiClientSecure client;
     SecureHttp::Request request;
@@ -280,37 +298,26 @@ bool install(ProgressCallback progress, void* context) {
             ? String("Firmware download failed: ") + why
             : String("Firmware HTTP error ") + status;
         http.end();
+        free(buffer);
+        Update.abort();
         return fail(message);
     }
     int declared = http.getSize();
     if (declared < 0 || (uint32_t)declared != s_manifest.size) {
         http.end();
+        free(buffer);
+        Update.abort();
         return fail("Firmware Content-Length does not match signed metadata");
     }
 
-    uint8_t* buffer = (uint8_t*)malloc(4096);
-    if (!buffer) {
-        http.end();
-        return fail("Not enough contiguous RAM for OTA buffer");
-    }
     mbedtls_sha256_context sha;
     mbedtls_sha256_init(&sha);
-    bool shaReady = mbedtls_sha256_starts_ret(&sha, 0) == 0;
-    if (!shaReady) {
+    if (mbedtls_sha256_starts_ret(&sha, 0) != 0) {
         free(buffer);
         http.end();
         mbedtls_sha256_free(&sha);
+        Update.abort();
         return fail("Could not initialize firmware SHA-256");
-    }
-
-    if (progress) progress("Preparing", 0, s_manifest.size, context);
-    bool updateStarted = Update.begin(s_manifest.size, U_FLASH);
-    if (!updateStarted) {
-        String message = String("Could not start OTA: ") + Update.errorString();
-        free(buffer);
-        http.end();
-        mbedtls_sha256_free(&sha);
-        return fail(message);
     }
 
     WiFiClient* stream = http.getStreamPtr();
