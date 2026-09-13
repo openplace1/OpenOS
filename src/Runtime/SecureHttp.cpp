@@ -17,6 +17,11 @@ extern bool osaSuspendBluetoothForMemory(const char* reason);
 namespace SecureHttp {
 namespace {
 
+// Set once a pinned handshake with this host has been rejected. Retrying the
+// pin on every later transfer only costs a failed handshake and, worse, holds
+// the whole request to the stricter pinned memory requirement.
+static String s_pinRejectedHost;
+
 static String heapSummary() {
     String summary = "free ";
     summary += (unsigned)(ESP.getFreeHeap() / 1024U);
@@ -288,6 +293,7 @@ int get(HTTPClient& http, WiFiClientSecure& client, const String& url,
     }
     const int attempts = request.attempts < 1 ? 1 : request.attempts;
     const char* anchor = trustAnchorForHost(host);
+    if (anchor && s_pinRejectedHost == host) anchor = nullptr;
     // Pinning is defence in depth: every document fetched from a pinned host
     // also carries a release signature that is checked afterwards. When the
     // pinned handshake is rejected we therefore log it loudly and continue
@@ -304,7 +310,18 @@ int get(HTTPClient& http, WiFiClientSecure& client, const String& url,
             delay(attempt == 2 ? 300 : 800);
             yield();
         }
-        if (!memoryAvailable(why, anchor != nullptr && !pinRejected))
+        // The pinned requirement must never block a transfer that an unpinned
+        // session could still carry: verification is defence in depth, the
+        // release signature is what authenticates the content.
+        bool wantPin = anchor != nullptr && !pinRejected;
+        if (wantPin && !memoryAvailable(why, true)) {
+            Serial.printf("[HTTPS] %s: not enough contiguous RAM to verify the "
+                          "pinned chain, continuing unpinned (%s)\n",
+                          host.c_str(), why.c_str());
+            pinRejected = true;
+            wantPin = false;
+        }
+        if (!memoryAvailable(why, false))
             return HTTPC_ERROR_CONNECTION_REFUSED;
         if (WiFi.status() != WL_CONNECTED) {
             why = "Wi-Fi is not connected";
@@ -318,7 +335,7 @@ int get(HTTPClient& http, WiFiClientSecure& client, const String& url,
         // Official hosts are pinned to their root CA (identity + host name).
         // Elsewhere authenticity comes from the release signatures on the
         // documents themselves, not from the server certificate.
-        const bool usePin = anchor != nullptr && !pinRejected;
+        const bool usePin = wantPin;
         if (usePin) client.setCACert(anchor);
         else        client.setInsecure();
         Serial.printf("[HTTPS] connect %s%s free=%u maxBlock=%u stackFree=%u\n",
@@ -345,9 +362,11 @@ int get(HTTPClient& http, WiFiClientSecure& client, const String& url,
             char detail[8] = {0};
             if (client.lastError(detail, sizeof(detail)) == -0x2700) {
                 pinRejected = true;
+                s_pinRejectedHost = host;
                 Serial.printf("[HTTPS] %s rejected the pinned root; continuing "
-                              "unpinned, the release signature still has to "
-                              "match\n", host.c_str());
+                              "unpinned for the rest of this session, the "
+                              "release signature still has to match\n",
+                              host.c_str());
             }
         }
         Serial.printf("[HTTPS] attempt %d/%d %s%s: %s (free=%u maxBlock=%u)\n",

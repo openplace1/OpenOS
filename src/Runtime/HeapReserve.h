@@ -26,6 +26,13 @@
 namespace HeapReserve {
 
 static constexpr size_t BYTES = 45U * 1024U;
+// Once an application has run, the heap rarely offers BYTES in one piece
+// again — a single long-lived String left in the middle of the released
+// region is enough. Reclaiming all-or-nothing therefore lost the reserve for
+// the rest of the session, and the next transfer found whatever fragments
+// were left. reclaim() now settles for the largest block it can get down to
+// this floor, which still covers both TLS record buffers.
+static constexpr size_t MIN_BYTES = 35U * 1024U;
 
 void begin();
 
@@ -35,6 +42,8 @@ void begin();
 void release(const char* reason);
 bool reclaim();
 bool held();
+// Size of the block currently held, 0 when none.
+size_t size();
 
 // Use the reserved block directly, without freeing it. A consumer that would
 // otherwise allocate and then leave long-lived debris inside the freed region
