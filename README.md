@@ -331,7 +331,7 @@ Optional, must be near the top of the file.
 
 Runtime limits per script: 128 KB source, 768 lines, 4096 bytes per source line,
 96 variables, 24 user functions and 10 nested calls. Compiled bytecode is
-limited to 12288 bytes, 96 numeric constants, 224 string constants, 224 names and
+limited to 12288 bytes, 192 numeric constants, 384 string constants, 320 names and
 a 48-value operand stack. Exceeding a compiler pool is a hard compile error;
 it never falls through to an invalid `-1` bytecode index.
 The OpenStore publisher applies a stricter 768-byte line limit to packaged OSA
@@ -905,9 +905,9 @@ device over plain TCP.
 | `elapsed(startMs)` | Wrap-safe milliseconds elapsed since `startMs` |
 | `sdk.version()` | Numeric SDK compatibility level (currently `6`) |
 | `sdk.has(feature)` | Capability check, including `d3`, `d3.scene`, `sprite`, `touch`, `perf`, `http`, `json`, `opk`, `ota`, `shapes`, `path`, `widgets`, `icons`, `tabbar`, `smooth`, `net`, `buffers`, `pixels`, `store.compatibility` and `store.updateAll` |
-| `sys.info(key)` | Hardware and build facts: `chip`, `cores`, `cpu` (MHz), `flash`, `sketch`, `slot`, `ram`, `psram`, `idf`, `mac`, `board`, `partition`, `display`, `touch`, `sdtotal`, `sdused`, `sdtype`, `reset` |
-| `openos.version()` | Display version (currently `1.6.0`) |
-| `openos.versionCode()` | Numeric OpenOS compatibility level (currently `24`) |
+| `sys.info(key)` | Hardware and build facts: `chip`, `cores`, `cpu` (MHz), `flash`, `sketch`, `slot`, `ram`, `psram`, `idf`, `mac`, `board`, `partition`, `display`, `touch`, `sdtotal`, `sdused`, `sdtype`, `reset`, `reserve` |
+| `openos.version()` | Display version (currently `1.6.1`) |
+| `openos.versionCode()` | Numeric OpenOS compatibility level (currently `25`) |
 
 ### Privileged — system
 
@@ -943,6 +943,7 @@ Any absolute path on SD. Use carefully.
 | Call | Effect |
 |---|---|
 | `fs.list(absPath)` | `\|`-separated entries; directories end with `/` |
+| `fs.usage(absPath, [maxDepth])` | Bytes under a directory (or a file's size), walking up to `maxDepth` levels (default 4) |
 | `fs.read(path[, offset, length])` | File contents or a bounded slice |
 | `fs.size(path)` | File size in bytes |
 | `fs.write(path, data)` | Overwrite |

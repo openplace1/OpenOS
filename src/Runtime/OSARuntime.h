@@ -13,9 +13,9 @@
 
 // ─── Bytecode VM limits ──────────────────────────────────────────────────────
 #define OSA_BC_MAX       12288  // total bytecode bytes (opcodes + operands)
-#define OSA_NUM_CONST    96     // numeric constant pool
-#define OSA_STR_CONST    224    // string constant pool (OTA Settings is largest)
-#define OSA_NAME_CONST   224    // variables, functions and builtin names
+#define OSA_NUM_CONST    192    // numeric constant pool (Settings' About pages use ~120)
+#define OSA_STR_CONST    384    // string constant pool (Settings has ~230 literals)
+#define OSA_NAME_CONST   320    // variables, functions and builtin names
 #define OSA_STACK_SIZE   48     // operand stack
 #define OSA_LOOP_DEPTH   8      // nested while/for/loop tracking
 

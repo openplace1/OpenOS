@@ -1588,8 +1588,9 @@ int OSARuntime::bcFindNextBranch(int n)  { return findNextBranch(n); }
 static const char    OSAC_MAGIC[4] = { 'O', 'S', 'A', 'C' };
 // 2: source size, source mtime and firmware version code follow the version
 // byte, so a cached compilation can be matched to its source and dropped
-// after a firmware update.
-static const uint8_t OSAC_VERSION  = 2;
+// after a firmware update. 3: pool and function counts are 16-bit, since the
+// string pool grew past 255 entries.
+static const uint8_t OSAC_VERSION  = 3;
 static void w8(File& f, uint8_t v)  { f.write(v); }
 static void w16(File& f, uint16_t v){ f.write((uint8_t)(v & 0xFF)); f.write((uint8_t)(v >> 8)); }
 static void w32(File& f, uint32_t v){ w16(f, (uint16_t)(v & 0xFFFF)); w16(f, (uint16_t)(v >> 16)); }
@@ -1773,16 +1774,16 @@ bool OSARuntime::serializeOsac(const String& dstPath) {
     w16(f, (uint16_t)(bc.loopEnd   & 0xFFFF));
     for (int i = 0; i < bc.codeLen; i++) f.write(bc.code[i]);
 
-    w8(f, (uint8_t)bc.numPoolLen);
+    w16(f, (uint16_t)bc.numPoolLen);
     for (int i = 0; i < bc.numPoolLen; i++) wD(f, bc.numPool[i]);
 
-    w8(f, (uint8_t)bc.strPoolLen);
+    w16(f, (uint16_t)bc.strPoolLen);
     for (int i = 0; i < bc.strPoolLen; i++) wS(f, bc.strPool[i]);
 
-    w8(f, (uint8_t)bc.namePoolLen);
+    w16(f, (uint16_t)bc.namePoolLen);
     for (int i = 0; i < bc.namePoolLen; i++) wS(f, bc.namePool[i]);
 
-    w8(f, (uint8_t)funcCount);
+    w16(f, (uint16_t)funcCount);
     for (int i = 0; i < funcCount; i++) {
         wS(f, funcs[i].name);
         w16(f, (uint16_t)funcs[i].bcStart);
@@ -1821,7 +1822,10 @@ bool OSARuntime::loadOsac(const String& srcPath, const SourceStamp* expectSource
     }
     uint8_t ver;
     if (!r8(f, ver) || ver != OSAC_VERSION) {
-        f.close(); setError(0, "Bad .osac version"); return false;
+        // A cache entry from an older firmware is just stale, not an error.
+        f.close();
+        if (!expectSource) setError(0, "Bad .osac version");
+        return false;
     }
     uint32_t sourceSize, sourceMtime;
     uint16_t builtBy;
@@ -1839,7 +1843,8 @@ bool OSARuntime::loadOsac(const String& srcPath, const SourceStamp* expectSource
 
     bc.clear();
     uint16_t ignoredColor, codeLen, setupEnd, loopStartRaw, loopEndRaw;
-    uint8_t ignoredIsApp, serializedException, count;
+    uint8_t ignoredIsApp, serializedException;
+    uint16_t count;
     if (!rS(f, appName, 64)) {
         f.close(); setError(0, "Invalid .osac app name"); return false;
     }
@@ -1868,7 +1873,7 @@ bool OSARuntime::loadOsac(const String& srcPath, const SourceStamp* expectSource
         f.close(); setError(0, "Truncated .osac code"); return false;
     }
 
-    if (!r8(f, count) || count > OSA_NUM_CONST) {
+    if (!r16(f, count) || count > OSA_NUM_CONST) {
         f.close(); setError(0, "Invalid .osac number pool"); return false;
     }
     bc.numPoolLen = count;
@@ -1878,7 +1883,7 @@ bool OSARuntime::loadOsac(const String& srcPath, const SourceStamp* expectSource
         }
     }
 
-    if (!r8(f, count) || count > OSA_STR_CONST) {
+    if (!r16(f, count) || count > OSA_STR_CONST) {
         f.close(); setError(0, "Invalid .osac string pool"); return false;
     }
     bc.strPoolLen = count;
@@ -1893,7 +1898,7 @@ bool OSARuntime::loadOsac(const String& srcPath, const SourceStamp* expectSource
         }
     }
 
-    if (!r8(f, count) || count > OSA_NAME_CONST) {
+    if (!r16(f, count) || count > OSA_NAME_CONST) {
         f.close(); setError(0, "Invalid .osac name pool"); return false;
     }
     bc.namePoolLen = count;
@@ -1903,7 +1908,7 @@ bool OSARuntime::loadOsac(const String& srcPath, const SourceStamp* expectSource
         }
     }
 
-    if (!r8(f, count) || count > OSA_MAX_FUNCS) {
+    if (!r16(f, count) || count > OSA_MAX_FUNCS) {
         f.close(); setError(0, "Invalid .osac function table"); return false;
     }
     funcCount = count;
@@ -3353,11 +3358,14 @@ bool OSARuntime::loadScript(String path) {
             }
             return true;
         }
-        // A stale or broken entry is replaced after this compile.
+        // A stale or broken entry is replaced after this compile; nothing it
+        // reported on the way counts as a script error.
         bc.clear();
         appName = "";
         requiredPerms = 0;
         isException = false;
+        errLine = -1;
+        errMsg = "";
     }
 
     // One buffer for the whole file: a single allocation that is released
@@ -5681,6 +5689,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
             }
         }
         if (key == "reset") return OSAVal(String(osaResetReasonName()));
+        if (key == "reserve") return OSAVal((double)HeapReserve::size());
         return OSAVal(String());
     }
     if (IS("sdready")) return OSAVal(isSdReady ? 1.0 : 0.0);
@@ -8204,6 +8213,48 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         return OSAVal(wrote ? 1.0 : -5.0);
     }
 
+    // fs.usage(path, [maxDepth]) — bytes held by the files under a directory
+    // (or one file's size), walking at most maxDepth levels (default 4).
+    if (IS("fs.usage")) {
+        if (!needException("fs.usage")) return OSAVal(-1.0);
+        if (!isSdReady) return OSAVal(-1.0);
+        struct Walk {
+            static double bytes(const String& path, int depth) {
+                File node = SD.open(path);
+                if (!node) return 0.0;
+                if (!node.isDirectory()) {
+                    double size = (double)node.size();
+                    node.close();
+                    return size;
+                }
+                double total = 0.0;
+                if (depth > 0) {
+                    File child = node.openNextFile();
+                    while (child) {
+                        String name = child.name();
+                        int slash = name.lastIndexOf('/');
+                        if (slash >= 0) name = name.substring(slash + 1);
+                        bool dir = child.isDirectory();
+                        double size = dir ? 0.0 : (double)child.size();
+                        child.close();
+                        if (dir) {
+                            String full = path;
+                            if (!full.endsWith("/")) full += "/";
+                            full += name;
+                            total += bytes(full, depth - 1);
+                        } else {
+                            total += size;
+                        }
+                        yield();
+                        child = node.openNextFile();
+                    }
+                }
+                node.close();
+                return total;
+            }
+        };
+        return OSAVal(Walk::bytes(S(0), constrain(iN(1, 4), 0, 6)));
+    }
     if (IS("fs.list")) {
         if (!needException("fs.list")) return OSAVal("");
         if (!isSdReady) return OSAVal("");
