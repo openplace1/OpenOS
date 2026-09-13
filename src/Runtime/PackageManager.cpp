@@ -927,11 +927,22 @@ static bool copyStored(File& archive, File& output, const ZipEntry& entry) {
 }
 
 static bool inflateDeflated(File& archive, File& output, const ZipEntry& entry) {
-    HeapReserve::release("OPK extraction");
-    uint8_t* dictionary = (uint8_t*)malloc(TINFL_LZ_DICT_SIZE);
-    tinfl_decompressor* inflater = (tinfl_decompressor*)malloc(sizeof(tinfl_decompressor));
+    // The 32 KB dictionary and the 11 KB decompressor come out of the heap
+    // reserve, which is idle once the download's TLS session has closed.
+    bool dictionaryInReserve = true, inflaterInReserve = true;
+    uint8_t* dictionary = (uint8_t*)HeapReserve::allocate(TINFL_LZ_DICT_SIZE, "OPK dictionary");
+    if (!dictionary) { dictionaryInReserve = false; dictionary = (uint8_t*)malloc(TINFL_LZ_DICT_SIZE); }
+    tinfl_decompressor* inflater =
+        (tinfl_decompressor*)HeapReserve::allocate(sizeof(tinfl_decompressor), "OPK inflater");
+    if (!inflater) { inflaterInReserve = false; inflater = (tinfl_decompressor*)malloc(sizeof(tinfl_decompressor)); }
+    auto releaseBuffers = [&]() {
+        if (dictionary) { if (dictionaryInReserve) HeapReserve::deallocate(dictionary); else free(dictionary); }
+        if (inflater) { if (inflaterInReserve) HeapReserve::deallocate(inflater); else free(inflater); }
+        dictionary = nullptr;
+        inflater = nullptr;
+    };
     if (!dictionary || !inflater) {
-        free(dictionary); free(inflater);
+        releaseBuffers();
         return fail("Not enough RAM to extract compressed OPK");
     }
     tinfl_init(inflater);
@@ -983,8 +994,7 @@ static bool inflateDeflated(File& archive, File& output, const ZipEntry& entry) 
     bool valid = status == TINFL_STATUS_DONE && totalOutput == entry.uncompressed &&
                  compressedLeft == 0 && inputPos == inputLength &&
                  (uint32_t)crc == entry.crc;
-    free(dictionary);
-    free(inflater);
+    releaseBuffers();
     return valid || fail("Deflated OPK file is corrupt");
 }
 

@@ -205,6 +205,44 @@ void release(const char* reason) {
                   (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 }
 
+bool makeRoom(size_t bytes, const char* reason) {
+    size_t need = bytes + 512U;   // allocator headers and rounding
+    size_t current = 0;
+    int live = 0;
+    portENTER_CRITICAL(&s_mux);
+    current = s_block ? s_size : 0;
+    live = s_live;
+    portEXIT_CRITICAL(&s_mux);
+    if (!current) return false;
+    if (live > 0) {
+        Serial.printf("[HEAP] reserve kept for %s: %d allocations live inside it\n",
+                      reason ? reason : "large allocation", live);
+        return false;
+    }
+    if (current < need + MIN_KEEP) {
+        release(reason);
+        return true;
+    }
+    size_t keep = (current - need) & ~(size_t)7U;
+    portENTER_CRITICAL(&s_mux);
+    void* shrunk = heap_caps_realloc(s_block, keep, MALLOC_CAP_8BIT);
+    if (shrunk) {
+        s_block = shrunk;
+        s_size = keep;
+        arenaFormat();
+    }
+    portEXIT_CRITICAL(&s_mux);
+    if (!shrunk) {
+        release(reason);
+        return true;
+    }
+    Serial.printf("[HEAP] reserve shrunk to %u B for %s free=%u maxBlock=%u\n",
+                  (unsigned)keep, reason ? reason : "large allocation",
+                  (unsigned)ESP.getFreeHeap(),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    return true;
+}
+
 bool reclaim() {
     if (s_block) {
         if (s_size >= BYTES) return true;

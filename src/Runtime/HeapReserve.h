@@ -47,6 +47,9 @@ static constexpr size_t BYTES = 52U * 1024U;
 // again. reclaim() settles for the largest block it can get down to this
 // floor, which still covers both TLS record buffers (2 x ~16.7 KB).
 static constexpr size_t MIN_BYTES = 35U * 1024U;
+// makeRoom() keeps at least this much: enough for a 3D scene list or a
+// script's source text while a sprite holds the rest.
+static constexpr size_t MIN_KEEP = 20U * 1024U;
 
 void begin();
 
@@ -55,6 +58,12 @@ void begin();
 // window); reclaim() takes it again afterwards. Refused, with a log line,
 // while mbedTLS still holds memory inside the block.
 void release(const char* reason);
+// The general heap cannot serve `bytes` in one block: give up just enough
+// of the reserve's tail for it (the block is shrunk in place, so the freed
+// tail is one contiguous piece), or the whole block when that would leave
+// less than MIN_KEEP. Refused while anything is live inside. reclaim() grows
+// the block back once the consumer is gone.
+bool makeRoom(size_t bytes, const char* reason);
 bool reclaim();
 bool held();
 // Size of the block currently held, 0 when none.

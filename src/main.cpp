@@ -763,14 +763,64 @@ static bool deleteFolderAt(int idx) {
 bool osaMakeFolder(int idx)                    { return createFolderFromIcon(idx); }
 bool osaDeleteFolder(int idx)                  { return deleteFolderAt(idx); }
 bool osaAddToFolder(int folderIdx, int appIdx) { return addAppToFolderImpl(folderIdx, appIdx); }
-// anim.openTile() in OSA used to play a zoom-in animation here; it now just
-// records which tile launched so a future close anim could find its position.
-// The animation calls themselves are gone — they didn't feel snappy enough.
+// anim.openTile() in OSA records which tile launched; the zoom itself plays
+// from main.cpp once the launch is known (playOpenAnimation), so a script
+// cannot start it without actually launching anything.
 void osaPlayOpenAnim(int idx) {
     if (idx < 0 || idx >= home.appCount) return;
     home.lastLaunchX     = 12 + (idx % 4) * 55 + 23;
     home.lastLaunchY     = 30 + (idx / 4) * 80 + 23;
     home.lastLaunchColor = home.tiles[idx].color;
+}
+
+// The launched tile grows into the whole screen in its own colour, and that
+// colour then stays under the loading script until it paints its first
+// frame — the way a phone opens an app. Six eased frames, about 120 ms of
+// SPI; a slower version of this once felt sluggish, which is why the tail
+// of the curve is where the big fills happen and why it stops at six.
+static void playOpenAnimation(int fromX, int fromY, int fromSize, uint16_t color,
+                              const String& label) {
+    const int frames = 6;
+    for (int i = 1; i <= frames; ++i) {
+        float t = (float)i / (float)frames;
+        t = 1.0f - (1.0f - t) * (1.0f - t);
+        int x = (int)(fromX + (0 - fromX) * t);
+        int y = (int)(fromY + (0 - fromY) * t);
+        int w = (int)(fromSize + (240 - fromSize) * t);
+        int h = (int)(fromSize + (320 - fromSize) * t);
+        int r = (int)(12 + (2 - 12) * t);
+        tft.fillRoundRect(x, y, w, h, r, color);
+        delay(8);
+    }
+    tft.fillScreen(color);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextFont(4);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawString(label, 120, 152);
+}
+
+// Finds the Home tile a launch came from — top level or inside a folder —
+// and plays the zoom. Launches that did not come from a tile (OpenStore,
+// app.launch from another script) get no animation.
+static void animateLaunchFromHome(const String& scriptPath) {
+    for (int i = 0; i < home.appCount; ++i) {
+        const HomeTile& tile = home.tiles[i];
+        if (!tile.isFolder && tile.scriptPath == scriptPath) {
+            playOpenAnimation(12 + (i % 4) * 55, 30 + (i / 4) * 80, 46,
+                              tile.color, tile.name);
+            return;
+        }
+        if (tile.isFolder && tile.children) {
+            for (int j = 0; j < tile.childCount; ++j) {
+                if (tile.children[j].scriptPath == scriptPath) {
+                    // The folder view lays its children out in a 3-wide grid.
+                    playOpenAnimation(37 + (j % 3) * 60, 50 + (j / 3) * 72, 46,
+                                      tile.children[j].color, tile.children[j].name);
+                    return;
+                }
+            }
+        }
+    }
 }
 
 // Loads /system/apps/home.osa into osaApp and shows it. Called on boot,
@@ -1033,6 +1083,7 @@ void loop() {
             }
             String next = osaApp.pendingLaunch();
             osaApp.clearPendingLaunch();
+            if (next.length() > 0) animateLaunchFromHome(next);
             osaApp.recycle();
             if (next.length() > 0) {
                 prepareMemoryForScript(next);

@@ -11,6 +11,7 @@ bool OSAApp::loadScript(const String& path) {
     scriptLoaded = showDone = wantsExit = false;
     Serial.printf("[APP] load '%s' free=%u\n", path.c_str(),
                   (unsigned)ESP.getFreeHeap());
+    uint32_t started = millis();
     if (!runtime.loadScript(path)) {
         name = runtime.appName.length() > 0 ? runtime.appName : "App";
         Serial.printf("[APP] load failed '%s': %s free=%u\n", path.c_str(),
@@ -19,8 +20,9 @@ bool OSAApp::loadScript(const String& path) {
     }
     name = runtime.appName.length() > 0 ? runtime.appName : "App";
     scriptLoaded = true;
-    Serial.printf("[APP] loaded '%s' as '%s' free=%u\n", path.c_str(),
-                  name.c_str(), (unsigned)ESP.getFreeHeap());
+    Serial.printf("[APP] loaded '%s' as '%s' in %u ms free=%u\n", path.c_str(),
+                  name.c_str(), (unsigned)(millis() - started),
+                  (unsigned)ESP.getFreeHeap());
     return true;
 }
 

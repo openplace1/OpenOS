@@ -336,6 +336,12 @@ it never falls through to an invalid `-1` bytecode index.
 The OpenStore publisher applies a stricter 768-byte line limit to packaged OSA
 source so packages remain within the supported publishing profile.
 
+Compiled bytecode is cached on the SD card (`/system/cache/<hash>.osac`, one
+entry per script path, validated against the source's size, modification time
+and the firmware version), so a script only pays for parsing and compiling the
+first time it runs on a given firmware. Privilege still comes from the script's
+path, never from anything inside a cache file.
+
 ---
 
 ## Permissions
@@ -661,9 +667,15 @@ waiting. It should be called once per animation loop instead of a busy wait.
 
 ### Lightweight pseudo-3D
 
-The 3D API uses perspective projection, back-face culling, simple directional
-lighting and a painter-sort for cube faces. It allocates no vertex heap and uses
-32-bit float math. Rendering a cube is one native SDK call.
+The 3D API uses perspective projection, back-face culling, directional
+lighting and a painter's sort. Immediate calls (`d3.cube`, `d3.line`, ...)
+transform and draw inside one native call. A *scene* (`d3.begin` … `d3.end` /
+`d3.present`) collects every primitive of a frame into one depth-sorted list
+first, so several shapes occlude each other correctly, and `d3.present` can
+render that list through a sprite much smaller than the viewport, band by
+band — the whole 240×320 at 16-bit colour from a 240×40 sprite (19 KB).
+Built-in shapes are generated on the fly; nothing keeps a vertex heap except
+a custom mesh.
 
 | Call | Effect / return |
 |---|---|
@@ -682,6 +694,53 @@ lighting and a painter-sort for cube faces. It allocates no vertex heap and uses
 | `d3.renderMs()` / `d3.faces()` | Last cube render time / visible face count |
 | `d3.adaptive(enabled)` | Enable/disable automatic quality fallback |
 | `d3.quality()` | `1` full quality, `0` temporary wireframe fallback |
+| `d3.view(rx, ry, rz)` | Orbit rotation applied to everything, radians |
+| `d3.light(x, y, z, [ambient])` | Direction *towards* the light and the ambient level `0..1` |
+
+**Scene**
+
+| Call | Effect / return |
+|---|---|
+| `d3.begin()` | Start collecting; `1` when the list exists (768 entries from the heap reserve, fewer on a tight heap) |
+| `d3.end()` | Sort far-to-near and draw into the active sprite or the screen; returns the entry count |
+| `d3.present()` | Sort and render through the active sprite in horizontal bands of its height, pushing each band at the viewport; the sprite must be as wide as the viewport |
+| `d3.viewport(x, y, w, h)` | Screen rectangle `d3.present` fills (default full screen) |
+| `d3.background(c565)` | Colour each band is cleared to |
+| `d3.tris()` / `d3.dropped()` / `d3.capacity()` | Entries collected / dropped for lack of room / list size |
+
+**Shapes** — placed with `d3.at`, coloured with `setcolor`; `mode` is `0` wire,
+`1` solid, `2` solid + edges, and `+4` makes a shape two-sided (no culling).
+The optional `edge565` overrides the edge colour.
+
+| Call | Effect / return |
+|---|---|
+| `d3.at(x, y, z, [rx, ry, rz], [scale])` | Position, rotation and uniform scale for the shapes that follow |
+| `d3.box(sx, sy, sz, [mode], [edge565])` | Box with those side lengths |
+| `d3.sphere(r, [segments], [mode], [edge565])` | UV sphere, 4–24 segments (default 12) |
+| `d3.cylinder(rBottom, [rTop], h, [sides], [mode], [edge565])` | Cylinder, or a frustum when the radii differ |
+| `d3.cone(r, h, [sides], [mode], [edge565])` | Cone |
+| `d3.torus(R, r, [segments], [rings], [mode], [edge565])` | Torus of ring radius `R` and tube radius `r` |
+| `d3.plane(w, d, [mode], [edge565])` | Two-sided rectangle in the XZ plane |
+| `d3.meshBegin()` / `d3.vertex(x, y, z)` / `d3.face(a, b, c, [d])` / `d3.meshEnd()` | Custom mesh of up to 256 vertices and 512 faces; `vertex` returns the index. List each face clockwise as seen from outside |
+| `d3.mesh([mode], [edge565])` | Draw the custom mesh under the current `d3.at` |
+
+```
+gfx.auto(240, 40, 16)          # a band buffer, not a full screen
+d3.viewport(0, 24, 240, 296)   # keep a strip for a HUD
+loop
+  d3.begin()
+  d3.view(0.35, t, 0)
+  setcolor(255, 149, 0)
+  d3.at(-1.2, 0, 0, 0, t, 0)
+  d3.sphere(0.9, 12, 2)
+  setcolor(52, 199, 120)
+  d3.at(1.2, 0, 0, t, t, 0)
+  d3.torus(0.8, 0.3, 12, 8, 1)
+  d3.present()
+  t = t + d3.delta()
+  d3.frame(30)
+end
+```
 
 If two consecutive frames take longer than ~1.67× the requested frame time,
 filled cubes temporarily switch to wireframe. Full quality returns after ten
@@ -690,7 +749,9 @@ deadline and keeps polling system gestures, so a 40 FPS target never starves
 touch or Wi-Fi; a 160×160 8-bit sprite pushed over 40 MHz SPI costs about
 12 ms per frame, which is what the 40 FPS ceiling is sized for. The
 [`3D Cube`](https://github.com/openplace1/OpenStore/blob/main/apps/cube3d.osa)
-sample is distributed through OpenStore and is the reference workload.
+sample is distributed through OpenStore and is the reference workload for
+immediate mode; [`3D Shapes`](https://github.com/openplace1/OpenStore/blob/main/apps/shapes3d.osa)
+is the reference for a full-screen scene.
 
 ### Wallpaper
 
@@ -762,6 +823,17 @@ theme; the accent is the system blue.
 | `ui.progress(x, y, w, h, value, [max])` | Pill progress track; `value/max` clamped to `0..1` |
 | `ui.card(x, y, w, h, [r])` | Raised surface for grouping content |
 | `ui.chip(x, y, label, [selected])` | Pill tag; returns its width so a row can be laid out in one pass |
+| `ui.icon(name, cx, cy, size, [bg565])` | One of the built-in icons in the draw colour; `1` if the name is known |
+| `ui.iconButton(cx, cy, d, icon, [style], [pressed])` | Round button with an icon; styles as `ui.button`, default `1` |
+| `ui.tabbar("icon:Label\|icon:Label\|…", selected)` | Floating pill tab bar along the bottom edge, up to 6 tabs; returns one tab's width |
+| `ui.tabbarTap(count)` | Index of the tab just tapped, or `-1` |
+
+Icons: `clock`, `share`, `folder`, `grid`/`apps`, `gear`/`settings`, `search`,
+`home`, `star`, `download`, `list`, `info`, `heart`, `wifi`, `bt`, `sun`,
+`moon`/`theme`, `sync`, `power`, `back`, `plus`, `check`, `close`, `more`,
+`play`, `music`, `cube`, `note`. Any other name draws its first character in a
+ring. The tab bar floats over the content, so leave the bottom 70 px of a
+scrolling list free — Control Center and OpenStore are built from these.
 
 `bg565` is the colour behind a checkbox or radio, needed to clear the mark
 when it turns off; it defaults to `theme.surface()`.
@@ -803,10 +875,10 @@ end
 | `millis()` | ms since boot |
 | `micros()` | µs counter since boot |
 | `elapsed(startMs)` | Wrap-safe milliseconds elapsed since `startMs` |
-| `sdk.version()` | Numeric SDK compatibility level (currently `4`) |
-| `sdk.has(feature)` | Capability check, including `d3`, `sprite`, `touch`, `perf`, `http`, `json`, `opk`, `ota`, `shapes`, `path`, `widgets`, `smooth`, `store.compatibility` and `store.updateAll` |
-| `openos.version()` | Display version (currently `1.4.0`) |
-| `openos.versionCode()` | Numeric OpenOS compatibility level (currently `21`) |
+| `sdk.version()` | Numeric SDK compatibility level (currently `5`) |
+| `sdk.has(feature)` | Capability check, including `d3`, `d3.scene`, `sprite`, `touch`, `perf`, `http`, `json`, `opk`, `ota`, `shapes`, `path`, `widgets`, `icons`, `tabbar`, `smooth`, `store.compatibility` and `store.updateAll` |
+| `openos.version()` | Display version (currently `1.5.0`) |
+| `openos.versionCode()` | Numeric OpenOS compatibility level (currently `23`) |
 
 ### Privileged — system
 

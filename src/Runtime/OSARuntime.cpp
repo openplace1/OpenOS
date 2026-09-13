@@ -633,6 +633,231 @@ static inline uint16_t osaSoftFill() {
     return Theme::dark() ? Theme::c(58, 58, 64) : Theme::c(236, 236, 240);
 }
 
+// ─── Built-in icons ──────────────────────────────────────────────────────────
+// A small vector set for tab bars, tiles and buttons, drawn with the
+// anti-aliased primitives so it reads cleanly at 18-28 px. `bg` is the colour
+// the strokes blend into (the tile or bar behind the icon); an unknown name
+// falls back to its first character in a ring, so a script can always show
+// something.
+
+static void osaStroke(TFT_eSPI* c, float x1, float y1, float x2, float y2,
+                      float w, uint16_t color, uint16_t bg) {
+    c->drawWideLine(x1, y1, x2, y2, w, color, bg);
+}
+
+static bool osaDrawIcon(TFT_eSPI* c, const String& name, int cx, int cy,
+                        int size, uint16_t color, uint16_t bg) {
+    const float s = (float)size;
+    const float r = s * 0.5f;
+    const float w = max(2.0f, s / 11.0f);      // stroke width
+    const float fx = (float)cx, fy = (float)cy;
+    if (name == "clock") {
+        c->drawSmoothArc(cx, cy, (int)r, (int)(r - w), 0, 360, color, bg, false);
+        osaStroke(c, fx, fy, fx, fy - r * 0.55f, w, color, bg);
+        osaStroke(c, fx, fy, fx + r * 0.42f, fy + r * 0.2f, w, color, bg);
+        return true;
+    }
+    if (name == "share") {
+        // A tray with an arrow rising out of it.
+        float bx = fx - r * 0.6f, by = fy - r * 0.1f, bw = r * 1.2f, bh = r * 1.0f;
+        osaStroke(c, bx, by, bx, by + bh, w, color, bg);
+        osaStroke(c, bx, by + bh, bx + bw, by + bh, w, color, bg);
+        osaStroke(c, bx + bw, by + bh, bx + bw, by, w, color, bg);
+        osaStroke(c, fx, fy + r * 0.3f, fx, fy - r * 0.9f, w, color, bg);
+        osaStroke(c, fx, fy - r * 0.9f, fx - r * 0.4f, fy - r * 0.5f, w, color, bg);
+        osaStroke(c, fx, fy - r * 0.9f, fx + r * 0.4f, fy - r * 0.5f, w, color, bg);
+        return true;
+    }
+    if (name == "folder") {
+        int bw = (int)(s * 0.9f), bh = (int)(s * 0.66f);
+        int bx = cx - bw / 2, by = cy - bh / 2 + (int)(s * 0.06f);
+        c->fillSmoothRoundRect(bx, by - (int)(s * 0.14f), bw / 2, (int)(s * 0.3f), 3, color, bg);
+        c->fillSmoothRoundRect(bx, by, bw, bh, 4, color, bg);
+        return true;
+    }
+    if (name == "grid" || name == "apps") {
+        int cell = (int)(s * 0.38f), gap = (int)(s * 0.12f);
+        int x0 = cx - cell - gap / 2, y0 = cy - cell - gap / 2;
+        for (int i = 0; i < 4; ++i)
+            c->fillSmoothRoundRect(x0 + (i % 2) * (cell + gap), y0 + (i / 2) * (cell + gap),
+                                   cell, cell, 3, color, bg);
+        return true;
+    }
+    if (name == "gear" || name == "settings") {
+        for (int i = 0; i < 8; ++i) {
+            float a = (float)i * (float)M_PI / 4.0f;
+            osaStroke(c, fx + cosf(a) * r * 0.55f, fy + sinf(a) * r * 0.55f,
+                      fx + cosf(a) * r, fy + sinf(a) * r, w * 1.4f, color, bg);
+        }
+        c->drawSmoothArc(cx, cy, (int)(r * 0.62f), (int)(r * 0.3f), 0, 360, color, bg, false);
+        return true;
+    }
+    if (name == "search") {
+        float gr = r * 0.62f;
+        c->drawSmoothArc(cx - (int)(r * 0.18f), cy - (int)(r * 0.18f), (int)gr, (int)(gr - w),
+                         0, 360, color, bg, false);
+        osaStroke(c, fx + r * 0.28f, fy + r * 0.28f, fx + r * 0.9f, fy + r * 0.9f, w * 1.3f, color, bg);
+        return true;
+    }
+    if (name == "home") {
+        osaStroke(c, fx - r, fy, fx, fy - r, w, color, bg);
+        osaStroke(c, fx, fy - r, fx + r, fy, w, color, bg);
+        c->fillSmoothRoundRect(cx - (int)(r * 0.66f), cy - (int)(r * 0.1f),
+                               (int)(r * 1.32f), (int)(r * 1.0f), 2, color, bg);
+        return true;
+    }
+    if (name == "star") {
+        float xs[10], ys[10];
+        int n = osaShapePoints(fx, fy, 5, r, r * 0.45f, 0.0f, xs, ys);
+        osaFillPolygon(c, xs, ys, n, cy + size, color);
+        return true;
+    }
+    if (name == "download") {
+        osaStroke(c, fx, fy - r, fx, fy + r * 0.35f, w, color, bg);
+        osaStroke(c, fx, fy + r * 0.35f, fx - r * 0.45f, fy - r * 0.1f, w, color, bg);
+        osaStroke(c, fx, fy + r * 0.35f, fx + r * 0.45f, fy - r * 0.1f, w, color, bg);
+        osaStroke(c, fx - r, fy + r * 0.8f, fx + r, fy + r * 0.8f, w, color, bg);
+        return true;
+    }
+    if (name == "list") {
+        for (int i = -1; i <= 1; ++i) {
+            float y = fy + (float)i * r * 0.62f;
+            c->fillSmoothCircle(cx - (int)(r * 0.8f), (int)y, (int)(w * 0.9f), color, bg);
+            osaStroke(c, fx - r * 0.35f, y, fx + r, y, w, color, bg);
+        }
+        return true;
+    }
+    if (name == "info") {
+        c->drawSmoothArc(cx, cy, (int)r, (int)(r - w), 0, 360, color, bg, false);
+        c->fillSmoothCircle(cx, cy - (int)(r * 0.45f), (int)(w * 0.75f), color, bg);
+        osaStroke(c, fx, fy - r * 0.1f, fx, fy + r * 0.5f, w, color, bg);
+        return true;
+    }
+    if (name == "heart") {
+        float lobe = r * 0.5f;
+        c->fillSmoothCircle(cx - (int)(lobe * 0.95f), cy - (int)(r * 0.3f), (int)lobe, color, bg);
+        c->fillSmoothCircle(cx + (int)(lobe * 0.95f), cy - (int)(r * 0.3f), (int)lobe, color, bg);
+        c->fillTriangle(cx - (int)(r * 0.95f), cy - (int)(r * 0.1f),
+                        cx + (int)(r * 0.95f), cy - (int)(r * 0.1f),
+                        cx, cy + (int)(r * 0.9f), color);
+        return true;
+    }
+    if (name == "wifi") {
+        // Three arcs opening upward: TFT_eSPI angles run clockwise from
+        // 6 o'clock, so 135..225 is the top quarter.
+        for (int i = 1; i <= 3; ++i) {
+            int radius = (int)(r * 0.38f * (float)i);
+            c->drawSmoothArc(cx, cy + (int)(r * 0.55f), radius, (int)(radius - w),
+                             135, 225, color, bg, false);
+        }
+        c->fillSmoothCircle(cx, cy + (int)(r * 0.5f), (int)w, color, bg);
+        return true;
+    }
+    if (name == "bt" || name == "bluetooth") {
+        float t = r * 0.95f;
+        osaStroke(c, fx, fy - t, fx, fy + t, w, color, bg);
+        osaStroke(c, fx, fy - t, fx + r * 0.5f, fy - t * 0.5f, w, color, bg);
+        osaStroke(c, fx + r * 0.5f, fy - t * 0.5f, fx - r * 0.5f, fy + t * 0.5f, w, color, bg);
+        osaStroke(c, fx, fy + t, fx + r * 0.5f, fy + t * 0.5f, w, color, bg);
+        osaStroke(c, fx + r * 0.5f, fy + t * 0.5f, fx - r * 0.5f, fy - t * 0.5f, w, color, bg);
+        return true;
+    }
+    if (name == "sun" || name == "brightness") {
+        c->fillSmoothCircle(cx, cy, (int)(r * 0.42f), color, bg);
+        for (int i = 0; i < 8; ++i) {
+            float a = (float)i * (float)M_PI / 4.0f;
+            osaStroke(c, fx + cosf(a) * r * 0.65f, fy + sinf(a) * r * 0.65f,
+                      fx + cosf(a) * r, fy + sinf(a) * r, w, color, bg);
+        }
+        return true;
+    }
+    if (name == "moon" || name == "theme") {
+        c->drawSmoothArc(cx, cy, (int)r, (int)(r - w), 0, 360, color, bg, false);
+        c->drawArc(cx, cy, (int)(r - w), 0, 180, 360, color, bg, false);
+        return true;
+    }
+    if (name == "sync" || name == "refresh") {
+        c->drawSmoothArc(cx, cy, (int)r, (int)(r - w), 20, 300, color, bg, false);
+        // Arrow head at the 300-degree end (upper right).
+        float a = 300.0f * (float)M_PI / 180.0f;
+        float ex = fx - sinf(a) * (r - w * 0.5f), ey = fy + cosf(a) * (r - w * 0.5f);
+        c->fillTriangle((int)(ex - w * 1.8f), (int)(ey - w * 1.2f),
+                        (int)(ex + w * 1.8f), (int)(ey - w * 0.2f),
+                        (int)(ex - w * 0.6f), (int)(ey + w * 2.0f), color);
+        return true;
+    }
+    if (name == "power") {
+        c->drawSmoothArc(cx, cy, (int)r, (int)(r - w), 215, 145, color, bg, false);
+        osaStroke(c, fx, fy - r, fx, fy - r * 0.1f, w, color, bg);
+        return true;
+    }
+    if (name == "back" || name == "chevron") {
+        osaStroke(c, fx + r * 0.35f, fy - r * 0.8f, fx - r * 0.45f, fy, w, color, bg);
+        osaStroke(c, fx - r * 0.45f, fy, fx + r * 0.35f, fy + r * 0.8f, w, color, bg);
+        return true;
+    }
+    if (name == "plus") {
+        osaStroke(c, fx - r * 0.8f, fy, fx + r * 0.8f, fy, w, color, bg);
+        osaStroke(c, fx, fy - r * 0.8f, fx, fy + r * 0.8f, w, color, bg);
+        return true;
+    }
+    if (name == "check") {
+        osaStroke(c, fx - r * 0.75f, fy + r * 0.05f, fx - r * 0.2f, fy + r * 0.6f, w, color, bg);
+        osaStroke(c, fx - r * 0.2f, fy + r * 0.6f, fx + r * 0.8f, fy - r * 0.6f, w, color, bg);
+        return true;
+    }
+    if (name == "close" || name == "x") {
+        osaStroke(c, fx - r * 0.7f, fy - r * 0.7f, fx + r * 0.7f, fy + r * 0.7f, w, color, bg);
+        osaStroke(c, fx + r * 0.7f, fy - r * 0.7f, fx - r * 0.7f, fy + r * 0.7f, w, color, bg);
+        return true;
+    }
+    if (name == "more" || name == "dots") {
+        for (int i = -1; i <= 1; ++i)
+            c->fillSmoothCircle(cx + (int)((float)i * r * 0.62f), cy, (int)(w * 0.9f), color, bg);
+        return true;
+    }
+    if (name == "play") {
+        c->fillTriangle(cx - (int)(r * 0.6f), cy - (int)(r * 0.85f),
+                        cx - (int)(r * 0.6f), cy + (int)(r * 0.85f),
+                        cx + (int)(r * 0.9f), cy, color);
+        return true;
+    }
+    if (name == "music") {
+        osaStroke(c, fx - r * 0.2f, fy + r * 0.4f, fx - r * 0.2f, fy - r * 0.9f, w, color, bg);
+        osaStroke(c, fx - r * 0.2f, fy - r * 0.9f, fx + r * 0.8f, fy - r * 0.6f, w, color, bg);
+        c->fillSmoothCircle(cx - (int)(r * 0.45f), cy + (int)(r * 0.45f), (int)(r * 0.3f), color, bg);
+        return true;
+    }
+    if (name == "cube" || name == "3d") {
+        float hx = r * 0.85f, hy = r * 0.5f;
+        osaStroke(c, fx, fy - r, fx + hx, fy - hy, w, color, bg);
+        osaStroke(c, fx + hx, fy - hy, fx + hx, fy + hy, w, color, bg);
+        osaStroke(c, fx + hx, fy + hy, fx, fy + r, w, color, bg);
+        osaStroke(c, fx, fy + r, fx - hx, fy + hy, w, color, bg);
+        osaStroke(c, fx - hx, fy + hy, fx - hx, fy - hy, w, color, bg);
+        osaStroke(c, fx - hx, fy - hy, fx, fy - r, w, color, bg);
+        osaStroke(c, fx - hx, fy - hy, fx, fy, w, color, bg);
+        osaStroke(c, fx + hx, fy - hy, fx, fy, w, color, bg);
+        osaStroke(c, fx, fy, fx, fy + r, w, color, bg);
+        return true;
+    }
+    if (name == "note" || name == "file") {
+        int bw = (int)(s * 0.7f), bh = (int)(s * 0.9f);
+        c->fillSmoothRoundRect(cx - bw / 2, cy - bh / 2, bw, bh, 3, color, bg);
+        for (int i = 0; i < 3; ++i)
+            c->drawFastHLine(cx - bw / 2 + 4, cy - bh / 4 + i * (bh / 4), bw - 8, bg);
+        return true;
+    }
+    // Fallback: the first character in a ring.
+    c->drawSmoothArc(cx, cy, (int)r, (int)(r - w), 0, 360, color, bg, false);
+    if (name.length() > 0) {
+        c->setTextFont(2); c->setTextSize(1);
+        c->setTextDatum(MC_DATUM); c->setTextColor(color);
+        c->drawString(name.substring(0, 1), cx, cy);
+    }
+    return false;
+}
+
 static uint16_t osaMix565(uint16_t first, uint16_t second, float amount) {
     if (!isfinite(amount)) amount = 0.0f;
     if (amount < 0.0f) amount = 0.0f;
@@ -1340,9 +1565,13 @@ int OSARuntime::bcFindNextBranch(int n)  { return findNextBranch(n); }
 
 // ─── .osac binary format helpers (used by serializeOsac / loadOsac) ───────
 static const char    OSAC_MAGIC[4] = { 'O', 'S', 'A', 'C' };
-static const uint8_t OSAC_VERSION  = 1;
+// 2: source size, source mtime and firmware version code follow the version
+// byte, so a cached compilation can be matched to its source and dropped
+// after a firmware update.
+static const uint8_t OSAC_VERSION  = 2;
 static void w8(File& f, uint8_t v)  { f.write(v); }
 static void w16(File& f, uint16_t v){ f.write((uint8_t)(v & 0xFF)); f.write((uint8_t)(v >> 8)); }
+static void w32(File& f, uint32_t v){ w16(f, (uint16_t)(v & 0xFFFF)); w16(f, (uint16_t)(v >> 16)); }
 static void wD(File& f, double v) {
     uint8_t* p = (uint8_t*)&v;
     for (int i = 0; i < 8; i++) f.write(p[i]);
@@ -1384,8 +1613,25 @@ static bool r16(File& f, uint16_t& out) {
     out = (uint16_t)a | ((uint16_t)b << 8);
     return true;
 }
+static bool r32(File& f, uint32_t& out) {
+    uint16_t low, high;
+    if (!r16(f, low) || !r16(f, high)) return false;
+    out = (uint32_t)low | ((uint32_t)high << 16);
+    return true;
+}
 static bool rD(File& f, double& out) {
     return readExact(f, &out, sizeof(out));
+}
+
+// Size and modification time of a script on the SD card; both zero when the
+// file cannot be opened.
+static void sourceStampOf(const String& path, uint32_t& size, uint32_t& mtime) {
+    size = mtime = 0;
+    File f = SD.open(path);
+    if (!f) return;
+    size = (uint32_t)f.size();
+    mtime = (uint32_t)f.getLastWrite();
+    f.close();
 }
 static bool rS(File& f, String& out, uint16_t maxLen) {
     uint16_t n;
@@ -1427,13 +1673,18 @@ static uint16_t parseAppColor(const String* lines, int lineCount, uint16_t fallb
 bool OSARuntime::serializeOsac(const String& dstPath) {
     if (!bc.valid) return false;
     if (!isSdReady) return false;
-    SD.remove(dstPath.c_str());
+    if (SD.exists(dstPath.c_str())) SD.remove(dstPath.c_str());
     File f = SD.open(dstPath, FILE_WRITE);
     if (!f) return false;
 
     // Header
     for (int i = 0; i < 4; i++) f.write(OSAC_MAGIC[i]);
     w8(f, OSAC_VERSION);
+    uint32_t sourceSize, sourceMtime;
+    sourceStampOf(loadedScriptPath, sourceSize, sourceMtime);
+    w32(f, sourceSize);
+    w32(f, sourceMtime);
+    w16(f, (uint16_t)OpenOSBuild::VERSION_CODE);
     wS(f, appName);
     // loadScript() releases the source lines once the bytecode is ready, so
     // the header directives are re-read from the file the runtime loaded.
@@ -1482,10 +1733,21 @@ bool OSARuntime::serializeOsac(const String& dstPath) {
     return true;
 }
 
-bool OSARuntime::loadOsac(const String& srcPath) {
-    if (!isSdReady) { setError(0, "No SD card"); return false; }
+String OSARuntime::bytecodeCachePath(const String& scriptPath) {
+    uint32_t hash = 2166136261U;
+    for (unsigned i = 0; i < scriptPath.length(); ++i) {
+        hash ^= (uint8_t)scriptPath[i];
+        hash *= 16777619U;
+    }
+    char name[40];
+    snprintf(name, sizeof(name), "/system/cache/%08x.osac", (unsigned)hash);
+    return String(name);
+}
+
+bool OSARuntime::loadOsac(const String& srcPath, const SourceStamp* expectSource) {
+    if (!isSdReady) { if (!expectSource) setError(0, "No SD card"); return false; }
     File f = SD.open(srcPath);
-    if (!f) { setError(0, "Not found: " + srcPath); return false; }
+    if (!f) { if (!expectSource) setError(0, "Not found: " + srcPath); return false; }
     if ((size_t)f.size() > 96 * 1024) {
         f.close(); setError(0, ".osac exceeds 96 KB"); return false;
     }
@@ -1499,6 +1761,19 @@ bool OSARuntime::loadOsac(const String& srcPath) {
     uint8_t ver;
     if (!r8(f, ver) || ver != OSAC_VERSION) {
         f.close(); setError(0, "Bad .osac version"); return false;
+    }
+    uint32_t sourceSize, sourceMtime;
+    uint16_t builtBy;
+    if (!r32(f, sourceSize) || !r32(f, sourceMtime) || !r16(f, builtBy)) {
+        f.close(); setError(0, "Truncated .osac header"); return false;
+    }
+    if (expectSource && (sourceSize != expectSource->size ||
+                         sourceMtime != expectSource->mtime ||
+                         builtBy != (uint16_t)OpenOSBuild::VERSION_CODE)) {
+        // Stale cache entry: the script changed or the firmware did. Not an
+        // error, the caller compiles from source and overwrites it.
+        f.close();
+        return false;
     }
 
     bc.clear();
@@ -2994,6 +3269,35 @@ bool OSARuntime::loadScript(String path) {
         return false;
     }
 
+    // Bytecode cache: a script compiled before on this firmware loads from
+    // its cached bytecode and skips reading, splitting and compiling the
+    // source. Privilege still derives from the path (see
+    // readIsExceptionFromFile), never from anything inside the cache file.
+    {
+        SourceStamp stamp;
+        stamp.size = (uint32_t)sourceBytes;
+        stamp.mtime = (uint32_t)f.getLastWrite();
+        String cachePath = bytecodeCachePath(path);
+        if (SD.exists(cachePath.c_str()) && loadOsac(cachePath, &stamp)) {
+            f.close();
+            appName       = readAppNameFromFile(path);
+            requiredPerms = readRequiredPermsFromFile(path);
+            isException   = readIsExceptionFromFile(path);
+            Serial.printf("[RT] bytecode from cache %s (%d B code) free=%u\n",
+                          cachePath.c_str(), bc.codeLen, (unsigned)ESP.getFreeHeap());
+            if (isSdReady) {
+                SD.mkdir("/apps");
+                SD.mkdir(sandboxDir().c_str());
+            }
+            return true;
+        }
+        // A stale or broken entry is replaced after this compile.
+        bc.clear();
+        appName = "";
+        requiredPerms = 0;
+        isException = false;
+    }
+
     // One buffer for the whole file: a single allocation that is released
     // after compiling, instead of one String per line. It is taken from the
     // boot-time reserve *without* freeing that block, so the compiler's
@@ -3135,6 +3439,15 @@ bool OSARuntime::loadScript(String path) {
     // A successfully compiled app no longer needs its source text at runtime;
     // the tree-walker fallback needs it as mutable Strings instead.
     if (compiled) {
+        // Cache the bytecode while the source lines are still here (the
+        // header directives are read from them).
+        if (isSdReady) {
+            SD.mkdir("/system");
+            SD.mkdir("/system/cache");
+            String cachePath = bytecodeCachePath(path);
+            if (serializeOsac(cachePath))
+                Serial.printf("[RT] bytecode cached as %s\n", cachePath.c_str());
+        }
         releaseLines();
         Serial.printf("[RT] released source free=%u\n", (unsigned)ESP.getFreeHeap());
     } else if (!materializeLines()) {
@@ -4664,9 +4977,11 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
             activeSprite = nullptr;
         }
         auto tryDepth = [&](int depth) -> bool {
-            // Sprites are the other big consumer of the boot-time reserve.
+            // Sprites are the other big consumer of the boot-time reserve;
+            // the reserve gives up only as much of its tail as the sprite
+            // needs, so a 3D scene list or the next script load still fit.
             if (!osaCanAllocateSprite(w, h, depth) && HeapReserve::held())
-                HeapReserve::release("sprite");
+                HeapReserve::makeRoom(osaSpriteBytes(w, h, depth) + 1024U, "sprite");
             if (!osaCanAllocateSprite(w, h, depth)) return false;
             activeSprite = new (std::nothrow) TFT_eSprite(tft);
             if (!activeSprite) return false;
@@ -4850,6 +5165,97 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         if (IS("d3.axes")) {
             d3.drawAxes(tft, activeSprite, (float)N(0, 2));
             return OSAVal();
+        }
+
+        // ── Scene: collect, sort, draw ──────────────────────────────────
+        if (IS("d3.begin")) return OSAVal(d3.beginScene() ? 1.0 : 0.0);
+        if (IS("d3.end")) return OSAVal((double)d3.endScene(tft, activeSprite));
+        if (IS("d3.present")) return OSAVal((double)d3.presentScene(tft, activeSprite));
+        if (IS("d3.view")) {
+            d3.setView((float)N(0), (float)N(1), (float)N(2));
+            return OSAVal();
+        }
+        if (IS("d3.light")) {
+            d3.setLight((float)N(0, -0.365), (float)N(1, -0.548), (float)N(2, -0.752),
+                        (float)N(3, 0.36));
+            return OSAVal();
+        }
+        if (IS("d3.background")) { d3.setBackground((uint16_t)iN(0)); return OSAVal(); }
+        if (IS("d3.viewport")) {
+            d3.setViewport(iN(0), iN(1), iN(2, 240), iN(3, 320));
+            return OSAVal();
+        }
+        if (IS("d3.at")) {
+            d3.setTransform((float)N(0), (float)N(1), (float)N(2),
+                            (float)N(3), (float)N(4), (float)N(5), (float)N(6, 1));
+            return OSAVal();
+        }
+        if (IS("d3.tris")) return OSAVal((double)d3.sceneCount());
+        if (IS("d3.dropped")) return OSAVal((double)d3.droppedCount());
+        if (IS("d3.capacity")) return OSAVal((double)d3.sceneCapacity());
+
+        // ── Shapes under d3.at() ────────────────────────────────────────
+        // mode: 0 wire, 1 solid, 2 solid + edges, +4 two-sided. The
+        // adaptive fallback turns everything into wireframe, as for cubes.
+        auto shapeMode = [&](int argIndex, int defaultMode) -> int {
+            int requested = iN(argIndex, defaultMode);
+            int style = requested & 3;
+            if (style == 3) style = 2;
+            if (d3AdaptiveQuality && d3ReducedQuality) style = 0;
+            return style | (requested & OSA3DRenderer::MODE_TWO_SIDED);
+        };
+        auto shapeEdge = [&](int argIndex, int mode) -> uint16_t {
+            if (argc > argIndex) return (uint16_t)iN(argIndex);
+            return (mode & 3) == 0 ? drawColor : OSA3DRenderer::shade565(drawColor, 0.28f);
+        };
+        if (IS("d3.box")) {
+            int mode = shapeMode(3, 2);
+            return OSAVal((double)d3.drawBox(tft, activeSprite, (float)N(0, 1),
+                                             (float)N(1, 1), (float)N(2, 1), mode,
+                                             drawColor, shapeEdge(4, mode)));
+        }
+        if (IS("d3.sphere")) {
+            int mode = shapeMode(2, 1);
+            return OSAVal((double)d3.drawSphere(tft, activeSprite, (float)N(0, 1),
+                                                iN(1, 12), mode, drawColor,
+                                                shapeEdge(3, mode)));
+        }
+        if (IS("d3.cylinder")) {
+            int mode = shapeMode(4, 2);
+            float bottom = (float)N(0, 1);
+            return OSAVal((double)d3.drawCylinder(tft, activeSprite, bottom,
+                                                  (float)N(1, bottom), (float)N(2, 1),
+                                                  iN(3, 12), mode, drawColor,
+                                                  shapeEdge(5, mode)));
+        }
+        if (IS("d3.cone")) {
+            int mode = shapeMode(3, 2);
+            return OSAVal((double)d3.drawCylinder(tft, activeSprite, (float)N(0, 1),
+                                                  0.0f, (float)N(1, 1), iN(2, 12), mode,
+                                                  drawColor, shapeEdge(4, mode)));
+        }
+        if (IS("d3.torus")) {
+            int mode = shapeMode(4, 1);
+            return OSAVal((double)d3.drawTorus(tft, activeSprite, (float)N(0, 1),
+                                               (float)N(1, 0.3), iN(2, 12), iN(3, 8),
+                                               mode, drawColor, shapeEdge(5, mode)));
+        }
+        if (IS("d3.plane")) {
+            int mode = shapeMode(2, 2);
+            return OSAVal((double)d3.drawPlane(tft, activeSprite, (float)N(0, 1),
+                                               (float)N(1, 1), mode, drawColor,
+                                               shapeEdge(3, mode)));
+        }
+        if (IS("d3.meshBegin")) return OSAVal(d3.meshBegin() ? 1.0 : 0.0);
+        if (IS("d3.vertex"))
+            return OSAVal((double)d3.meshVertex((float)N(0), (float)N(1), (float)N(2)));
+        if (IS("d3.face"))
+            return OSAVal(d3.meshFace(iN(0), iN(1), iN(2), argc >= 4 ? iN(3) : -1) ? 1.0 : 0.0);
+        if (IS("d3.meshEnd")) return OSAVal((double)d3.meshFaceCount());
+        if (IS("d3.mesh")) {
+            int mode = shapeMode(0, 2);
+            return OSAVal((double)d3.drawMesh(tft, activeSprite, mode, drawColor,
+                                              shapeEdge(1, mode)));
         }
         if (IS("d3.renderMs"))
             return OSAVal((double)d3.lastRenderMicros() / 1000.0);
@@ -5089,7 +5495,9 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
                          feature == "store.updateall" ||
                          feature == "ota" ||
                          feature == "shapes" || feature == "path" ||
-                         feature == "widgets" || feature == "smooth";
+                         feature == "widgets" || feature == "smooth" ||
+                         feature == "d3.scene" || feature == "icons" ||
+                         feature == "tabbar";
         return OSAVal(available ? 1.0 : 0.0);
     }
     if (IS("openos.version"))
@@ -6145,6 +6553,98 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         if (!Theme::dark() && r > 0)
             canvas->drawSmoothRoundRect(x, y, r, r, w, h, Theme::divider2(), Theme::surface());
         return OSAVal();
+    }
+
+    // ui.icon(name, cx, cy, size, [bg565]) — one of the built-in vector
+    // icons in the draw colour. bg565 is what the strokes blend into; it
+    // defaults to the theme surface.
+    if (IS("ui.icon")) {
+        uint16_t behind = argc >= 5 ? (uint16_t)iN(4) : Theme::surface();
+        return OSAVal(osaDrawIcon(canvas, S(0), iN(1), iN(2), max(8, iN(3, 24)),
+                                  drawColor, behind) ? 1.0 : 0.0);
+    }
+
+    // ui.iconButton(cx, cy, d, icon, [style], [pressed]) — a round button
+    // with an icon; styles as ui.button. Returns nothing.
+    if (IS("ui.iconButton")) {
+        int cx = iN(0), cy = iN(1), d = max(16, iN(2, 44));
+        int style = iN(4, 1);
+        bool pressed = iN(5, 0) != 0;
+        uint16_t fill = osaBlue(), ink = TFT_WHITE;
+        switch (style) {
+            case 1: fill = osaSoftFill(); ink = Theme::text(); break;
+            case 2: fill = osaSoftFill(); ink = osaRed(); break;
+            case 3: fill = Theme::surface(); ink = osaBlue(); break;
+            case 4: fill = osaRed(); ink = TFT_WHITE; break;
+            default: break;
+        }
+        if (pressed) fill = osaMix565(fill, TFT_BLACK, 0.18f);
+        canvas->fillSmoothCircle(cx, cy, d / 2, fill);
+        if (style == 3) canvas->drawSmoothCircle(cx, cy, d / 2, Theme::divider2(), fill);
+        osaDrawIcon(canvas, S(3), cx, cy, d * 22 / 44, ink, fill);
+        return OSAVal();
+    }
+
+    // ui.tabbar("icon:Label|icon:Label|...", selected) — a floating pill
+    // along the bottom edge, the selected tab lifted on a tinted disc.
+    // Returns the width of one tab; ui.tabbarTap(count) maps a tap back to
+    // an index. Content should scroll underneath: leave 70 px at the bottom.
+    if (IS("ui.tabbar")) {
+        String items = S(0);
+        int selected = iN(1, 0);
+        const int barX = 12, barY = 320 - 12 - 58, barW = 216, barH = 58;
+        String labels[6], icons[6];
+        int count = 0;
+        int start = 0;
+        for (int i = 0; i <= (int)items.length() && count < 6; ++i) {
+            if (i == (int)items.length() || items[i] == '|') {
+                String entry = items.substring(start, i);
+                int colon = entry.indexOf(':');
+                icons[count] = colon >= 0 ? entry.substring(0, colon) : String();
+                labels[count] = colon >= 0 ? entry.substring(colon + 1) : entry;
+                ++count;
+                start = i + 1;
+            }
+        }
+        if (count == 0) return OSAVal(0.0);
+        const bool dark = Theme::dark();
+        const uint16_t bar = dark ? Theme::c(44, 44, 50) : Theme::c(246, 246, 250);
+        const uint16_t edge = dark ? Theme::c(62, 62, 70) : Theme::c(214, 214, 222);
+        const uint16_t ink = dark ? Theme::c(200, 200, 208) : Theme::c(90, 90, 100);
+        const uint16_t tint = dark ? Theme::c(32, 60, 96) : Theme::c(210, 228, 255);
+        // A soft shadow under the bar, then the bar itself.
+        canvas->fillSmoothRoundRect(barX + 1, barY + 3, barW, barH, barH / 2,
+                                    dark ? Theme::c(10, 10, 12) : Theme::c(200, 200, 208));
+        canvas->fillSmoothRoundRect(barX, barY, barW, barH, barH / 2, bar);
+        canvas->drawSmoothRoundRect(barX, barY, barH / 2, barH / 2, barW, barH, edge, bar);
+        int tabW = barW / count;
+        canvas->setTextFont(1); canvas->setTextSize(1);
+        canvas->setTextDatum(MC_DATUM);
+        for (int i = 0; i < count; ++i) {
+            int cx = barX + tabW * i + tabW / 2;
+            bool on = i == selected;
+            uint16_t behind = bar;
+            if (on) {
+                int discW = min(tabW - 8, 64), discH = barH - 10;
+                canvas->fillSmoothRoundRect(cx - discW / 2, barY + 5, discW, discH, discH / 2, tint, bar);
+                behind = tint;
+            }
+            uint16_t color = on ? osaBlue() : ink;
+            osaDrawIcon(canvas, icons[i], cx, barY + 22, 20, color, behind);
+            canvas->setTextColor(color);
+            canvas->drawString(popupFitLine(canvas, labels[i], tabW - 10), cx, barY + 44);
+        }
+        return OSAVal((double)tabW);
+    }
+    if (IS("ui.tabbarTap")) {
+        int count = max(1, iN(0, 1));
+        pollGesture();
+        if (!tapOneShot) return OSAVal(-1.0);
+        const int barX = 12, barY = 320 - 12 - 58, barW = 216, barH = 58;
+        if (gestureEndX < barX || gestureEndX >= barX + barW ||
+            gestureEndY < barY || gestureEndY >= barY + barH) return OSAVal(-1.0);
+        tapOneShot = false;
+        return OSAVal((double)min(count - 1, (gestureEndX - barX) / (barW / count)));
     }
 
     // ui.chip(x, y, label, [selected]) — a pill tag; returns its width so a

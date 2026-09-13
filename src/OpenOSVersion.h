@@ -2,14 +2,14 @@
 
 namespace OpenOSBuild {
 
-static constexpr const char* VERSION_NAME = "1.4.1";
-static constexpr int VERSION_CODE = 22;
-static constexpr int OSA_SDK_VERSION = 4;
+static constexpr const char* VERSION_NAME = "1.5.0";
+static constexpr int VERSION_CODE = 23;
+static constexpr int OSA_SDK_VERSION = 5;
 static constexpr int OTA_UPDATER_VERSION_CODE = 1;
 static constexpr const char* OTA_TARGET = "denky32-wroom32";
 static constexpr const char* OTA_PARTITION_SCHEME = "openos-dual-v1";
 static constexpr const char* OTA_IMAGE_MARKER =
     "OPENOS-OTA-IMAGE-V1|target=denky32-wroom32|partition=openos-dual-v1|"
-    "version=1.4.1|versionCode=22|";
+    "version=1.5.0|versionCode=23|";
 
 } // namespace OpenOSBuild

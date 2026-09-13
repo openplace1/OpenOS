@@ -357,8 +357,15 @@ private:
     bool vmPush(OSAVal v);
     OSAVal vmPop();
     // Binary .osac format — write the compiled state out / read it back.
+    // The header records the source file's size and modification time plus
+    // the firmware version code; loadOsac() with `expectSource` set treats a
+    // mismatch on any of them as "not this file" and returns false quietly.
+    struct SourceStamp { uint32_t size; uint32_t mtime; };
     bool serializeOsac(const String& dstPath);
-    bool loadOsac(const String& srcPath);
+    bool loadOsac(const String& srcPath, const SourceStamp* expectSource = nullptr);
+    // Bytecode cache: /system/cache/<fnv1a(path)>.osac, one file per script
+    // path, validated against the source stamp and the firmware version.
+    static String bytecodeCachePath(const String& scriptPath);
 
     // ── Execution (tree-walker fallback) ─────────────────────────────────────
     void execRange(int from, int to);
