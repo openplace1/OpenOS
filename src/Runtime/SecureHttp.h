@@ -23,11 +23,25 @@
 // feed must still carry a release signature.
 namespace SecureHttp {
 
-// Heap floor for one TLS session: 2 x 16 KB record buffers, handshake state,
-// the parsed peer chain (GitHub sends three certificates) and lwIP receive
-// buffers. Below this the handshake fails inside mbedTLS with an allocation
-// error long before any byte reaches the application.
+// Heap floor for one TLS session when mbedTLS has to take everything from
+// the general heap: 2 x 16 KB record buffers, handshake state, the parsed
+// peer chain (GitHub sends three certificates) and lwIP receive buffers.
+// Below this the handshake fails inside mbedTLS with an allocation error
+// long before any byte reaches the application.
 static constexpr size_t TLS_MIN_FREE_BYTES  = 46U * 1024U;
+// With the HeapReserve arena holding the whole mbedTLS session, the general
+// heap only supplies lwIP's receive window, HTTPClient's own buffers, the
+// SD spool and whatever overflowed a full arena. Measured on hardware:
+// a session that failed inside RSA with 61 KB free (of which 39 KB was one
+// block) succeeds with the arena and ~22 KB of general heap, and the first
+// catalog fetch inside OpenStore starts with 19 KB free of which the largest
+// block is under 4 KB. The gate is deliberately loose: it exists to give a
+// clear message, and a handshake that runs out of memory anyway is reported
+// as such by describeConnectFailure().
+static constexpr size_t TLS_MIN_FREE_WITH_ARENA  = 12U * 1024U;
+// The pinned issuer certificate and the verification temporaries live in
+// the arena as well; the general heap only sees them when the arena is full.
+static constexpr size_t TLS_PINNED_EXTRA_WITH_ARENA = 2U * 1024U;
 // mbedTLS allocates MBEDTLS_SSL_IN_BUFFER_LEN (16384 + record overhead) twice.
 static constexpr size_t TLS_MIN_BLOCK_BYTES = 17U * 1024U;
 // Verification runs while both record buffers are held, so for a pinned host

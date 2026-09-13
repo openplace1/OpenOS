@@ -31,6 +31,7 @@ static constexpr int    CATALOG_MAX_ENTRIES   = 64;
 
 static const char* DOWNLOAD_PATH = "/system/.openstore-download.opk";
 static const char* MANIFEST_TMP  = "/system/.openstore-manifest.tmp";
+static const char* CATALOG_TMP   = "/system/.openstore-catalog.tmp";
 static const char* CATALOG_CONFIG_KEY = "store_catalog_url";
 static const char* SYSTEM_PREFIX_CONFIG_KEY = "store_system_prefix";
 
@@ -691,34 +692,6 @@ static bool readSmallFile(const String& path, size_t maximum, String& output) {
     return true;
 }
 
-class LimitedStringStream : public Stream {
-public:
-    explicit LimitedStringStream(size_t limit) : maximum(limit) {}
-    bool begin(size_t hint) { return hint == 0 || data.reserve(min(hint, maximum)); }
-    size_t write(uint8_t c) override { return write(&c, 1); }
-    size_t write(const uint8_t* src, size_t count) override {
-        if (overflow || count > maximum - data.length()) {
-            overflow = true; setWriteError(); return 0;
-        }
-        if (count && !data.concat((const char*)src, (unsigned int)count)) {
-            oom = true; setWriteError(); return 0;
-        }
-        return count;
-    }
-    int available() override { return 0; }
-    int read() override { return -1; }
-    int peek() override { return -1; }
-    void flush() override {}
-    String take() { return static_cast<String&&>(data); }
-    bool tooLarge() const { return overflow; }
-    bool outOfMemory() const { return oom; }
-private:
-    String data;
-    size_t maximum;
-    bool overflow = false;
-    bool oom = false;
-};
-
 class LimitedFileStream : public Stream {
 public:
     LimitedFileStream(File& destination, size_t limit) : file(destination), maximum(limit) {}
@@ -744,6 +717,50 @@ private:
     size_t written = 0;
     bool overflow = false;
 };
+
+// Copies the response body into `sink`. HTTPClient::writeToStream() waits
+// for ever while the socket stays open, which is exactly what a transfer
+// starved of Wi-Fi receive buffers looks like from the outside — the device
+// sat at "Loading catalog" with nothing on the serial port. This reads with
+// an inactivity limit and says how far it got. Chunked responses (no
+// Content-Length) still go through HTTPClient, which decodes them.
+static int copyBody(HTTPClient& http, Stream& sink, uint32_t inactivityMs,
+                    const char* tag) {
+    int declared = http.getSize();
+    if (declared < 0) return http.writeToStream(&sink);
+    WiFiClient* stream = http.getStreamPtr();
+    size_t received = 0;
+    uint32_t lastDataAt = millis();
+    uint8_t buffer[512];
+    while (received < (size_t)declared) {
+        int availableBytes = stream ? stream->available() : 0;
+        if (availableBytes <= 0) {
+            if (!http.connected()) {
+                Serial.printf("[%s] connection closed after %u of %d B\n", tag,
+                              (unsigned)received, declared);
+                return -1;
+            }
+            if ((uint32_t)(millis() - lastDataAt) > inactivityMs) {
+                Serial.printf("[%s] transfer stalled after %u of %d B free=%u maxBlock=%u\n",
+                              tag, (unsigned)received, declared,
+                              (unsigned)ESP.getFreeHeap(),
+                              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+                return -1;
+            }
+            delay(2);
+            yield();
+            continue;
+        }
+        size_t wanted = min((size_t)availableBytes,
+                            min(sizeof(buffer), (size_t)declared - received));
+        int count = stream->readBytes(buffer, wanted);
+        if (count <= 0) continue;
+        lastDataAt = millis();
+        if (sink.write(buffer, (size_t)count) != (size_t)count) return -1;
+        received += (size_t)count;
+    }
+    return (int)received;
+}
 
 static bool validStoreUrl(const String& url) {
     return url.startsWith("https://") && url.length() <= 2048 &&
@@ -782,7 +799,7 @@ static bool downloadPackageFile(const String& url) {
         return fail("OPK download exceeds 8 MB");
     }
     LimitedFileStream sink(destination, OPK_MAX_PACKAGE_BYTES);
-    int received = http.writeToStream(&sink);
+    int received = copyBody(http, sink, 30000U, "STORE");
     sink.flush();
     http.end();
     destination.close();
@@ -1148,52 +1165,92 @@ static void recoverRoot(const String& root) {
 }
 
 static bool downloadCatalogDocument(String& document) {
-    // As in FirmwareUpdate: take the response buffer before the reserved
-    // block is handed to mbedTLS, so the catalog text does not sit inside
-    // that region and split it once the session closes.
-    LimitedStringStream output(CATALOG_MAX_BYTES);
-    if (!output.begin(8192)) return fail("Not enough RAM for store catalog");
+    // The body is spooled to the SD card and read back only once the TLS
+    // session is closed. Holding an 8 KB response buffer in RAM alongside
+    // the handshake used to leave OpenStore's general heap in 2 KB pieces,
+    // and the buffer had to be taken before the session (so it would not
+    // settle inside the reserve) — which meant taking it at the worst moment.
+    removeFileIfPresent(CATALOG_TMP);
+    size_t received = 0;
+    {
+        // Keep TLS/HTTP objects inside this scope so their memory is gone
+        // before the document is read back and before validation allocates.
+        SecureHttp::prepareMemory("STORE", "catalog HTTPS");
+        SecureHttp::RadioAwake awake;
+        String why;
+        if (!SecureHttp::memoryAvailable(why)) return fail(why);
+        String source = catalogSourceUrl();
+        if (!validStoreUrl(source)) return fail("OpenStore requires a valid HTTPS URL");
+        // GitHub's raw CDN can briefly serve an older branch snapshot directly
+        // after publishing. A harmless query key also prevents that stale cache.
+        if (source.startsWith("https://raw.githubusercontent.com/")) {
+            source += source.indexOf('?') >= 0 ? '&' : '?';
+            source += "openos=";
+            source += millis();
+        }
 
-    // Keep TLS/HTTP objects inside this helper so their buffers are gone before
-    // JSON validation allocates temporary IDs and before an OPK download starts.
-    SecureHttp::prepareMemory("STORE", "catalog HTTPS");
-    SecureHttp::RadioAwake awake;
-    String why;
-    if (!SecureHttp::memoryAvailable(why)) return fail(why);
-    String source = catalogSourceUrl();
-    if (!validStoreUrl(source)) return fail("OpenStore requires a valid HTTPS URL");
-    // GitHub's raw CDN can briefly serve an older branch snapshot directly
-    // after publishing. A harmless query key also prevents that stale cache.
-    if (source.startsWith("https://raw.githubusercontent.com/")) {
-        source += source.indexOf('?') >= 0 ? '&' : '?';
-        source += "openos=";
-        source += millis();
+        HTTPClient http;
+        WiFiClientSecure client;
+        SecureHttp::Request request;
+        request.attempts = 3;
+        int status = SecureHttp::get(http, client, source, request, why);
+        if (status != HTTP_CODE_OK) {
+            String message = status < 0
+                ? String("Catalog download failed: ") + why
+                : String("Catalog HTTP error ") + status;
+            http.end();
+            return fail(message);
+        }
+        int declared = http.getSize();
+        if (declared > (int)CATALOG_MAX_BYTES) {
+            http.end();
+            return fail("Store catalog exceeds 24 KB");
+        }
+        File spool = SD.open(CATALOG_TMP, FILE_WRITE);
+        if (!spool) {
+            http.end();
+            return fail("Could not write the store catalog to the SD card");
+        }
+        LimitedFileStream output(spool, CATALOG_MAX_BYTES);
+        int written = copyBody(http, output, 20000U, "STORE");
+        bool writeError = output.getWriteError() != 0;
+        spool.close();
+        http.end();
+        if (output.tooLarge()) {
+            removeFileIfPresent(CATALOG_TMP);
+            return fail("Store catalog exceeds 24 KB");
+        }
+        if (written < 0 || writeError) {
+            removeFileIfPresent(CATALOG_TMP);
+            return fail("Could not read store catalog");
+        }
+        received = output.size();
+    }
+    if (received == 0) {
+        removeFileIfPresent(CATALOG_TMP);
+        return fail("Store catalog is empty");
     }
 
-    HTTPClient http;
-    WiFiClientSecure client;
-    SecureHttp::Request request;
-    request.attempts = 3;
-    int status = SecureHttp::get(http, client, source, request, why);
-    if (status != HTTP_CODE_OK) {
-        String message = status < 0
-            ? String("Catalog download failed: ") + why
-            : String("Catalog HTTP error ") + status;
-        http.end();
-        return fail(message);
+    File spool = SD.open(CATALOG_TMP, FILE_READ);
+    if (!spool) return fail("Could not read the store catalog from the SD card");
+    bool ok = document.reserve((unsigned int)received);
+    uint8_t chunk[512];
+    while (ok && document.length() < received) {
+        int count = spool.read(chunk, sizeof(chunk));
+        if (count <= 0) break;
+        ok = document.concat((const char*)chunk, (unsigned int)count);
     }
-    int declared = http.getSize();
-    if (declared > (int)CATALOG_MAX_BYTES) {
-        http.end();
-        return fail("Store catalog exceeds 24 KB");
+    spool.close();
+    removeFileIfPresent(CATALOG_TMP);
+    if (!ok) {
+        document = String();
+        return fail("Not enough RAM for store catalog");
     }
-    int received = http.writeToStream(&output);
-    http.end();
-    if (output.tooLarge()) return fail("Store catalog exceeds 24 KB");
-    if (output.outOfMemory()) return fail("Not enough RAM for store catalog");
-    if (received < 0) return fail("Could not read store catalog");
-    document = output.take();
-    return document.length() > 0 || fail("Store catalog is empty");
+    if (document.length() != received) {
+        document = String();
+        return fail("Could not read store catalog");
+    }
+    return true;
 }
 
 } // namespace

@@ -16,11 +16,16 @@
 // osaApp on boot — no native class. See LOCKSCREEN_SCRIPT below.
 
 // Override the weak symbol defined in arduino-esp32's main.cpp.
-// The default loop task gets 8 KB which is not enough for the OSA runtime's
-// recursive expression evaluator + nested user-function calls. 32 KB has lots
-// of headroom and the ESP32 has 320 KB of RAM total — it's cheap.
+// The default loop task gets 8 KB, which is not enough for the OSA runtime's
+// recursive expression evaluator plus nested user-function calls. It ran with
+// 32 KB for a long time, but that stack comes out of the same heap as
+// everything else, and on this no-PSRAM board 12 KB of it is the difference
+// between a TLS transfer inside OpenStore stalling and completing. Measured
+// high-water mark across boot, the lock screen, Home, OpenStore (with a TLS
+// handshake, which runs on this stack) and Settings: under 7.5 KB used. 20 KB
+// leaves more than double that. OPENOS:PING reports the current mark.
 size_t getArduinoLoopTaskStackSize() {
-    return 32768;
+    return 20480;
 }
 
 // Keep a freshly installed OTA image in PENDING_VERIFY until OpenOS completes
@@ -76,6 +81,32 @@ OSAApp osaApp(&tft, &ts);
 // on demand frees that memory back to other consumers (sprites!) when CC
 // isn't open.
 static OSAApp* osaOverlayApp = nullptr;
+// Where the overlay runtime lives: inside the heap reserve when it fits
+// there (an application-time heap never offers 20-30 KB in one piece), else
+// wherever new found room.
+static bool osaOverlayInReserve = false;
+
+static OSAApp* createOverlayApp() {
+    void* room = HeapReserve::allocate(sizeof(OSAApp), "Control Center runtime");
+    if (room) {
+        osaOverlayInReserve = true;
+        return new (room) OSAApp(&tft, &ts);
+    }
+    osaOverlayInReserve = false;
+    return new (std::nothrow) OSAApp(&tft, &ts);
+}
+
+static void destroyOverlayApp() {
+    if (!osaOverlayApp) return;
+    if (osaOverlayInReserve) {
+        osaOverlayApp->~OSAApp();
+        HeapReserve::deallocate(osaOverlayApp);
+    } else {
+        delete osaOverlayApp;
+    }
+    osaOverlayApp = nullptr;
+    osaOverlayInReserve = false;
+}
 static OSAApp* g_underlyingApp = nullptr;  // activeApp captured before CC opened
 
 
@@ -560,10 +591,11 @@ void osaPollSerialCommands() {
         if (c == '\n' || c == '\r') {
             line[length] = 0;
             if (strcmp(line, "OPENOS:PING") == 0) {
-                Serial.printf("OPENOS:PONG %s/%d free=%u maxBlock=%u\n",
+                Serial.printf("OPENOS:PONG %s/%d free=%u maxBlock=%u stackFree=%u\n",
                               OpenOSBuild::VERSION_NAME, OpenOSBuild::VERSION_CODE,
                               (unsigned)ESP.getFreeHeap(),
-                              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+                              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+                              (unsigned)uxTaskGetStackHighWaterMark(nullptr));
             } else if (strncmp(line, "OPENOS:TLSDIAG", 14) == 0) {
                 String host = String(line + 14);
                 host.trim();
@@ -778,7 +810,7 @@ static void openControlCenter(AppState returnState) {
     const size_t overlayNeed = sizeof(OSAApp) + 16U * 1024U;
     if (ESP.getFreeHeap() < overlayNeed)
         suspendBluetoothForMemory("Control Center");
-    if (!osaOverlayApp) osaOverlayApp = new (std::nothrow) OSAApp(&tft, &ts);
+    if (!osaOverlayApp) osaOverlayApp = createOverlayApp();
     String controlCenterPath = PackageManager::resolveSystemEntry(
         "openos.controlcenter", "/system/apps/controlcenter.osa");
     if (osaOverlayApp && osaOverlayApp->loadScript(controlCenterPath)) {
@@ -789,12 +821,11 @@ static void openControlCenter(AppState returnState) {
         if (osaOverlayApp) {
             Serial.printf("[CC] load failed: %s\n", osaOverlayApp->lastError().c_str());
         } else {
-            Serial.printf("[CC] runtime allocation failed free=%u maxBlock=%u\n",
-                          (unsigned)ESP.getFreeHeap(),
+            Serial.printf("[CC] runtime allocation failed need=%u free=%u maxBlock=%u\n",
+                          (unsigned)sizeof(OSAApp), (unsigned)ESP.getFreeHeap(),
                           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
         }
-        delete osaOverlayApp;
-        osaOverlayApp = nullptr;
+        destroyOverlayApp();
         resumeBluetoothAfterMemoryUse();
     }
 }
@@ -804,11 +835,9 @@ static void closeControlCenter() {
     g_underlyingApp = nullptr;
     currentState = previousState;
     // Free the overlay runtime so its 20-30 KB of inline arrays + loaded
-    // script content goes back to the heap (sprites need every byte).
-    if (osaOverlayApp) {
-        delete osaOverlayApp;
-        osaOverlayApp = nullptr;
-    }
+    // script content goes back to the reserve (a TLS session or a sprite
+    // needs every byte of it).
+    destroyOverlayApp();
     resumeBluetoothAfterMemoryUse();
     if (activeApp != nullptr) {
         // Underlying app (or home script) is still loaded — just repaint.

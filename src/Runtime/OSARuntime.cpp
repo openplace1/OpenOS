@@ -2749,7 +2749,7 @@ bool OSARuntime::materializeLines() {
             return false;
         }
     }
-    if (sourceBorrowed) HeapReserve::giveBack(sourceText);
+    if (sourceBorrowed) HeapReserve::deallocate(sourceText);
     else                free(sourceText);
     sourceText = nullptr;
     sourceBorrowed = false;
@@ -2761,7 +2761,7 @@ bool OSARuntime::materializeLines() {
 void OSARuntime::releaseLines() {
     delete[] lines;
     lines = nullptr;
-    if (sourceBorrowed) HeapReserve::giveBack(sourceText);
+    if (sourceBorrowed) HeapReserve::deallocate(sourceText);
     else                free(sourceText);
     sourceText = nullptr;
     sourceBorrowed = false;
@@ -2999,7 +2999,7 @@ bool OSARuntime::loadScript(String path) {
     // boot-time reserve *without* freeing that block, so the compiler's
     // string pools cannot settle inside it and leave the region permanently
     // split — HTTPS later needs it whole (see HeapReserve.h).
-    sourceText = (char*)HeapReserve::borrow(sourceBytes + 1, "script load");
+    sourceText = (char*)HeapReserve::allocate(sourceBytes + 1, "script load");
     sourceBorrowed = sourceText != nullptr;
     if (!sourceText) {
         HeapReserve::release("oversized script");

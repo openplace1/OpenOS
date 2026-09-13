@@ -28,6 +28,11 @@ static String heapSummary() {
     summary += " KB, largest block ";
     summary += (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) / 1024U);
     summary += " KB";
+    if (HeapReserve::held()) {
+        summary += ", TLS arena ";
+        summary += (unsigned)(HeapReserve::size() / 1024U);
+        summary += " KB";
+    }
     return summary;
 }
 
@@ -89,11 +94,30 @@ void prepareMemory(const char* tag, const char* operation) {
 }
 
 bool memoryAvailable(String& why, bool pinned) {
-    // The reserved block exists precisely for this moment.
-    HeapReserve::release("HTTPS");
+    // mbedTLS allocates its record buffers and other large structures from
+    // the reserve (see HeapReserve), so with the reserve held a session only
+    // needs the general heap for small pieces. Without it — lent to a sprite
+    // that is still alive — the old all-from-the-heap requirement applies.
+    HeapReserve::reclaim();
     size_t freeBytes = ESP.getFreeHeap();
-    size_t needed = TLS_MIN_FREE_BYTES + (pinned ? TLS_PINNED_EXTRA_BYTES : 0);
     size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    const bool arena = HeapReserve::held() && HeapReserve::size() >= HeapReserve::MIN_BYTES;
+    if (arena) {
+        // No largest-block requirement: everything over 1 KB comes out of
+        // the arena, and inside an application the general heap is routinely
+        // in 2 KB pieces with 25 KB free — a session still completes there.
+        size_t needed = TLS_MIN_FREE_WITH_ARENA +
+                        (pinned ? TLS_PINNED_EXTRA_WITH_ARENA : 0);
+        if (freeBytes >= needed) return true;
+        why = "Not enough RAM for HTTPS (";
+        why += heapSummary();
+        why += "; needs ";
+        why += (unsigned)(needed / 1024U);
+        why += " KB free). Close Bluetooth or restart the device";
+        if (!pinned) Serial.printf("[HTTPS] refused: %s\n", why.c_str());
+        return false;
+    }
+    size_t needed = TLS_MIN_FREE_BYTES + (pinned ? TLS_PINNED_EXTRA_BYTES : 0);
     bool blocksOk;
     if (pinned) {
         // Both buffers and the certificate verification come out of one
@@ -128,6 +152,7 @@ bool memoryAvailable(String& why, bool pinned) {
         why += " KB blocks";
     }
     why += "). Close Bluetooth or restart the device";
+    if (!pinned) Serial.printf("[HTTPS] refused: %s\n", why.c_str());
     return false;
 }
 
@@ -340,11 +365,13 @@ int get(HTTPClient& http, WiFiClientSecure& client, const String& url,
         const bool usePin = wantPin;
         if (usePin) client.setCACert(anchor);
         else        client.setInsecure();
-        Serial.printf("[HTTPS] connect %s%s free=%u maxBlock=%u stackFree=%u\n",
+        HeapReserve::resetPeak();
+        Serial.printf("[HTTPS] connect %s%s free=%u maxBlock=%u arena=%u stackFree=%u\n",
                       host.c_str(),
                       usePin ? " (pinned)" : (anchor ? " (pin rejected, unpinned)" : ""),
                       (unsigned)ESP.getFreeHeap(),
                       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+                      (unsigned)HeapReserve::size(),
                       (unsigned)uxTaskGetStackHighWaterMark(nullptr));
         client.setHandshakeTimeout(request.handshakeTimeoutS);
         http.setConnectTimeout((int32_t)request.connectTimeoutMs);
@@ -356,7 +383,16 @@ int get(HTTPClient& http, WiFiClientSecure& client, const String& url,
             return HTTPC_ERROR_CONNECTION_REFUSED;
         }
         status = http.GET();
-        if (status > 0) return status;
+        // How much of the reserve the handshake used, and whether anything
+        // large had to spill into the general heap. Tuning data for the
+        // thresholds above; one line per session.
+        Serial.printf("[HTTPS] %s: arena peak %u B, %d large allocations spilled to heap\n",
+                      status > 0 ? "handshake ok" : "handshake failed",
+                      (unsigned)HeapReserve::arenaPeak(), HeapReserve::arenaOverflows());
+        if (status > 0) {
+            why = "";
+            return status;
+        }
         why = status == HTTPC_ERROR_CONNECTION_REFUSED
             ? describeConnectFailure(client, host)
             : String(HTTPClient::errorToString(status));
@@ -372,16 +408,15 @@ int get(HTTPClient& http, WiFiClientSecure& client, const String& url,
             }
         }
         Serial.printf("[HTTPS] attempt %d/%d %s%s: %s (free=%u maxBlock=%u)\n",
-                      attempt, attempts, host.c_str(), anchor ? " (pinned)" : "",
+                      attempt, attempts, host.c_str(), usePin ? " (pinned)" : "",
                       why.c_str(),
                       (unsigned)ESP.getFreeHeap(),
                       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     }
     http.end();
     client.stop();
-    // Every attempt failed. memoryAvailable() released the reserve on the way
-    // in, so take it back here — otherwise one failed update check leaves the
-    // device without its large-block reserve until the next return to Home.
+    // Every attempt failed; make sure the reserve is back at full size for
+    // whoever tries next.
     HeapReserve::reclaim();
     return status;
 }
