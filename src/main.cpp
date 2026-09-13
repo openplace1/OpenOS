@@ -451,6 +451,99 @@ static void registerOsaShortcuts() {
     scanPackageRoot("/system/packages", true);
 }
 
+// ─── Staged firmware update ──────────────────────────────────────────────────
+// ota.install() records the verified release and restarts; the download runs
+// here, before any script is loaded, because that is the only moment the heap
+// still offers one block large enough for a TLS session plus the flash
+// writer. A failure just carries on booting — the previous firmware is intact
+// and the record has already been cleared, so the device cannot loop.
+
+static void drawStagedProgress(const char* phase, size_t completed,
+                               size_t total, void* context) {
+    (void)context;
+    static int lastPercent = -1;
+    static String lastPhase;
+    int percent = total > 0 ? (int)((completed * 100U) / total) : 0;
+    if (percent > 100) percent = 100;
+    String nextPhase = phase ? phase : "Updating";
+    bool phaseChanged = nextPhase != lastPhase;
+    if (!phaseChanged && percent == lastPercent) return;
+    if (phaseChanged) {
+        lastPhase = nextPhase;
+        tft.fillScreen(TFT_BLACK);
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextFont(4);
+        tft.setTextColor(TFT_WHITE);
+        tft.drawString("Updating OpenOS", 120, 96);
+        tft.setTextFont(2);
+        tft.setTextColor(tft.color565(150, 150, 160));
+        tft.drawString(nextPhase, 120, 128);
+        tft.drawString("Keep the device powered", 120, 232);
+    }
+    lastPercent = percent;
+    tft.fillRoundRect(20, 160, 200, 18, 7, tft.color565(45, 45, 52));
+    int fill = (196 * percent) / 100;
+    if (fill > 0)
+        tft.fillRoundRect(22, 162, fill, 14, 6, tft.color565(52, 199, 89));
+    tft.fillRect(80, 184, 80, 20, TFT_BLACK);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextFont(2);
+    tft.setTextColor(tft.color565(200, 200, 210));
+    tft.drawString(String(percent) + "%", 120, 194);
+}
+
+static void runStagedFirmwareUpdate() {
+    if (!FirmwareUpdate::staged()) return;
+    Serial.printf("[OTA] staged update pending: %s\n",
+                  FirmwareUpdate::stagedName().c_str());
+
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextFont(4);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawString("Updating OpenOS", 120, 96);
+    tft.setTextFont(2);
+    tft.setTextColor(tft.color565(150, 150, 160));
+    tft.drawString("Connecting to Wi-Fi", 120, 128);
+
+    uint32_t started = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - started < 20000U) {
+        delay(200);
+        yield();
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("[OTA] staged update: no Wi-Fi, continuing boot");
+        tft.setTextColor(tft.color565(255, 149, 0));
+        tft.drawString("No Wi-Fi - update postponed", 120, 160);
+        delay(2000);
+        return;
+    }
+
+    Serial.printf("[OTA] staged install starting free=%u maxBlock=%u\n",
+                  (unsigned)ESP.getFreeHeap(),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    if (FirmwareUpdate::installStaged(drawStagedProgress, nullptr)) {
+        Serial.println("[OTA] staged install complete, restarting");
+        tft.fillScreen(TFT_BLACK);
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextFont(4);
+        tft.setTextColor(tft.color565(52, 199, 89));
+        tft.drawString("Update installed", 120, 150);
+        delay(1200);
+        ESP.restart();
+    }
+    Serial.printf("[OTA] staged install failed: %s\n",
+                  FirmwareUpdate::lastError().c_str());
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextFont(2);
+    tft.setTextColor(tft.color565(255, 69, 58));
+    tft.drawString("Update failed", 120, 130);
+    tft.setTextColor(tft.color565(180, 180, 190));
+    tft.drawString("Starting the current version", 120, 158);
+    delay(2500);
+}
+
 // ─── USB serial diagnostics ──────────────────────────────────────────────────
 // Line-oriented commands on the USB serial port for a developer with the
 // board on a cable; nothing here changes state on the device.
@@ -817,6 +910,10 @@ void setup() {
             }
         }
     }
+
+    // Before any script loads: the heap is still unbroken here, which is what
+    // a 2 MB download over TLS needs.
+    runStagedFirmwareUpdate();
 
     registerOsaShortcuts();
     home.applyOrder();

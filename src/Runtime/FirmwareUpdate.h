@@ -37,10 +37,27 @@ String releaseDescription();
 String publishedAt();
 size_t downloadSize();
 
-// Installs only the release cached by a successful check(). No URL, hash or
-// target can be supplied by OSA. On success the next OTA slot is bootable but
-// the caller decides when to restart.
-bool install(ProgressCallback progress = nullptr, void* context = nullptr);
+// Records the release cached by a successful check() for installation on the
+// next boot, and does not download anything itself. No URL, hash or target
+// can be supplied by OSA.
+//
+// The download runs from setup(), before any application is loaded, because
+// a 2 MB TLS transfer needs a large contiguous block and a device that has
+// been running for a while cannot offer one: the Wi-Fi stack keeps buffers it
+// grew during earlier transfers, so the heap has plenty free but nothing big
+// enough left in one piece. At boot it does.
+bool stageForRestart();
+
+// True when a staged release is waiting; the caller restarts to install it.
+bool staged();
+
+// Downloads, verifies and activates a staged release. Clears the record
+// first, so a failure costs one attempt and never loops the device. Returns
+// false with lastError() set; the caller carries on booting.
+bool installStaged(ProgressCallback progress = nullptr, void* context = nullptr);
+
+// Identity of the staged release, for the progress screen.
+String stagedName();
 
 bool canRollback();
 bool rollback();

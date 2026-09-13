@@ -8,18 +8,18 @@ static const char* INFO_JSON =
     "  \"channel\": \"stable\",\n"
     "  \"target\": \"denky32-wroom32\",\n"
     "  \"partitionScheme\": \"openos-dual-v1\",\n"
-    "  \"name\": \"OpenOS 1.2.14\",\n"
-    "  \"version\": \"1.2.14\",\n"
-    "  \"versionCode\": 17,\n"
+    "  \"name\": \"OpenOS 1.3.1\",\n"
+    "  \"version\": \"1.3.1\",\n"
+    "  \"versionCode\": 19,\n"
     "  \"minUpdaterVersionCode\": 1,\n"
     "  \"releaseType\": \"patch\",\n"
-    "  \"description\": \"Wydanie sprawdzajace instalacje przez siec na urzadzeniu. Nie zmienia dzialania wzgledem 1.2.13.\",\n"
+    "  \"description\": \"Wydanie sprawdzajace instalacje przez siec. Nie zmienia dzialania wzgledem 1.3.0, ktore przenioslo pobieranie aktualizacji na start urzadzenia.\",\n"
     "  \"publishedAt\": \"2026-09-13\",\n"
-    "  \"firmware\": \"firmware-17.bin\",\n"
-    "  \"size\": 1978832,\n"
-    "  \"sha256\": \"d201c913b88712fafa9492fced3a023904d63b34f44da4d1f0c8a8604f019ac1\",\n"
+    "  \"firmware\": \"firmware-19.bin\",\n"
+    "  \"size\": 1981552,\n"
+    "  \"sha256\": \"d2ce93ebed86f83a94a5e42853781cfb30aae523d61687fe6184af770b81841a\",\n"
     "  \"keyId\": \"openos-release-2026-02\",\n"
-    "  \"signature\": \"MEUCIF9cwrdKQ3HYY5ROZxbhu8yPsbNqaJ7UDSmm36OvEtoJAiEAmkdJMxTN3aIXPy4c01S+gfGt9Y9HuAMMiY0kaZz8fx0=\"\n"
+    "  \"signature\": \"MEUCIQDMQcR6eo16uesKx+6a+dk8SZYcQTf9UVdEekvhNZO4/gIgN7KE+broL7/rVMXKdcyhlFE4/VaM9F3+3ezVx8HhUTQ=\"\n"
     "}\n";
 
 // canonical signature payload computed by the Python release tool rules
@@ -30,23 +30,23 @@ static const char* INFO_CANONICAL =
     "channel:6:stable\n"
     "target:15:denky32-wroom32\n"
     "partitionScheme:14:openos-dual-v1\n"
-    "name:13:OpenOS 1.2.14\n"
-    "version:6:1.2.14\n"
-    "versionCode:2:17\n"
+    "name:12:OpenOS 1.3.1\n"
+    "version:5:1.3.1\n"
+    "versionCode:2:19\n"
     "minUpdaterVersionCode:1:1\n"
     "releaseType:5:patch\n"
-    "description:96:Wydanie sprawdzajace instalacje przez siec na urzadzeniu. Nie zmienia dzialania wzgledem 1.2.13.\n"
+    "description:143:Wydanie sprawdzajace instalacje przez siec. Nie zmienia dzialania wzgledem 1.3.0, ktore przenioslo pobieranie aktualizacji na start urzadzenia.\n"
     "publishedAt:10:2026-09-13\n"
-    "firmware:15:firmware-17.bin\n"
-    "size:7:1978832\n"
-    "sha256:64:d201c913b88712fafa9492fced3a023904d63b34f44da4d1f0c8a8604f019ac1\n"
+    "firmware:15:firmware-19.bin\n"
+    "size:7:1981552\n"
+    "sha256:64:d2ce93ebed86f83a94a5e42853781cfb30aae523d61687fe6184af770b81841a\n"
     "keyId:22:openos-release-2026-02\n";
 
 // values the parser must extract from INFO_JSON
-static const char* INFO_EXPECTED_NAME = "OpenOS 1.2.14";
-static const char* INFO_EXPECTED_FIRMWARE = "firmware-17.bin";
+static const char* INFO_EXPECTED_NAME = "OpenOS 1.3.1";
+static const char* INFO_EXPECTED_FIRMWARE = "firmware-19.bin";
 static const char* INFO_EXPECTED_KEY_ID = "openos-release-2026-02";
 static const char* INFO_EXPECTED_TARGET = "denky32-wroom32";
 static const char* INFO_EXPECTED_PARTITION = "openos-dual-v1";
-static const unsigned INFO_EXPECTED_VERSION_CODE = 17u;
-static const unsigned INFO_EXPECTED_SIZE = 1978832u;
+static const unsigned INFO_EXPECTED_VERSION_CODE = 19u;
+static const unsigned INFO_EXPECTED_SIZE = 1981552u;

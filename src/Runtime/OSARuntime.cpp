@@ -6707,17 +6707,14 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
                         FirmwareUpdate::releaseChannel() + " / " +
                         FirmwareUpdate::releaseType();
         if (!showSystemPopup("Install firmware update?", detail,
-                             "Keep power connected during installation",
+                             "The device restarts to install it",
                              "Cancel", "Install", true)) return OSAVal(0.0);
-        clearRichMenuCache();
-        PackageManager::clearCatalog();
-        OtaProgressUi progressUi;
-        progressUi.display = tft;
-        bool installed = FirmwareUpdate::install(drawOtaProgress, &progressUi);
-        if (!installed) return OSAVal(0.0);
-        showSystemPopup("Update installed", FirmwareUpdate::remoteVersion(),
-                        "OpenOS will restart into the new slot",
-                        "", "Restart", true);
+        // The download itself runs from the next boot, before any application
+        // is loaded: a 2 MB TLS transfer needs a contiguous block that a
+        // device which has been running for a while can no longer offer.
+        if (!FirmwareUpdate::stageForRestart()) return OSAVal(0.0);
+        showSystemPopup("Restarting to install", FirmwareUpdate::remoteVersion(),
+                        "Keep the device powered", "", "Restart", true);
         delay(150);
         ESP.restart();
         return OSAVal(1.0);

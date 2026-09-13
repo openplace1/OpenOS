@@ -24,6 +24,10 @@ static constexpr uint32_t OTA_SLOT_BYTES = 0x1F0000;
 static constexpr uint32_t BOOT_PROBATION_MS = 8000;
 static constexpr const char* PREF_NAMESPACE = "openos-ota";
 static constexpr const char* PREF_SOURCE_KEY = "info_url";
+static constexpr const char* PREF_STAGED_URL = "pend_url";
+static constexpr const char* PREF_STAGED_SIZE = "pend_size";
+static constexpr const char* PREF_STAGED_SHA = "pend_sha";
+static constexpr const char* PREF_STAGED_NAME = "pend_name";
 
 using OtaManifest::Manifest;
 using OtaManifest::validHttpsUrl;
@@ -249,15 +253,17 @@ String releaseDescription() {
 String publishedAt() { return s_manifestReady ? s_manifest.published : String(); }
 size_t downloadSize() { return s_manifestReady ? (size_t)s_manifest.size : 0; }
 
-bool install(ProgressCallback progress, void* context) {
-    s_error = "";
-    if (!s_manifestReady || !s_updateAvailable)
-        return fail("Check for a newer signed update first");
+// Downloads `url`, checks it against the signed `size` and `sha256hex`, and
+// makes the inactive slot bootable. Shared by the staged boot path; nothing
+// here trusts anything that did not come out of a verified manifest.
+static bool performInstall(const String& url, uint32_t size,
+                           const String& sha256hex,
+                           ProgressCallback progress, void* context) {
     if (!supported())
         return fail("USB migration to the dual-slot partition layout is required");
     if (WiFi.status() != WL_CONNECTED) return fail("Wi-Fi is not connected");
     const esp_partition_t* next = esp_ota_get_next_update_partition(nullptr);
-    if (!next || s_manifest.size > next->size)
+    if (!next || size > next->size)
         return fail("Firmware does not fit the inactive OTA slot");
 
     HeapReserve::reclaim();
@@ -272,7 +278,7 @@ bool install(ProgressCallback progress, void* context) {
                     (unsigned)(ESP.getFreeHeap() / 1024U) + " KB, need " +
                     (unsigned)(SecureHttp::TLS_MIN_FREE_BYTES / 1024U + 10U) +
                     " KB)");
-    if (!validHttpsUrl(s_manifest.resolvedFirmwareUrl))
+    if (!validHttpsUrl(url))
         return fail("OTA firmware URL is invalid");
 
     // Both 4 KB buffers are claimed before the TLS session exists. Update's
@@ -281,8 +287,8 @@ bool install(ProgressCallback progress, void* context) {
     // reports that failure as a begin() returning false with no error set.
     uint8_t* buffer = (uint8_t*)malloc(4096);
     if (!buffer) return fail("Not enough contiguous RAM for the OTA buffer");
-    if (progress) progress("Preparing", 0, s_manifest.size, context);
-    if (!Update.begin(s_manifest.size, U_FLASH)) {
+    if (progress) progress("Preparing", 0, size, context);
+    if (!Update.begin(size, U_FLASH)) {
         String detail = Update.errorString();
         // UPDATE_ERROR_OK here means begin() bailed out without recording a
         // reason; the only such path is its own 4 KB allocation failing.
@@ -298,8 +304,7 @@ bool install(ProgressCallback progress, void* context) {
     SecureHttp::Request request;
     request.attempts = 2;
     request.readTimeoutMs = 20000;
-    int status = SecureHttp::get(http, client, s_manifest.resolvedFirmwareUrl,
-                                 request, why);
+    int status = SecureHttp::get(http, client, url, request, why);
     if (status != HTTP_CODE_OK) {
         String message = status < 0
             ? String("Firmware download failed: ") + why
@@ -310,7 +315,7 @@ bool install(ProgressCallback progress, void* context) {
         return fail(message);
     }
     int declared = http.getSize();
-    if (declared < 0 || (uint32_t)declared != s_manifest.size) {
+    if (declared < 0 || (uint32_t)declared != size) {
         http.end();
         free(buffer);
         Update.abort();
@@ -331,7 +336,7 @@ bool install(ProgressCallback progress, void* context) {
     size_t received = 0;
     uint32_t lastDataAt = millis();
     String transferError;
-    while (received < s_manifest.size) {
+    while (received < size) {
         int availableBytes = stream ? stream->available() : 0;
         if (availableBytes <= 0) {
             if (!http.connected()) {
@@ -347,7 +352,7 @@ bool install(ProgressCallback progress, void* context) {
             continue;
         }
         size_t wanted = min((size_t)availableBytes,
-                            min((size_t)4096, (size_t)s_manifest.size - received));
+                            min((size_t)4096, (size_t)size - received));
         int count = stream->readBytes(buffer, wanted);
         if (count <= 0) continue;
         lastDataAt = millis();
@@ -361,7 +366,7 @@ bool install(ProgressCallback progress, void* context) {
             break;
         }
         received += (size_t)count;
-        if (progress) progress("Installing", received, s_manifest.size, context);
+        if (progress) progress("Installing", received, size, context);
         yield();
     }
 
@@ -378,18 +383,78 @@ bool install(ProgressCallback progress, void* context) {
         return fail(transferError.length() > 0 ? transferError
                                                : String("Could not finish firmware SHA-256"));
     }
-    if (received != s_manifest.size ||
-        !OtaManifest::digestMatches(digest, s_manifest.sha256)) {
+    if (received != size || !OtaManifest::digestMatches(digest, sha256hex)) {
         Update.abort();
         return fail("Firmware SHA-256 does not match the signed manifest");
     }
-    if (progress) progress("Finalizing", s_manifest.size, s_manifest.size, context);
+    if (progress) progress("Finalizing", size, size, context);
     if (!Update.end(false) || !Update.isFinished()) {
         String message = String("Could not activate OTA image: ") + Update.errorString();
         Update.abort();
         return fail(message);
     }
     return true;
+}
+
+bool stageForRestart() {
+    s_error = "";
+    if (!s_manifestReady || !s_updateAvailable)
+        return fail("Check for a newer signed update first");
+    if (!supported())
+        return fail("USB migration to the dual-slot partition layout is required");
+    const esp_partition_t* next = esp_ota_get_next_update_partition(nullptr);
+    if (!next || s_manifest.size > next->size)
+        return fail("Firmware does not fit the inactive OTA slot");
+
+    Preferences preferences;
+    if (!preferences.begin(PREF_NAMESPACE, false))
+        return fail("Could not record the pending update");
+    bool ok = preferences.putString(PREF_STAGED_URL, s_manifest.resolvedFirmwareUrl) > 0 &&
+              preferences.putUInt(PREF_STAGED_SIZE, s_manifest.size) == sizeof(uint32_t) &&
+              preferences.putString(PREF_STAGED_SHA, s_manifest.sha256) > 0 &&
+              preferences.putString(PREF_STAGED_NAME, s_manifest.name) > 0;
+    preferences.end();
+    if (!ok) return fail("Could not record the pending update");
+    Serial.printf("[OTA] staged %s for the next boot\n", s_manifest.name.c_str());
+    return true;
+}
+
+bool staged() {
+    Preferences preferences;
+    if (!preferences.begin(PREF_NAMESPACE, true)) return false;
+    bool present = preferences.isKey(PREF_STAGED_URL) &&
+                   preferences.isKey(PREF_STAGED_SHA);
+    preferences.end();
+    return present;
+}
+
+String stagedName() {
+    Preferences preferences;
+    if (!preferences.begin(PREF_NAMESPACE, true)) return String();
+    String name = preferences.getString(PREF_STAGED_NAME, "");
+    preferences.end();
+    return name;
+}
+
+bool installStaged(ProgressCallback progress, void* context) {
+    s_error = "";
+    Preferences preferences;
+    if (!preferences.begin(PREF_NAMESPACE, false))
+        return fail("Could not read the pending update");
+    String url = preferences.getString(PREF_STAGED_URL, "");
+    uint32_t size = preferences.getUInt(PREF_STAGED_SIZE, 0);
+    String sha256hex = preferences.getString(PREF_STAGED_SHA, "");
+    // Clear it before trying: one attempt per request, so a device can never
+    // end up retrying a broken download on every boot.
+    preferences.remove(PREF_STAGED_URL);
+    preferences.remove(PREF_STAGED_SIZE);
+    preferences.remove(PREF_STAGED_SHA);
+    preferences.remove(PREF_STAGED_NAME);
+    preferences.end();
+
+    if (url.length() == 0 || sha256hex.length() != 64 || size < 4096)
+        return fail("The pending update record is incomplete");
+    return performInstall(url, size, sha256hex, progress, context);
 }
 
 bool canRollback() { return Update.canRollBack(); }
