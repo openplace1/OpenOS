@@ -8,18 +8,18 @@ static const char* INFO_JSON =
     "  \"channel\": \"stable\",\n"
     "  \"target\": \"denky32-wroom32\",\n"
     "  \"partitionScheme\": \"openos-dual-v1\",\n"
-    "  \"name\": \"OpenOS 1.2.11\",\n"
-    "  \"version\": \"1.2.11\",\n"
-    "  \"versionCode\": 14,\n"
+    "  \"name\": \"OpenOS 1.2.12\",\n"
+    "  \"version\": \"1.2.12\",\n"
+    "  \"versionCode\": 15,\n"
     "  \"minUpdaterVersionCode\": 1,\n"
     "  \"releaseType\": \"patch\",\n"
-    "  \"description\": \"Bufor na pobierany manifest i katalog jest rezerwowany zanim blok pamieci trafi do mbedTLS. Wczesniej tekst ladowal w srodku tego obszaru i po zamknieciu sesji zostawial w nim dziure, przez co kolejne pobranie mialo juz tylko 35 KB ciaglej pamieci i nie miescilo dwoch buforow TLS - to blokowalo pobranie obrazu firmware.\",\n"
+    "  \"description\": \"Wydanie sprawdzajace pelna sciezke aktualizacji przez siec na urzadzeniu. Poza dokumentacja gospodarki pamiecia na plytce bez PSRAM nie zmienia dzialania wzgledem 1.2.11.\",\n"
     "  \"publishedAt\": \"2026-09-13\",\n"
-    "  \"firmware\": \"firmware-14.bin\",\n"
+    "  \"firmware\": \"firmware-15.bin\",\n"
     "  \"size\": 1982896,\n"
-    "  \"sha256\": \"b621bb2befcc8878c0820741074599871725275e6ce5939f3d32f8bbf813a08e\",\n"
+    "  \"sha256\": \"b05c630daf273b774e4bb32372f2351c561e4b56800e8e63a4490a6bd56d4290\",\n"
     "  \"keyId\": \"openos-release-2026-02\",\n"
-    "  \"signature\": \"MEUCICj9fV11NzraPo6z4Vo4SwUPCFheMtqkqgZ2bo9VH+hRAiEAzwc+uv2epzr2P1IR2ePy3PVKk2F8dyBbG6CNr2XC8u0=\"\n"
+    "  \"signature\": \"MEUCIH1WZa3qY3LxID1iklRq4QRGG4/Yl1x0fIrmFMnusx6bAiEAse37yIWYb8GoH3y4LUyagOFply3sp1R9e8EtNjMkIOA=\"\n"
     "}\n";
 
 // canonical signature payload computed by the Python release tool rules
@@ -30,23 +30,23 @@ static const char* INFO_CANONICAL =
     "channel:6:stable\n"
     "target:15:denky32-wroom32\n"
     "partitionScheme:14:openos-dual-v1\n"
-    "name:13:OpenOS 1.2.11\n"
-    "version:6:1.2.11\n"
-    "versionCode:2:14\n"
+    "name:13:OpenOS 1.2.12\n"
+    "version:6:1.2.12\n"
+    "versionCode:2:15\n"
     "minUpdaterVersionCode:1:1\n"
     "releaseType:5:patch\n"
-    "description:321:Bufor na pobierany manifest i katalog jest rezerwowany zanim blok pamieci trafi do mbedTLS. Wczesniej tekst ladowal w srodku tego obszaru i po zamknieciu sesji zostawial w nim dziure, przez co kolejne pobranie mialo juz tylko 35 KB ciaglej pamieci i nie miescilo dwoch buforow TLS - to blokowalo pobranie obrazu firmware.\n"
+    "description:170:Wydanie sprawdzajace pelna sciezke aktualizacji przez siec na urzadzeniu. Poza dokumentacja gospodarki pamiecia na plytce bez PSRAM nie zmienia dzialania wzgledem 1.2.11.\n"
     "publishedAt:10:2026-09-13\n"
-    "firmware:15:firmware-14.bin\n"
+    "firmware:15:firmware-15.bin\n"
     "size:7:1982896\n"
-    "sha256:64:b621bb2befcc8878c0820741074599871725275e6ce5939f3d32f8bbf813a08e\n"
+    "sha256:64:b05c630daf273b774e4bb32372f2351c561e4b56800e8e63a4490a6bd56d4290\n"
     "keyId:22:openos-release-2026-02\n";
 
 // values the parser must extract from INFO_JSON
-static const char* INFO_EXPECTED_NAME = "OpenOS 1.2.11";
-static const char* INFO_EXPECTED_FIRMWARE = "firmware-14.bin";
+static const char* INFO_EXPECTED_NAME = "OpenOS 1.2.12";
+static const char* INFO_EXPECTED_FIRMWARE = "firmware-15.bin";
 static const char* INFO_EXPECTED_KEY_ID = "openos-release-2026-02";
 static const char* INFO_EXPECTED_TARGET = "denky32-wroom32";
 static const char* INFO_EXPECTED_PARTITION = "openos-dual-v1";
-static const unsigned INFO_EXPECTED_VERSION_CODE = 14u;
+static const unsigned INFO_EXPECTED_VERSION_CODE = 15u;
 static const unsigned INFO_EXPECTED_SIZE = 1982896u;

@@ -18,6 +18,7 @@ live. No reflash.
   - [Syntax](#syntax)
 - [Permissions](#permissions)
 - [OpenStore and OPK packages](#openstore-and-opk-packages)
+- [Memory on a board without PSRAM](#memory-on-a-board-without-psram)
 - [Firmware OTA updates](#firmware-ota-updates)
 - [SDK reference](#sdk-reference)
   - [Screen drawing](#screen-drawing)
@@ -194,6 +195,45 @@ boot from staging/backup directories.
 
 Build packages and regenerate the catalog with `tools/build_opk.py`. The full
 format and publishing workflow are documented in `store/README.md`.
+
+## Memory on a board without PSRAM
+
+One HTTPS session is the largest thing OpenOS does. mbedTLS here has fixed
+16 KB record buffers and allocates two of them, so a handshake needs roughly
+45 KB of heap *in one piece* — more than the free heap contains in one piece
+once an application is running. Three rules keep that possible, and getting
+any of them wrong produces errors that name the wrong culprit.
+
+**One reserved block.** `Runtime/HeapReserve` claims the largest block it can
+(45 KB, down to a 35 KB floor) at boot, while the heap is still unbroken, and
+lends it to the few consumers that need contiguous memory: a TLS session, a
+3D sprite, the OPK inflate window, a script's source text. Small allocations
+never land in it, so it stays whole.
+
+**Borrow, do not release, when debris would be left behind.** `release()`
+returns the block to the allocator; whatever the consumer allocates next
+comes out of that region, and anything still alive when the consumer
+finishes leaves a hole that can never be reclaimed. Script loading therefore
+uses `borrow()`, which hands out the block without freeing it, and a
+downloaded manifest or catalog reserves its buffer *before* the block is
+released. Both were real bugs: compiling one application, or one update
+check, used to shrink the reserve permanently and the next transfer failed.
+
+**Verification runs while the buffers are held.** The certificate chain is
+checked with both record buffers still allocated, so what is left of the
+region has to cover it. Reaching a pinned root through two RSA-4096
+signatures did not fit; pinning the server certificate's own issuer (see
+`Runtime/OpenOSTrustAnchors.h`) reduces it to one RSA-2048 check. When it
+still does not fit, or the chain is rejected, `SecureHttp` says so and
+continues unpinned — the release signature is what authenticates content,
+and a hardening layer must not be able to stop updates.
+
+Failures in this area are reported with the free heap and the largest block
+at the moment they happened, because "certificate verification failed" and
+"connection refused" are both what a shortage of contiguous memory looks
+like from the outside.
+
+---
 
 ## Firmware OTA updates
 
