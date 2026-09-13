@@ -220,6 +220,7 @@ private:
     // compile frees the buffer. Only the tree-walker fallback materialises
     // `lines` as Strings, because it rewrites lines while executing.
     char*     sourceText = nullptr;
+    bool      sourceBorrowed = false;
     uint32_t* lineOffsets = nullptr;
     String*   lines = nullptr;
     int       lineCount = 0;

@@ -8,18 +8,18 @@ static const char* INFO_JSON =
     "  \"channel\": \"stable\",\n"
     "  \"target\": \"denky32-wroom32\",\n"
     "  \"partitionScheme\": \"openos-dual-v1\",\n"
-    "  \"name\": \"OpenOS 1.2.2\",\n"
-    "  \"version\": \"1.2.2\",\n"
-    "  \"versionCode\": 5,\n"
+    "  \"name\": \"OpenOS 1.2.6\",\n"
+    "  \"version\": \"1.2.6\",\n"
+    "  \"versionCode\": 9,\n"
     "  \"minUpdaterVersionCode\": 1,\n"
     "  \"releaseType\": \"patch\",\n"
-    "  \"description\": \"Pierwsza aktualizacja instalowana przez OTA. Sprawdzenie pamieci przed polaczeniem HTTPS wymaga teraz jednego ciaglego obszaru na oba bufory TLS i weryfikacje certyfikatu, wiec brak RAM nie udaje juz bledu certyfikatu; diagnostyka lancucha uruchamiana jest tylko na zadanie przez USB, a nieudana instalacja oddaje zarezerwowana pamiec.\",\n"
-    "  \"publishedAt\": \"2026-09-12\",\n"
-    "  \"firmware\": \"firmware-5.bin\",\n"
-    "  \"size\": 1979440,\n"
-    "  \"sha256\": \"abca8b98e30e7635ce73434c859a91e6d320929a7c0937cd872f4b64bc58ffad\",\n"
+    "  \"description\": \"Przypiete certyfikaty oficjalnego feedu obejmuja teraz wystawce certyfikatu serwera, dzieki czemu weryfikacja miesci sie w pamieci obok buforow TLS; gdy mimo to zostanie odrzucona, urzadzenie ponawia polaczenie bez przypiecia, bo o autentycznosci decyduje podpis wydania. Nieudany transfer oddaje zarezerwowany blok pamieci.\",\n"
+    "  \"publishedAt\": \"2026-09-13\",\n"
+    "  \"firmware\": \"firmware-9.bin\",\n"
+    "  \"size\": 1982240,\n"
+    "  \"sha256\": \"77f1e905434d418461cd9383f9311b69ec37d76fb17cf9ff006f9432d59fce62\",\n"
     "  \"keyId\": \"openos-release-2026-02\",\n"
-    "  \"signature\": \"MEUCIDeawGuOT6dTajdGn3ROvvs5UH16urG3YdendivDG/FXAiEAumqlz/WbhtlQOvoi9slVpZ7vGgZQZ49Ob/vf5X/v/G4=\"\n"
+    "  \"signature\": \"MEUCIDarkP3RS7sXVxtDmu1oMhpSzsJu2l4tZoOm3pXUs0utAiEA7U3K3HdMZjIMi7Pi7szzsmQ/JMQDHOKEEQl1CY25UFE=\"\n"
     "}\n";
 
 // canonical signature payload computed by the Python release tool rules
@@ -30,23 +30,23 @@ static const char* INFO_CANONICAL =
     "channel:6:stable\n"
     "target:15:denky32-wroom32\n"
     "partitionScheme:14:openos-dual-v1\n"
-    "name:12:OpenOS 1.2.2\n"
-    "version:5:1.2.2\n"
-    "versionCode:1:5\n"
+    "name:12:OpenOS 1.2.6\n"
+    "version:5:1.2.6\n"
+    "versionCode:1:9\n"
     "minUpdaterVersionCode:1:1\n"
     "releaseType:5:patch\n"
-    "description:335:Pierwsza aktualizacja instalowana przez OTA. Sprawdzenie pamieci przed polaczeniem HTTPS wymaga teraz jednego ciaglego obszaru na oba bufory TLS i weryfikacje certyfikatu, wiec brak RAM nie udaje juz bledu certyfikatu; diagnostyka lancucha uruchamiana jest tylko na zadanie przez USB, a nieudana instalacja oddaje zarezerwowana pamiec.\n"
-    "publishedAt:10:2026-09-12\n"
-    "firmware:14:firmware-5.bin\n"
-    "size:7:1979440\n"
-    "sha256:64:abca8b98e30e7635ce73434c859a91e6d320929a7c0937cd872f4b64bc58ffad\n"
+    "description:324:Przypiete certyfikaty oficjalnego feedu obejmuja teraz wystawce certyfikatu serwera, dzieki czemu weryfikacja miesci sie w pamieci obok buforow TLS; gdy mimo to zostanie odrzucona, urzadzenie ponawia polaczenie bez przypiecia, bo o autentycznosci decyduje podpis wydania. Nieudany transfer oddaje zarezerwowany blok pamieci.\n"
+    "publishedAt:10:2026-09-13\n"
+    "firmware:14:firmware-9.bin\n"
+    "size:7:1982240\n"
+    "sha256:64:77f1e905434d418461cd9383f9311b69ec37d76fb17cf9ff006f9432d59fce62\n"
     "keyId:22:openos-release-2026-02\n";
 
 // values the parser must extract from INFO_JSON
-static const char* INFO_EXPECTED_NAME = "OpenOS 1.2.2";
-static const char* INFO_EXPECTED_FIRMWARE = "firmware-5.bin";
+static const char* INFO_EXPECTED_NAME = "OpenOS 1.2.6";
+static const char* INFO_EXPECTED_FIRMWARE = "firmware-9.bin";
 static const char* INFO_EXPECTED_KEY_ID = "openos-release-2026-02";
 static const char* INFO_EXPECTED_TARGET = "denky32-wroom32";
 static const char* INFO_EXPECTED_PARTITION = "openos-dual-v1";
-static const unsigned INFO_EXPECTED_VERSION_CODE = 5u;
-static const unsigned INFO_EXPECTED_SIZE = 1979440u;
+static const unsigned INFO_EXPECTED_VERSION_CODE = 9u;
+static const unsigned INFO_EXPECTED_SIZE = 1982240u;

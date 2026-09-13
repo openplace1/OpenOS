@@ -28,8 +28,23 @@ namespace HeapReserve {
 static constexpr size_t BYTES = 45U * 1024U;
 
 void begin();
+
+// Hand the whole block back to the allocator. Use this for a consumer that
+// needs the *allocator* to hand out the space (mbedTLS, TFT_eSprite, the OPK
+// inflate window); reclaim() takes it again afterwards.
 void release(const char* reason);
 bool reclaim();
 bool held();
+
+// Use the reserved block directly, without freeing it. A consumer that would
+// otherwise allocate and then leave long-lived debris inside the freed region
+// must borrow instead: loading a script used to release the block, and the
+// compiler's string pools then settled inside it, so the region could never
+// be reclaimed whole again and the next HTTPS handshake found only ~38 KB
+// contiguous — enough for both TLS record buffers but not for the
+// certificate verification that runs while they are held.
+// Returns nullptr when the block is missing, already lent or too small.
+void* borrow(size_t bytes, const char* reason);
+void giveBack(void* pointer);
 
 } // namespace HeapReserve

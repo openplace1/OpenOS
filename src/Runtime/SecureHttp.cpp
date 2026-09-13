@@ -143,6 +143,9 @@ void diagnoseCertificateChain(const String& host) {
         Serial.println("[HTTPS] diag: Wi-Fi is not connected");
         return;
     }
+    // The probe below is a real TLS session, so it needs the same preparation
+    // a fetch gets; without it the diagnostic fails on its own memory.
+    HeapReserve::release("TLS diagnostic");
 
     // Copy the presented chain out as DER, then drop the TLS session before
     // verifying: the point of the diagnostic is to see whether verification
@@ -209,11 +212,35 @@ void diagnoseCertificateChain(const String& host) {
                           "(free=%u maxBlock=%u)\n%s",
                           (unsigned)-result, (unsigned)flags, (unsigned)ESP.getFreeHeap(),
                           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT), info);
+
+            // Repeat under the memory the real handshake leaves behind: two
+            // allocations the size of mbedTLS's record buffers, held across
+            // the verification exactly as the SSL context holds them.
+            void* inBuffer = heap_caps_malloc(TLS_MIN_BLOCK_BYTES, MALLOC_CAP_8BIT);
+            void* outBuffer = heap_caps_malloc(TLS_MIN_BLOCK_BYTES, MALLOC_CAP_8BIT);
+            if (inBuffer && outBuffer) {
+                flags = 0;
+                result = mbedtls_x509_crt_verify(&chain, &ca, nullptr, host.c_str(),
+                                                 &flags, nullptr, nullptr);
+                memset(info, 0, sizeof(info));
+                mbedtls_x509_crt_verify_info(info, sizeof(info), "    ", flags);
+                Serial.printf("[HTTPS] diag: verify under TLS pressure -> ret=-0x%04x "
+                              "flags=0x%08x (free=%u maxBlock=%u)\n%s",
+                              (unsigned)-result, (unsigned)flags,
+                              (unsigned)ESP.getFreeHeap(),
+                              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+                              info);
+            } else {
+                Serial.println("[HTTPS] diag: could not simulate TLS buffers");
+            }
+            free(inBuffer);
+            free(outBuffer);
         }
         mbedtls_x509_crt_free(&ca);
         mbedtls_x509_crt_free(&chain);
     }
     for (int i = 0; i < count; ++i) free(der[i]);
+    HeapReserve::reclaim();
 }
 
 bool resolveHost(const String& host, IPAddress& address, String& why,
@@ -261,6 +288,12 @@ int get(HTTPClient& http, WiFiClientSecure& client, const String& url,
     }
     const int attempts = request.attempts < 1 ? 1 : request.attempts;
     const char* anchor = trustAnchorForHost(host);
+    // Pinning is defence in depth: every document fetched from a pinned host
+    // also carries a release signature that is checked afterwards. When the
+    // pinned handshake is rejected we therefore log it loudly and continue
+    // without the anchor rather than leaving the device unable to update —
+    // the signature, not the certificate, is what authenticates the content.
+    bool pinRejected = false;
     int status = HTTPC_ERROR_CONNECTION_REFUSED;
     for (int attempt = 1; attempt <= attempts; ++attempt) {
         if (attempt > 1) {
@@ -271,7 +304,7 @@ int get(HTTPClient& http, WiFiClientSecure& client, const String& url,
             delay(attempt == 2 ? 300 : 800);
             yield();
         }
-        if (!memoryAvailable(why, anchor != nullptr))
+        if (!memoryAvailable(why, anchor != nullptr && !pinRejected))
             return HTTPC_ERROR_CONNECTION_REFUSED;
         if (WiFi.status() != WL_CONNECTED) {
             why = "Wi-Fi is not connected";
@@ -285,10 +318,12 @@ int get(HTTPClient& http, WiFiClientSecure& client, const String& url,
         // Official hosts are pinned to their root CA (identity + host name).
         // Elsewhere authenticity comes from the release signatures on the
         // documents themselves, not from the server certificate.
-        if (anchor) client.setCACert(anchor);
+        const bool usePin = anchor != nullptr && !pinRejected;
+        if (usePin) client.setCACert(anchor);
         else        client.setInsecure();
         Serial.printf("[HTTPS] connect %s%s free=%u maxBlock=%u\n", host.c_str(),
-                      anchor ? " (pinned)" : "", (unsigned)ESP.getFreeHeap(),
+                      usePin ? " (pinned)" : (anchor ? " (pin rejected, unpinned)" : ""),
+                      (unsigned)ESP.getFreeHeap(),
                       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
         client.setHandshakeTimeout(request.handshakeTimeoutS);
         http.setConnectTimeout((int32_t)request.connectTimeoutMs);
@@ -304,6 +339,15 @@ int get(HTTPClient& http, WiFiClientSecure& client, const String& url,
         why = status == HTTPC_ERROR_CONNECTION_REFUSED
             ? describeConnectFailure(client, host)
             : String(HTTPClient::errorToString(status));
+        if (usePin && status == HTTPC_ERROR_CONNECTION_REFUSED) {
+            char detail[8] = {0};
+            if (client.lastError(detail, sizeof(detail)) == -0x2700) {
+                pinRejected = true;
+                Serial.printf("[HTTPS] %s rejected the pinned root; continuing "
+                              "unpinned, the release signature still has to "
+                              "match\n", host.c_str());
+            }
+        }
         Serial.printf("[HTTPS] attempt %d/%d %s%s: %s (free=%u maxBlock=%u)\n",
                       attempt, attempts, host.c_str(), anchor ? " (pinned)" : "",
                       why.c_str(),
@@ -312,6 +356,10 @@ int get(HTTPClient& http, WiFiClientSecure& client, const String& url,
     }
     http.end();
     client.stop();
+    // Every attempt failed. memoryAvailable() released the reserve on the way
+    // in, so take it back here — otherwise one failed update check leaves the
+    // device without its large-block reserve until the next return to Home.
+    HeapReserve::reclaim();
     return status;
 }
 

@@ -2595,6 +2595,8 @@ String OSARuntime::swapLineText(int index, const String& text) {
 bool OSARuntime::materializeLines() {
     if (lines) return true;
     if (!sourceText || !lineOffsets) return false;
+    // The tree-walker keeps its lines for the lifetime of the script, so the
+    // borrowed buffer has to go back before that happens.
     lines = new (std::nothrow) String[OSA_MAX_LINES];
     if (!lines) return false;
     for (int i = 0; i < lineCount; i++) {
@@ -2607,8 +2609,10 @@ bool OSARuntime::materializeLines() {
             return false;
         }
     }
-    free(sourceText);
+    if (sourceBorrowed) HeapReserve::giveBack(sourceText);
+    else                free(sourceText);
     sourceText = nullptr;
+    sourceBorrowed = false;
     free(lineOffsets);
     lineOffsets = nullptr;
     return true;
@@ -2617,8 +2621,10 @@ bool OSARuntime::materializeLines() {
 void OSARuntime::releaseLines() {
     delete[] lines;
     lines = nullptr;
-    free(sourceText);
+    if (sourceBorrowed) HeapReserve::giveBack(sourceText);
+    else                free(sourceText);
     sourceText = nullptr;
+    sourceBorrowed = false;
     free(lineOffsets);
     lineOffsets = nullptr;
     lineCount = 0;
@@ -2849,10 +2855,16 @@ bool OSARuntime::loadScript(String path) {
     }
 
     // One buffer for the whole file: a single allocation that is released
-    // after compiling, instead of one String per line. The boot-time reserve
-    // is lent out for the duration so a 20 KB script always fits.
-    HeapReserve::release("script load");
-    sourceText = (char*)malloc(sourceBytes + 1);
+    // after compiling, instead of one String per line. It is taken from the
+    // boot-time reserve *without* freeing that block, so the compiler's
+    // string pools cannot settle inside it and leave the region permanently
+    // split — HTTPS later needs it whole (see HeapReserve.h).
+    sourceText = (char*)HeapReserve::borrow(sourceBytes + 1, "script load");
+    sourceBorrowed = sourceText != nullptr;
+    if (!sourceText) {
+        HeapReserve::release("oversized script");
+        sourceText = (char*)malloc(sourceBytes + 1);
+    }
     if (!sourceText) {
         f.close();
         setError(0, "Not enough RAM to load OSA source");
@@ -2989,6 +3001,7 @@ bool OSARuntime::loadScript(String path) {
         setError(0, "Not enough RAM for the OSA interpreter");
         return false;
     }
+    // Only needed when the source was too large to borrow and release() ran.
     HeapReserve::reclaim();
 
     // Create per-app sandbox directory

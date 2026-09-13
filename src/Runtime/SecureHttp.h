@@ -30,13 +30,15 @@ namespace SecureHttp {
 static constexpr size_t TLS_MIN_FREE_BYTES  = 46U * 1024U;
 // mbedTLS allocates MBEDTLS_SSL_IN_BUFFER_LEN (16384 + record overhead) twice.
 static constexpr size_t TLS_MIN_BLOCK_BYTES = 17U * 1024U;
-// Parsing the pinned roots (RSA-4096) and verifying the chain needs more on
-// top — and, crucially, that work happens while both record buffers are still
-// held, so for a pinned host the *largest single region* has to hold both of
-// them plus this much. Two separate 17 KB blocks pass a naive probe and then
-// leave the RSA-4096 verification with nothing, which mbedTLS reports as
-// "certificate is not correctly signed by the trusted CA".
-static constexpr size_t TLS_PINNED_EXTRA_BYTES = 6U * 1024U;
+// Verification runs while both record buffers are held, so for a pinned host
+// the *largest single region* has to cover both of them plus room to work.
+// Two separate 17 KB blocks pass a naive probe and then leave the
+// verification with nothing, which mbedTLS reports as "certificate is not
+// correctly signed by the trusted CA". Since the leaf's own issuer is pinned
+// (see OpenOSTrustAnchors.h) that work is a single RSA-2048 signature check
+// rather than a walk through two RSA-4096 certificates, so the margin here is
+// small — but it must not be zero.
+static constexpr size_t TLS_PINNED_EXTRA_BYTES = 3U * 1024U;
 static constexpr size_t TLS_PINNED_REGION_BYTES =
     2U * TLS_MIN_BLOCK_BYTES + TLS_PINNED_EXTRA_BYTES;
 
@@ -75,9 +77,12 @@ bool memoryAvailable(String& why, bool pinned = false);
 const char* trustAnchorForHost(const String& host);
 
 // Connects to `host`:443 without verification, prints the certificate chain
-// the server presents and the result of verifying it against the pinned root
-// (mbedTLS verify flags). Called automatically after a pinned handshake is
-// rejected, and available over the USB serial command OPENOS:TLSDIAG.
+// the server presents and the result of verifying it against the pinned roots
+// (mbedTLS verify flags) — once with a free heap and once while two blocks
+// the size of the TLS record buffers are held, which is the situation the
+// real handshake verifies in. Available over the USB serial command
+// OPENOS:TLSDIAG; never run automatically, because it opens a second TLS
+// session.
 void diagnoseCertificateChain(const String& host);
 
 // Host part of an https:// URL without userinfo or port. Empty when invalid.

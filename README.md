@@ -207,11 +207,16 @@ The default manifest is
 It is a flat, maximum-4-KB JSON object signed with ECDSA P-256. The matching
 release public key is compiled into OpenOS, so authenticity comes from that
 signature and the signed firmware hash. On top of that the official host is
-pinned: `Runtime/OpenOSTrustAnchors.h` carries ISRG Root X1, the root that
-issues the GitHub raw CDN certificates, and mbedTLS verifies the chain and
-host name of `*.githubusercontent.com` against it before any byte of a
-manifest, catalog or firmware is accepted. The official URL accepts only the
-`stable` channel.
+pinned: `Runtime/OpenOSTrustAnchors.h` carries the three certificates that
+issue the GitHub raw CDN chain (Let's Encrypt YR1, ISRG Root YR, ISRG Root
+X1), and mbedTLS verifies the chain and host name of
+`*.githubusercontent.com` against them. Pinning the leaf's own issuer matters
+on this board: it makes verification a single RSA-2048 check instead of a
+walk through two RSA-4096 certificates, which does not fit in the heap left
+over once mbedTLS holds both record buffers. Pinning is defence in depth — if
+the pinned handshake is rejected the device logs it and retries unpinned,
+because the release signature, not the certificate, is what authenticates the
+content. The official URL accepts only the `stable` channel.
 
 Settings can store another HTTPS `info.json` URL in NVS, like OpenStore can
 change its catalog. Custom feeds may publish `stable`, `beta` or `dev`, but
