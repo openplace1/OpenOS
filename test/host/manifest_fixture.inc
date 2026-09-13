@@ -8,18 +8,18 @@ static const char* INFO_JSON =
     "  \"channel\": \"stable\",\n"
     "  \"target\": \"denky32-wroom32\",\n"
     "  \"partitionScheme\": \"openos-dual-v1\",\n"
-    "  \"name\": \"OpenOS 1.2.13\",\n"
-    "  \"version\": \"1.2.13\",\n"
-    "  \"versionCode\": 16,\n"
+    "  \"name\": \"OpenOS 1.2.14\",\n"
+    "  \"version\": \"1.2.14\",\n"
+    "  \"versionCode\": 17,\n"
     "  \"minUpdaterVersionCode\": 1,\n"
-    "  \"releaseType\": \"security\",\n"
-    "  \"description\": \"Przypiecie certyfikatu jest teraz proba warunkowa: urzadzenie podejmuje ja tylko wtedy, gdy ma na nia zapas pamieci, a w przeciwnym razie laczy sie bez przypiecia. Przypiety jest jeden certyfikat zamiast trzech. O autentycznosci decyduje podpis wydania i suma SHA-256, wiec aktualizacje dzialaja takze wtedy, gdy na przypiecie nie ma miejsca.\",\n"
+    "  \"releaseType\": \"patch\",\n"
+    "  \"description\": \"Wydanie sprawdzajace instalacje przez siec na urzadzeniu. Nie zmienia dzialania wzgledem 1.2.13.\",\n"
     "  \"publishedAt\": \"2026-09-13\",\n"
-    "  \"firmware\": \"firmware-16.bin\",\n"
-    "  \"size\": 1978816,\n"
-    "  \"sha256\": \"ff49ea9b98ee3afbe6404671c214359bb1e6b3d20d4105ef420eb0cdf0ba9500\",\n"
+    "  \"firmware\": \"firmware-17.bin\",\n"
+    "  \"size\": 1978832,\n"
+    "  \"sha256\": \"d201c913b88712fafa9492fced3a023904d63b34f44da4d1f0c8a8604f019ac1\",\n"
     "  \"keyId\": \"openos-release-2026-02\",\n"
-    "  \"signature\": \"MEQCIB0pE/rW5+ykRshx5FSeWKcWLMB3S5uZq3/bQHX4GI7OAiB7JCT1BzTjr5/3GMR/Sb4X6jTneKdb9KdeqXXq67xs/Q==\"\n"
+    "  \"signature\": \"MEUCIF9cwrdKQ3HYY5ROZxbhu8yPsbNqaJ7UDSmm36OvEtoJAiEAmkdJMxTN3aIXPy4c01S+gfGt9Y9HuAMMiY0kaZz8fx0=\"\n"
     "}\n";
 
 // canonical signature payload computed by the Python release tool rules
@@ -30,23 +30,23 @@ static const char* INFO_CANONICAL =
     "channel:6:stable\n"
     "target:15:denky32-wroom32\n"
     "partitionScheme:14:openos-dual-v1\n"
-    "name:13:OpenOS 1.2.13\n"
-    "version:6:1.2.13\n"
-    "versionCode:2:16\n"
+    "name:13:OpenOS 1.2.14\n"
+    "version:6:1.2.14\n"
+    "versionCode:2:17\n"
     "minUpdaterVersionCode:1:1\n"
-    "releaseType:8:security\n"
-    "description:342:Przypiecie certyfikatu jest teraz proba warunkowa: urzadzenie podejmuje ja tylko wtedy, gdy ma na nia zapas pamieci, a w przeciwnym razie laczy sie bez przypiecia. Przypiety jest jeden certyfikat zamiast trzech. O autentycznosci decyduje podpis wydania i suma SHA-256, wiec aktualizacje dzialaja takze wtedy, gdy na przypiecie nie ma miejsca.\n"
+    "releaseType:5:patch\n"
+    "description:96:Wydanie sprawdzajace instalacje przez siec na urzadzeniu. Nie zmienia dzialania wzgledem 1.2.13.\n"
     "publishedAt:10:2026-09-13\n"
-    "firmware:15:firmware-16.bin\n"
-    "size:7:1978816\n"
-    "sha256:64:ff49ea9b98ee3afbe6404671c214359bb1e6b3d20d4105ef420eb0cdf0ba9500\n"
+    "firmware:15:firmware-17.bin\n"
+    "size:7:1978832\n"
+    "sha256:64:d201c913b88712fafa9492fced3a023904d63b34f44da4d1f0c8a8604f019ac1\n"
     "keyId:22:openos-release-2026-02\n";
 
 // values the parser must extract from INFO_JSON
-static const char* INFO_EXPECTED_NAME = "OpenOS 1.2.13";
-static const char* INFO_EXPECTED_FIRMWARE = "firmware-16.bin";
+static const char* INFO_EXPECTED_NAME = "OpenOS 1.2.14";
+static const char* INFO_EXPECTED_FIRMWARE = "firmware-17.bin";
 static const char* INFO_EXPECTED_KEY_ID = "openos-release-2026-02";
 static const char* INFO_EXPECTED_TARGET = "denky32-wroom32";
 static const char* INFO_EXPECTED_PARTITION = "openos-dual-v1";
-static const unsigned INFO_EXPECTED_VERSION_CODE = 16u;
-static const unsigned INFO_EXPECTED_SIZE = 1978816u;
+static const unsigned INFO_EXPECTED_VERSION_CODE = 17u;
+static const unsigned INFO_EXPECTED_SIZE = 1978832u;
