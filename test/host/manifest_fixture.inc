@@ -8,18 +8,18 @@ static const char* INFO_JSON =
     "  \"channel\": \"stable\",\n"
     "  \"target\": \"denky32-wroom32\",\n"
     "  \"partitionScheme\": \"openos-dual-v1\",\n"
-    "  \"name\": \"OpenOS 1.5.0\",\n"
-    "  \"version\": \"1.5.0\",\n"
-    "  \"versionCode\": 23,\n"
+    "  \"name\": \"OpenOS 1.6.0\",\n"
+    "  \"version\": \"1.6.0\",\n"
+    "  \"versionCode\": 24,\n"
     "  \"minUpdaterVersionCode\": 1,\n"
     "  \"releaseType\": \"minor\",\n"
-    "  \"description\": \"Scene-based 3D in OSA SDK 5: d3.begin/d3.end/d3.present collect a whole frame into one depth-sorted scene, and d3.present renders it through a small band sprite, so the full 240x320 screen is drawn at 16-bit colour (20-22 fps with five shapes). New shapes: box, sphere, cylinder, cone, torus, plane and custom meshes, plus d3.view orbit and d3.light. Control Center is now a grid of tiles with icons. Compiled bytecode is cached on the SD card, so apps and the home screen start about twice as fast after the first run. Launching an app from Home zooms its tile into the screen. New widgets: ui.icon (27 built-in icons), ui.iconButton and a floating ui.tabbar. The heap reserve gives up only what a sprite needs, so 3D scenes and OPK extraction keep their memory. Try 3D Shapes from OpenStore.\",\n"
+    "  \"description\": \"Bluetooth Classic is gone: it took 740 KB of the 2 MB image and 80 KB of heap while on, so the image is now 1.3 MB and applications get about three times the free memory (110 KB with the reserve held). OSA SDK 6 adds raw building blocks: byte buffers (buf.*), TCP and UDP sockets (net.*, udp.*) and pixel access to the screen and sprites (screen.read/write, gfx.read/write) - the Cast Receiver app shows a computer screen with them. sys.info exposes hardware facts for the redesigned About device screen. Home has three pages of twelve tiles (swipe sideways, hold and drag to move, carry a tile to the edge for the next page); closing an app folds it into its tile colour and returns to Home in about 150 ms - script headers, bytecode loads and the card rescan were all made lazy or block-based. Scripts may now be 768 lines. Update Home, Control Center and Settings from OpenStore after installing.\",\n"
     "  \"publishedAt\": \"2026-09-13\",\n"
-    "  \"firmware\": \"firmware-23.bin\",\n"
-    "  \"size\": 2015136,\n"
-    "  \"sha256\": \"f48326d181ce3d9447f895a55f74f8fbfbfe7e7f2a592ac6e1d5379352306361\",\n"
+    "  \"firmware\": \"firmware-24.bin\",\n"
+    "  \"size\": 1290480,\n"
+    "  \"sha256\": \"1967a42956fddbf5201084b25a7bd3e07b69100a452ff85c88e97b4c97f6b614\",\n"
     "  \"keyId\": \"openos-release-2026-02\",\n"
-    "  \"signature\": \"MEUCIFSFzfhZmfHw6ZuR4dqjwydq6RiJtihYpWnQ89f2bedKAiEAnUdiTtAfrMbsO1MQ/m2a8oIag96dRWuRnUmEMd5UYvg=\"\n"
+    "  \"signature\": \"MEUCIQDfES2VvuojfW8tnTfM5DDU2/sN44jYicJms79gWJ7W7gIgbcL6zk8b1Re3f1L6uFuUY18aFDNt7iv/RsnIYCgPg5I=\"\n"
     "}\n";
 
 // canonical signature payload computed by the Python release tool rules
@@ -30,23 +30,23 @@ static const char* INFO_CANONICAL =
     "channel:6:stable\n"
     "target:15:denky32-wroom32\n"
     "partitionScheme:14:openos-dual-v1\n"
-    "name:12:OpenOS 1.5.0\n"
-    "version:5:1.5.0\n"
-    "versionCode:2:23\n"
+    "name:12:OpenOS 1.6.0\n"
+    "version:5:1.6.0\n"
+    "versionCode:2:24\n"
     "minUpdaterVersionCode:1:1\n"
     "releaseType:5:minor\n"
-    "description:793:Scene-based 3D in OSA SDK 5: d3.begin/d3.end/d3.present collect a whole frame into one depth-sorted scene, and d3.present renders it through a small band sprite, so the full 240x320 screen is drawn at 16-bit colour (20-22 fps with five shapes). New shapes: box, sphere, cylinder, cone, torus, plane and custom meshes, plus d3.view orbit and d3.light. Control Center is now a grid of tiles with icons. Compiled bytecode is cached on the SD card, so apps and the home screen start about twice as fast after the first run. Launching an app from Home zooms its tile into the screen. New widgets: ui.icon (27 built-in icons), ui.iconButton and a floating ui.tabbar. The heap reserve gives up only what a sprite needs, so 3D scenes and OPK extraction keep their memory. Try 3D Shapes from OpenStore.\n"
+    "description:899:Bluetooth Classic is gone: it took 740 KB of the 2 MB image and 80 KB of heap while on, so the image is now 1.3 MB and applications get about three times the free memory (110 KB with the reserve held). OSA SDK 6 adds raw building blocks: byte buffers (buf.*), TCP and UDP sockets (net.*, udp.*) and pixel access to the screen and sprites (screen.read/write, gfx.read/write) - the Cast Receiver app shows a computer screen with them. sys.info exposes hardware facts for the redesigned About device screen. Home has three pages of twelve tiles (swipe sideways, hold and drag to move, carry a tile to the edge for the next page); closing an app folds it into its tile colour and returns to Home in about 150 ms - script headers, bytecode loads and the card rescan were all made lazy or block-based. Scripts may now be 768 lines. Update Home, Control Center and Settings from OpenStore after installing.\n"
     "publishedAt:10:2026-09-13\n"
-    "firmware:15:firmware-23.bin\n"
-    "size:7:2015136\n"
-    "sha256:64:f48326d181ce3d9447f895a55f74f8fbfbfe7e7f2a592ac6e1d5379352306361\n"
+    "firmware:15:firmware-24.bin\n"
+    "size:7:1290480\n"
+    "sha256:64:1967a42956fddbf5201084b25a7bd3e07b69100a452ff85c88e97b4c97f6b614\n"
     "keyId:22:openos-release-2026-02\n";
 
 // values the parser must extract from INFO_JSON
-static const char* INFO_EXPECTED_NAME = "OpenOS 1.5.0";
-static const char* INFO_EXPECTED_FIRMWARE = "firmware-23.bin";
+static const char* INFO_EXPECTED_NAME = "OpenOS 1.6.0";
+static const char* INFO_EXPECTED_FIRMWARE = "firmware-24.bin";
 static const char* INFO_EXPECTED_KEY_ID = "openos-release-2026-02";
 static const char* INFO_EXPECTED_TARGET = "denky32-wroom32";
 static const char* INFO_EXPECTED_PARTITION = "openos-dual-v1";
-static const unsigned INFO_EXPECTED_VERSION_CODE = 23u;
-static const unsigned INFO_EXPECTED_SIZE = 2015136u;
+static const unsigned INFO_EXPECTED_VERSION_CODE = 24u;
+static const unsigned INFO_EXPECTED_SIZE = 1290480u;
