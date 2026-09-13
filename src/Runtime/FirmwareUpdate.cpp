@@ -85,6 +85,15 @@ private:
 };
 
 static bool downloadManifest(String& document) {
+    // Claim the response buffer first. memoryAvailable() hands the reserved
+    // block to mbedTLS, and anything allocated after that lands inside the
+    // region: the manifest text stayed there once the session closed and left
+    // the block permanently split, so the next transfer found ~35 KB instead
+    // of 45 KB and could not fit two TLS record buffers.
+    BoundedStringStream output(MANIFEST_MAX_BYTES);
+    if (!output.reserve(MANIFEST_MAX_BYTES))
+        return fail("Not enough RAM for OTA manifest");
+
     SecureHttp::prepareMemory("OTA", "manifest HTTPS");
     SecureHttp::RadioAwake awake;
     String why;
@@ -113,11 +122,6 @@ static bool downloadManifest(String& document) {
     if (declared > (int)MANIFEST_MAX_BYTES) {
         http.end();
         return fail("OTA manifest exceeds 4 KB");
-    }
-    BoundedStringStream output(MANIFEST_MAX_BYTES);
-    if (!output.reserve(declared > 0 ? (size_t)declared : 768)) {
-        http.end();
-        return fail("Not enough RAM for OTA manifest");
     }
     int received = http.writeToStream(&output);
     http.end();
@@ -256,6 +260,7 @@ bool install(ProgressCallback progress, void* context) {
     if (!next || s_manifest.size > next->size)
         return fail("Firmware does not fit the inactive OTA slot");
 
+    HeapReserve::reclaim();
     SecureHttp::prepareMemory("OTA", "firmware HTTPS");
     SecureHttp::RadioAwake awake;
     String why;

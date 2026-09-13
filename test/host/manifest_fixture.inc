@@ -8,18 +8,18 @@ static const char* INFO_JSON =
     "  \"channel\": \"stable\",\n"
     "  \"target\": \"denky32-wroom32\",\n"
     "  \"partitionScheme\": \"openos-dual-v1\",\n"
-    "  \"name\": \"OpenOS 1.2.10\",\n"
-    "  \"version\": \"1.2.10\",\n"
-    "  \"versionCode\": 13,\n"
+    "  \"name\": \"OpenOS 1.2.11\",\n"
+    "  \"version\": \"1.2.11\",\n"
+    "  \"versionCode\": 14,\n"
     "  \"minUpdaterVersionCode\": 1,\n"
-    "  \"releaseType\": \"minor\",\n"
-    "  \"description\": \"Nowe ota.checked() pozwala ekranowi aktualizacji pokazac wynik sprawdzenia takze po wyjsciu z Ustawien i powrocie - wczesniej przycisk instalacji opisany byl jako niedostepny, mimo ze aktualizacja byla gotowa. Wymaga zaktualizowanego pakietu Ustawien.\",\n"
+    "  \"releaseType\": \"patch\",\n"
+    "  \"description\": \"Bufor na pobierany manifest i katalog jest rezerwowany zanim blok pamieci trafi do mbedTLS. Wczesniej tekst ladowal w srodku tego obszaru i po zamknieciu sesji zostawial w nim dziure, przez co kolejne pobranie mialo juz tylko 35 KB ciaglej pamieci i nie miescilo dwoch buforow TLS - to blokowalo pobranie obrazu firmware.\",\n"
     "  \"publishedAt\": \"2026-09-13\",\n"
-    "  \"firmware\": \"firmware-13.bin\",\n"
-    "  \"size\": 1982864,\n"
-    "  \"sha256\": \"d6bae2c8a7da0ec1deec76dedc51dbd455e6ecaecdb0a4c2cef73dd5f48cd2fa\",\n"
+    "  \"firmware\": \"firmware-14.bin\",\n"
+    "  \"size\": 1982896,\n"
+    "  \"sha256\": \"b621bb2befcc8878c0820741074599871725275e6ce5939f3d32f8bbf813a08e\",\n"
     "  \"keyId\": \"openos-release-2026-02\",\n"
-    "  \"signature\": \"MEUCIDun+sOijS3cV0WEcX9os8vUn3rNjUZZYiVZYavDCVhoAiEAqqUEoXyS/cGKZpwycIAW9m7UCNDJ3dne3Xlr1FmXCqo=\"\n"
+    "  \"signature\": \"MEUCICj9fV11NzraPo6z4Vo4SwUPCFheMtqkqgZ2bo9VH+hRAiEAzwc+uv2epzr2P1IR2ePy3PVKk2F8dyBbG6CNr2XC8u0=\"\n"
     "}\n";
 
 // canonical signature payload computed by the Python release tool rules
@@ -30,23 +30,23 @@ static const char* INFO_CANONICAL =
     "channel:6:stable\n"
     "target:15:denky32-wroom32\n"
     "partitionScheme:14:openos-dual-v1\n"
-    "name:13:OpenOS 1.2.10\n"
-    "version:6:1.2.10\n"
-    "versionCode:2:13\n"
+    "name:13:OpenOS 1.2.11\n"
+    "version:6:1.2.11\n"
+    "versionCode:2:14\n"
     "minUpdaterVersionCode:1:1\n"
-    "releaseType:5:minor\n"
-    "description:251:Nowe ota.checked() pozwala ekranowi aktualizacji pokazac wynik sprawdzenia takze po wyjsciu z Ustawien i powrocie - wczesniej przycisk instalacji opisany byl jako niedostepny, mimo ze aktualizacja byla gotowa. Wymaga zaktualizowanego pakietu Ustawien.\n"
+    "releaseType:5:patch\n"
+    "description:321:Bufor na pobierany manifest i katalog jest rezerwowany zanim blok pamieci trafi do mbedTLS. Wczesniej tekst ladowal w srodku tego obszaru i po zamknieciu sesji zostawial w nim dziure, przez co kolejne pobranie mialo juz tylko 35 KB ciaglej pamieci i nie miescilo dwoch buforow TLS - to blokowalo pobranie obrazu firmware.\n"
     "publishedAt:10:2026-09-13\n"
-    "firmware:15:firmware-13.bin\n"
-    "size:7:1982864\n"
-    "sha256:64:d6bae2c8a7da0ec1deec76dedc51dbd455e6ecaecdb0a4c2cef73dd5f48cd2fa\n"
+    "firmware:15:firmware-14.bin\n"
+    "size:7:1982896\n"
+    "sha256:64:b621bb2befcc8878c0820741074599871725275e6ce5939f3d32f8bbf813a08e\n"
     "keyId:22:openos-release-2026-02\n";
 
 // values the parser must extract from INFO_JSON
-static const char* INFO_EXPECTED_NAME = "OpenOS 1.2.10";
-static const char* INFO_EXPECTED_FIRMWARE = "firmware-13.bin";
+static const char* INFO_EXPECTED_NAME = "OpenOS 1.2.11";
+static const char* INFO_EXPECTED_FIRMWARE = "firmware-14.bin";
 static const char* INFO_EXPECTED_KEY_ID = "openos-release-2026-02";
 static const char* INFO_EXPECTED_TARGET = "denky32-wroom32";
 static const char* INFO_EXPECTED_PARTITION = "openos-dual-v1";
-static const unsigned INFO_EXPECTED_VERSION_CODE = 13u;
-static const unsigned INFO_EXPECTED_SIZE = 1982864u;
+static const unsigned INFO_EXPECTED_VERSION_CODE = 14u;
+static const unsigned INFO_EXPECTED_SIZE = 1982896u;

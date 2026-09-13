@@ -1148,6 +1148,12 @@ static void recoverRoot(const String& root) {
 }
 
 static bool downloadCatalogDocument(String& document) {
+    // As in FirmwareUpdate: take the response buffer before the reserved
+    // block is handed to mbedTLS, so the catalog text does not sit inside
+    // that region and split it once the session closes.
+    LimitedStringStream output(CATALOG_MAX_BYTES);
+    if (!output.begin(8192)) return fail("Not enough RAM for store catalog");
+
     // Keep TLS/HTTP objects inside this helper so their buffers are gone before
     // JSON validation allocates temporary IDs and before an OPK download starts.
     SecureHttp::prepareMemory("STORE", "catalog HTTPS");
@@ -1180,11 +1186,6 @@ static bool downloadCatalogDocument(String& document) {
     if (declared > (int)CATALOG_MAX_BYTES) {
         http.end();
         return fail("Store catalog exceeds 24 KB");
-    }
-    LimitedStringStream output(CATALOG_MAX_BYTES);
-    if (!output.begin(declared > 0 ? (size_t)declared : 1024)) {
-        http.end();
-        return fail("Not enough RAM for store catalog");
     }
     int received = http.writeToStream(&output);
     http.end();
