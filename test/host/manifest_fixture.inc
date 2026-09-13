@@ -8,18 +8,18 @@ static const char* INFO_JSON =
     "  \"channel\": \"stable\",\n"
     "  \"target\": \"denky32-wroom32\",\n"
     "  \"partitionScheme\": \"openos-dual-v1\",\n"
-    "  \"name\": \"OpenOS 1.3.1\",\n"
-    "  \"version\": \"1.3.1\",\n"
-    "  \"versionCode\": 19,\n"
+    "  \"name\": \"OpenOS 1.3.2\",\n"
+    "  \"version\": \"1.3.2\",\n"
+    "  \"versionCode\": 20,\n"
     "  \"minUpdaterVersionCode\": 1,\n"
     "  \"releaseType\": \"patch\",\n"
-    "  \"description\": \"Wydanie sprawdzajace instalacje przez siec. Nie zmienia dzialania wzgledem 1.3.0, ktore przenioslo pobieranie aktualizacji na start urzadzenia.\",\n"
+    "  \"description\": \"Limit bezczynnosci przy pobieraniu obrazu podniesiony z 15 do 60 sekund. Kazde zapisane 4 KB kasuje sektor pamieci flash, a okno odbiorcze TCP ma niecale 6 KB, wiec transfer z natury idzie skokowo i krotki limit przerywal poprawne pobieranie. Postep jest teraz raportowany na port szeregowy.\",\n"
     "  \"publishedAt\": \"2026-09-13\",\n"
-    "  \"firmware\": \"firmware-19.bin\",\n"
-    "  \"size\": 1981552,\n"
-    "  \"sha256\": \"d2ce93ebed86f83a94a5e42853781cfb30aae523d61687fe6184af770b81841a\",\n"
+    "  \"firmware\": \"firmware-20.bin\",\n"
+    "  \"size\": 1981696,\n"
+    "  \"sha256\": \"cfe2a8f3dd0e6a08bfa33c2383ad0ec72bec685015a7466373973f3c4eaa45c9\",\n"
     "  \"keyId\": \"openos-release-2026-02\",\n"
-    "  \"signature\": \"MEUCIQDMQcR6eo16uesKx+6a+dk8SZYcQTf9UVdEekvhNZO4/gIgN7KE+broL7/rVMXKdcyhlFE4/VaM9F3+3ezVx8HhUTQ=\"\n"
+    "  \"signature\": \"MEUCIQDdcVhArulzL6geqJyryadq86w2Ka8yQ+BTQUm2MDQnJgIgQApgBQjA0IX/wfoH+5x1ZdzPBScg4jsWpkcMrBgqpI4=\"\n"
     "}\n";
 
 // canonical signature payload computed by the Python release tool rules
@@ -30,23 +30,23 @@ static const char* INFO_CANONICAL =
     "channel:6:stable\n"
     "target:15:denky32-wroom32\n"
     "partitionScheme:14:openos-dual-v1\n"
-    "name:12:OpenOS 1.3.1\n"
-    "version:5:1.3.1\n"
-    "versionCode:2:19\n"
+    "name:12:OpenOS 1.3.2\n"
+    "version:5:1.3.2\n"
+    "versionCode:2:20\n"
     "minUpdaterVersionCode:1:1\n"
     "releaseType:5:patch\n"
-    "description:143:Wydanie sprawdzajace instalacje przez siec. Nie zmienia dzialania wzgledem 1.3.0, ktore przenioslo pobieranie aktualizacji na start urzadzenia.\n"
+    "description:291:Limit bezczynnosci przy pobieraniu obrazu podniesiony z 15 do 60 sekund. Kazde zapisane 4 KB kasuje sektor pamieci flash, a okno odbiorcze TCP ma niecale 6 KB, wiec transfer z natury idzie skokowo i krotki limit przerywal poprawne pobieranie. Postep jest teraz raportowany na port szeregowy.\n"
     "publishedAt:10:2026-09-13\n"
-    "firmware:15:firmware-19.bin\n"
-    "size:7:1981552\n"
-    "sha256:64:d2ce93ebed86f83a94a5e42853781cfb30aae523d61687fe6184af770b81841a\n"
+    "firmware:15:firmware-20.bin\n"
+    "size:7:1981696\n"
+    "sha256:64:cfe2a8f3dd0e6a08bfa33c2383ad0ec72bec685015a7466373973f3c4eaa45c9\n"
     "keyId:22:openos-release-2026-02\n";
 
 // values the parser must extract from INFO_JSON
-static const char* INFO_EXPECTED_NAME = "OpenOS 1.3.1";
-static const char* INFO_EXPECTED_FIRMWARE = "firmware-19.bin";
+static const char* INFO_EXPECTED_NAME = "OpenOS 1.3.2";
+static const char* INFO_EXPECTED_FIRMWARE = "firmware-20.bin";
 static const char* INFO_EXPECTED_KEY_ID = "openos-release-2026-02";
 static const char* INFO_EXPECTED_TARGET = "denky32-wroom32";
 static const char* INFO_EXPECTED_PARTITION = "openos-dual-v1";
-static const unsigned INFO_EXPECTED_VERSION_CODE = 19u;
-static const unsigned INFO_EXPECTED_SIZE = 1981552u;
+static const unsigned INFO_EXPECTED_VERSION_CODE = 20u;
+static const unsigned INFO_EXPECTED_SIZE = 1981696u;

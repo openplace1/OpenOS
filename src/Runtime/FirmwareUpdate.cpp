@@ -303,7 +303,7 @@ static bool performInstall(const String& url, uint32_t size,
     WiFiClientSecure client;
     SecureHttp::Request request;
     request.attempts = 2;
-    request.readTimeoutMs = 20000;
+    request.readTimeoutMs = 30000;
     int status = SecureHttp::get(http, client, url, request, why);
     if (status != HTTP_CODE_OK) {
         String message = status < 0
@@ -335,6 +335,8 @@ static bool performInstall(const String& url, uint32_t size,
     WiFiClient* stream = http.getStreamPtr();
     size_t received = 0;
     uint32_t lastDataAt = millis();
+    uint32_t startedAt = millis();
+    size_t loggedAt = 0;
     String transferError;
     while (received < size) {
         int availableBytes = stream ? stream->available() : 0;
@@ -343,7 +345,10 @@ static bool performInstall(const String& url, uint32_t size,
                 transferError = "Firmware transfer ended early";
                 break;
             }
-            if ((uint32_t)(millis() - lastDataAt) > 15000U) {
+            // Each 4 KB written erases a flash sector (tens of ms) and the
+            // receive window is only ~5.7 KB, so the stream is stop-and-go by
+            // design; a stall has to be long to mean anything. 15 s was not.
+            if ((uint32_t)(millis() - lastDataAt) > 60000U) {
                 transferError = "Firmware transfer timed out";
                 break;
             }
@@ -366,6 +371,14 @@ static bool performInstall(const String& url, uint32_t size,
             break;
         }
         received += (size_t)count;
+        // Every tenth, so a failed transfer says how far it got.
+        if (received - loggedAt >= size / 10 || received == size) {
+            loggedAt = received;
+            uint32_t elapsed = millis() - startedAt;
+            Serial.printf("[OTA] %u/%u B after %u s free=%u\n", (unsigned)received,
+                          (unsigned)size, (unsigned)(elapsed / 1000U),
+                          (unsigned)ESP.getFreeHeap());
+        }
         if (progress) progress("Installing", received, size, context);
         yield();
     }

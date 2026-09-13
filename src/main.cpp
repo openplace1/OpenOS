@@ -467,7 +467,7 @@ static void drawStagedProgress(const char* phase, size_t completed,
     if (percent > 100) percent = 100;
     String nextPhase = phase ? phase : "Updating";
     bool phaseChanged = nextPhase != lastPhase;
-    if (!phaseChanged && percent == lastPercent) return;
+    if (!phaseChanged && (percent == lastPercent || (percent % 2) != 0)) return;
     if (phaseChanged) {
         lastPhase = nextPhase;
         tft.fillScreen(TFT_BLACK);
