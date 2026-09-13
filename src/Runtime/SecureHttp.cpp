@@ -315,8 +315,10 @@ int get(HTTPClient& http, WiFiClientSecure& client, const String& url,
         // release signature is what authenticates the content.
         bool wantPin = anchor != nullptr && !pinRejected;
         if (wantPin && !memoryAvailable(why, true)) {
-            Serial.printf("[HTTPS] %s: not enough contiguous RAM to verify the "
-                          "pinned chain, continuing unpinned (%s)\n",
+            // Not an error: the pin is hardening, the release signature is
+            // what authenticates the content.
+            Serial.printf("[HTTPS] %s: too little RAM to verify the pinned "
+                          "certificate, continuing unpinned (%s)\n",
                           host.c_str(), why.c_str());
             pinRejected = true;
             wantPin = false;

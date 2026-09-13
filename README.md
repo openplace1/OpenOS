@@ -219,14 +219,16 @@ downloaded manifest or catalog reserves its buffer *before* the block is
 released. Both were real bugs: compiling one application, or one update
 check, used to shrink the reserve permanently and the next transfer failed.
 
-**Verification runs while the buffers are held.** The certificate chain is
-checked with both record buffers still allocated, so what is left of the
-region has to cover it. Reaching a pinned root through two RSA-4096
-signatures did not fit; pinning the server certificate's own issuer (see
-`Runtime/OpenOSTrustAnchors.h`) reduces it to one RSA-2048 check. When it
-still does not fit, or the chain is rejected, `SecureHttp` says so and
-continues unpinned — the release signature is what authenticates content,
-and a hardening layer must not be able to stop updates.
+**Verification runs while the buffers are held.** The trust store is parsed
+and kept for the whole handshake, and the chain is checked with both record
+buffers still allocated. On this board that fits with roughly 72 KB free and
+does not at 66 KB, which is what an update check from inside a running
+application has. So pinning is attempted only when the headroom is there:
+one certificate is pinned rather than a chain of roots
+(`Runtime/OpenOSTrustAnchors.h`), and when it does not fit — or the chain is
+rejected — `SecureHttp` logs why and continues unpinned. The release
+signature is what authenticates content; a hardening layer must not be able
+to stop updates.
 
 Failures in this area are reported with the free heap and the largest block
 at the moment they happened, because "certificate verification failed" and

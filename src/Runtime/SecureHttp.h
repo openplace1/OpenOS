@@ -38,9 +38,14 @@ static constexpr size_t TLS_MIN_BLOCK_BYTES = 17U * 1024U;
 // (see OpenOSTrustAnchors.h) that work is a single RSA-2048 signature check
 // rather than a walk through two RSA-4096 certificates, so the margin here is
 // small — but it must not be zero.
-static constexpr size_t TLS_PINNED_EXTRA_BYTES = 3U * 1024U;
+// Measured on hardware: a pinned handshake completes with about 72 KB free
+// and fails, with assorted mbedTLS errors, at about 66 KB — the trust store
+// and the verification are parsed and held alongside both record buffers.
+// Rather than let that surface as a certificate error, SecureHttp only
+// attempts the pin when this much is free and skips it otherwise.
+static constexpr size_t TLS_PINNED_EXTRA_BYTES = 24U * 1024U;
 static constexpr size_t TLS_PINNED_REGION_BYTES =
-    2U * TLS_MIN_BLOCK_BYTES + TLS_PINNED_EXTRA_BYTES;
+    2U * TLS_MIN_BLOCK_BYTES + 3U * 1024U;
 
 // Keeps the Wi-Fi modem out of power save while the object lives. Modem
 // sleep adds up to ~100 ms per round trip and, with some access points,
