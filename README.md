@@ -872,7 +872,9 @@ end
 
 The last eight banners are kept; Control Center lists them. System scripts
 read them with `notify.count()`, `notify.text(i)` (newest first),
-`notify.age(i)` (seconds) and `notify.clear()`.
+`notify.age(i)` (seconds) and `notify.clear()`; `notify.requested()` is `1`
+once when Control Center was reopened by a second swipe from the top edge,
+which the script answers by showing the list straight away.
 
 ### Buffers, sockets and pixels
 
