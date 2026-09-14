@@ -28,6 +28,7 @@ HomeTile& HomeTile::operator=(const HomeTile& other) {
     freeChildren();
     name       = other.name;
     scriptPath = other.scriptPath;
+    icon       = other.icon;
     color      = other.color;
     isFolder   = other.isFolder;
     children   = copiedChildren;
@@ -45,6 +46,7 @@ HomeTile& HomeTile::operator=(HomeTile&& other) noexcept {
     freeChildren();
     name       = static_cast<String&&>(other.name);
     scriptPath = static_cast<String&&>(other.scriptPath);
+    icon       = static_cast<String&&>(other.icon);
     color      = other.color;
     isFolder   = other.isFolder;
     children   = other.children;
@@ -102,7 +104,8 @@ Home::Home(TFT_eSPI* tftInstance, XPT2046_Touchscreen* tsInstance) {
     ts  = tsInstance;
 }
 
-void Home::addScript(const String& scriptPath, const String& displayName, uint16_t color) {
+void Home::addScript(const String& scriptPath, const String& displayName, uint16_t color,
+                     const String& icon) {
     // Home is rescanned whenever it is reopened so apps copied to the SD card
     // become available without a reboot.  Do not add a second tile for an app
     // that is already on the grid or stored inside a folder.
@@ -119,6 +122,7 @@ void Home::addScript(const String& scriptPath, const String& displayName, uint16
     HomeTile& t = tiles[appCount++];
     t.name       = displayName;
     t.scriptPath = scriptPath;
+    t.icon       = icon;
     t.color      = color;
     t.isFolder   = false;
 }

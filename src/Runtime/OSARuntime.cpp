@@ -632,7 +632,7 @@ static void osaDrawRoundRect4(TFT_eSPI* canvas, int x, int y, int w, int h,
 }
 
 // System accent colours shared by the popup and the ui.* widgets.
-static inline uint16_t osaBlue()  { return 0x03DF; }   // 0, 122, 255
+static inline uint16_t osaBlue()  { return Theme::accent(); }
 static inline uint16_t osaRed()   { return 0xF9C6; }   // 255, 59, 48
 static inline uint16_t osaGreen() { return 0x362B; }   // 52, 199, 89
 static inline uint16_t osaSoftFill() {
@@ -845,6 +845,27 @@ static bool osaDrawIcon(TFT_eSPI* c, const String& name, int cx, int cy,
         osaStroke(c, fx - hx, fy - hy, fx, fy, w, color, bg);
         osaStroke(c, fx + hx, fy - hy, fx, fy, w, color, bg);
         osaStroke(c, fx, fy, fx, fy + r, w, color, bg);
+        return true;
+    }
+    if (name == "cloud" || name == "rain" || name == "snow") {
+        // Three lobes on a flat base; rain adds slanted strokes below,
+        // snow three dots.
+        float baseY = fy + (name == "cloud" ? r * 0.35f : r * 0.05f);
+        float scale = name == "cloud" ? 1.0f : 0.8f;
+        c->fillSmoothCircle(cx - (int)(r * 0.45f * scale), (int)(baseY - r * 0.3f * scale), (int)(r * 0.38f * scale), color, bg);
+        c->fillSmoothCircle(cx + (int)(r * 0.05f * scale), (int)(baseY - r * 0.55f * scale), (int)(r * 0.5f * scale), color, bg);
+        c->fillSmoothCircle(cx + (int)(r * 0.5f * scale), (int)(baseY - r * 0.25f * scale), (int)(r * 0.36f * scale), color, bg);
+        c->fillSmoothRoundRect(cx - (int)(r * 0.8f * scale), (int)(baseY - r * 0.3f * scale),
+                               (int)(r * 1.6f * scale), (int)(r * 0.32f * scale), 3, color, bg);
+        if (name == "rain") {
+            for (int i = -1; i <= 1; ++i) {
+                float x = fx + (float)i * r * 0.4f;
+                osaStroke(c, x + r * 0.1f, baseY + r * 0.15f, x - r * 0.1f, baseY + r * 0.6f, w * 0.8f, color, bg);
+            }
+        } else if (name == "snow") {
+            for (int i = -1; i <= 1; ++i)
+                c->fillSmoothCircle(cx + (int)((float)i * r * 0.4f), (int)(baseY + r * 0.4f), (int)(w * 0.7f), color, bg);
+        }
         return true;
     }
     if (name == "note" || name == "file") {
@@ -2108,10 +2129,51 @@ static int       g_loopDepth = 0;
 static bool compileLineRange(OSARuntime* rt, int from, int to);
 static bool compileLineAt(OSARuntime* rt, int& i, int rangeEnd);
 
+// `#const NAME value` header lines. Collected before compiling; an
+// identifier that matches one is emitted as its literal instead of a
+// variable read, so scripts can name their magic numbers at no runtime cost.
+static const int OSA_MAX_CONSTS = 24;
+struct OsaConst { String name; String value; bool isNum; };
+static OsaConst g_consts[OSA_MAX_CONSTS];
+static int g_constCount = 0;
+
+static void collectConsts(OSARuntime* rt) {
+    g_constCount = 0;
+    for (int i = 0; i < rt->sourceLineCount() && g_constCount < OSA_MAX_CONSTS; i++) {
+        String t = rt->lineText(i);
+        if (t.length() == 0) continue;
+        if (t[0] != '#') break;            // header block is over
+        if (!t.startsWith("#const ")) continue;
+        String rest = t.substring(7); rest.trim();
+        int space = rest.indexOf(' ');
+        if (space <= 0) continue;
+        String name = rest.substring(0, space);
+        String value = rest.substring(space + 1); value.trim();
+        if (value.length() == 0) continue;
+        OsaConst& c = g_consts[g_constCount];
+        c.name = name;
+        if (value.startsWith("\"") && value.endsWith("\"") && value.length() >= 2) {
+            c.value = value.substring(1, value.length() - 1);
+            c.isNum = false;
+        } else {
+            c.value = value;
+            c.isNum = true;
+        }
+        ++g_constCount;
+    }
+}
+
+static const OsaConst* findConst(const String& name) {
+    for (int i = 0; i < g_constCount; i++)
+        if (g_consts[i].name == name) return &g_consts[i];
+    return nullptr;
+}
+
 bool OSARuntime::compile() {
     bc.clear();
     g_loopDepth = 0;
     lastCompileError = OSA_BCERR_NONE;
+    collectConsts(this);
     auto failCompile = [&](uint8_t fallback) -> bool {
         lastCompileError = bc.buildError != OSA_BCERR_NONE
                          ? bc.buildError : fallback;
@@ -2634,6 +2696,17 @@ static bool compPri(OSARuntime* rt, Lex& lex) {
                 if (!emit4(rt->bc, OP_CALL_BUILTIN, (int16_t)idx, (uint8_t)argc)) return false;
             }
             return true;
+        }
+        // A header constant?
+        if (const OsaConst* c = findConst(t.str)) {
+            if (c->isNum) {
+                int idx = rt->bcAddNum(c->value.toDouble());
+                if (idx < 0) return false;
+                return emit3(rt->bc, OP_PUSH_NUM, (int16_t)idx);
+            }
+            int idx = rt->bcAddStr(c->value);
+            if (idx < 0) return false;
+            return emit3(rt->bc, OP_PUSH_STR, (int16_t)idx);
         }
         // Plain variable read.
         int idx = rt->bcAddName(t.str);
@@ -3187,6 +3260,7 @@ bool OSARuntime::checkExitGesture() {
         while (ts->touched()) yield();
         swipeHomeStartY = -1;
         exitFlag = true;
+        exitedBySwipe = true;
         return true;
     }
     return false;
@@ -3279,6 +3353,7 @@ bool OSARuntime::loadScript(String path) {
     swipeHomeStartY = -1;
     swipeOverlayStartY = -1;
     wantsOverlay = false;
+    exitedBySwipe = false;
     vmHalted = false;
     vmCallDepth = 0;
     directBuiltinArgs = nullptr;
@@ -4624,7 +4699,27 @@ uint16_t OSARuntime::readIconColorFromFile(const String& path, uint16_t fallback
     return fallback;
 }
 
+String OSARuntime::readAppIconFromFile(const String& path) {
+    String lower = path; lower.toLowerCase();
+    if (lower.endsWith(".osac")) return String();
+    HeaderBlock header;
+    if (!header.load(path)) return String();
+    String raw;
+    while (header.next(raw)) {
+        if (!raw.startsWith("#appIcon")) continue;
+        String v = raw.substring(8); v.trim();
+        if (v.startsWith("\"")) v = v.substring(1);
+        if (v.endsWith("\""))   v = v.substring(0, v.length() - 1);
+        v.trim();
+        return v.length() <= 16 ? v : String();
+    }
+    return String();
+}
+
 bool OSARuntime::checkPerm(uint8_t bit, const String& label, const String& detail) {
+    // System scripts (Home, lock screen, Settings, Control Center...) are
+    // trusted with every permission; only user apps are asked.
+    if (isException) return true;
     String key    = permKey();
     int    stored = Config::getInt(key, 0);
     uint8_t granted = stored & 0x0F;
@@ -5591,7 +5686,9 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
                          feature == "widgets" || feature == "smooth" ||
                          feature == "d3.scene" || feature == "icons" ||
                          feature == "tabbar" || feature == "net" ||
-                         feature == "buffers" || feature == "pixels";
+                         feature == "buffers" || feature == "pixels" ||
+                         feature == "accent" || feature == "appicon" ||
+                         feature == "const" || feature == "notify.history";
         return OSAVal(available ? 1.0 : 0.0);
     }
     if (IS("openos.version"))
@@ -6740,7 +6837,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         const uint16_t bar = dark ? Theme::c(44, 44, 50) : Theme::c(246, 246, 250);
         const uint16_t edge = dark ? Theme::c(62, 62, 70) : Theme::c(214, 214, 222);
         const uint16_t ink = dark ? Theme::c(200, 200, 208) : Theme::c(90, 90, 100);
-        const uint16_t tint = dark ? Theme::c(32, 60, 96) : Theme::c(210, 228, 255);
+        const uint16_t tint = osaMix565(osaBlue(), bar, dark ? 0.62f : 0.78f);
         // A soft shadow under the bar, then the bar itself.
         canvas->fillSmoothRoundRect(barX + 1, barY + 3, barW, barH, barH / 2,
                                     dark ? Theme::c(10, 10, 12) : Theme::c(200, 200, 208));
@@ -7732,6 +7829,14 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         Config::save();
         return OSAVal();
     }
+    // sys.accent(c565) — 0 restores the default blue.
+    if (IS("sys.accent")) {
+        if (!needException("sys.accent")) return OSAVal();
+        sysAccent = (uint16_t)iN(0);
+        Config::setInt("accent", (int)sysAccent);
+        Config::save();
+        return OSAVal();
+    }
     if (IS("sys.theme")) {
         if (!needException("sys.theme")) return OSAVal();
         sysTheme = iN(0) ? 1 : 0;
@@ -7753,7 +7858,34 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     }
     if (IS("sys.notify")) {
         if (!needException("sys.notify")) return OSAVal();
-        Toast::show(tft, S(0));
+        Toast::show(tft, S(0), (uint32_t)iN(1, (int)Toast::DURATION_MS));
+        return OSAVal();
+    }
+    // ui.toast(text, [ms]) — notify() with a chosen duration, 0.3-15 s.
+    if (IS("ui.toast")) {
+        if (!checkPerm(OSA_PERM_NOTIFY, "Send Notifications",
+                       "Show system notification banners"))
+            return OSAVal();
+        Toast::show(tft, S(0), (uint32_t)max(0, iN(1, (int)Toast::DURATION_MS)));
+        return OSAVal();
+    }
+    // notify.count() / notify.text(i) / notify.age(i) / notify.clear() — the
+    // last eight banners, newest first; system apps only (Control Center).
+    if (IS("notify.count")) {
+        if (!needException("notify.count")) return OSAVal(0.0);
+        return OSAVal((double)Toast::historyCount());
+    }
+    if (IS("notify.text")) {
+        if (!needException("notify.text")) return OSAVal("");
+        return OSAVal(Toast::historyText(iN(0)));
+    }
+    if (IS("notify.age")) {
+        if (!needException("notify.age")) return OSAVal(0.0);
+        return OSAVal((double)(Toast::historyAgeMs(iN(0)) / 1000U));
+    }
+    if (IS("notify.clear")) {
+        if (!needException("notify.clear")) return OSAVal();
+        Toast::clearHistory();
         return OSAVal();
     }
     // app.launch(absPath) — unwinds this script and asks the host to load
@@ -8680,6 +8812,67 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         if (i < 0 || i >= home.appCount) return OSAVal(0.0);
         return OSAVal((double)home.tiles[i].color);
     }
+    // home.sortedCount(query) / home.sortedAt(query, k, want) — every app on
+    // every page and inside every folder whose name contains `query`
+    // (case-insensitive; "" for all), in alphabetical order. want: 0 name,
+    // 1 path, 2 colour, 3 icon. The drawer is built on these.
+    if (IS("home.sortedCount") || IS("home.sortedAt")) {
+        String query = S(0);
+        query.toLowerCase();
+        struct Ref { uint8_t tile; int8_t child; };
+        Ref refs[Home::MAX_APPS * 4];
+        int count = 0;
+        auto consider = [&](int i, int j, const String& tileName) {
+            if (count >= (int)(sizeof(refs) / sizeof(refs[0]))) return;
+            if (query.length() > 0) {
+                String lower = tileName;
+                lower.toLowerCase();
+                if (lower.indexOf(query) < 0) return;
+            }
+            refs[count++] = { (uint8_t)i, (int8_t)j };
+        };
+        for (int i = 0; i < home.appCount; ++i) {
+            const HomeTile& tile = home.tiles[i];
+            if (tile.isFolder) {
+                for (int j = 0; j < tile.childCount; ++j) consider(i, j, tile.children[j].name);
+            } else {
+                consider(i, -1, tile.name);
+            }
+        }
+        if (IS("home.sortedCount")) return OSAVal((double)count);
+        int k = iN(1), want = iN(2);
+        if (k < 0 || k >= count) return want == 2 ? OSAVal(0.0) : OSAVal("");
+        auto nameOf = [&](const Ref& r) -> const String& {
+            return r.child < 0 ? home.tiles[r.tile].name
+                               : home.tiles[r.tile].children[r.child].name;
+        };
+        // Selection: the k-th smallest without sorting the whole list.
+        for (int pass = 0; pass <= k; ++pass) {
+            int best = pass;
+            for (int m = pass + 1; m < count; ++m)
+                if (strcasecmp(nameOf(refs[m]).c_str(), nameOf(refs[best]).c_str()) < 0) best = m;
+            Ref tmp = refs[pass]; refs[pass] = refs[best]; refs[best] = tmp;
+        }
+        const Ref& r = refs[k];
+        const HomeTile& t = r.child < 0 ? home.tiles[r.tile] : home.tiles[r.tile].children[r.child];
+        if (want == 0) return OSAVal(t.name);
+        if (want == 1) return OSAVal(t.scriptPath);
+        if (want == 2) return OSAVal((double)t.color);
+        return OSAVal(t.icon);
+    }
+    // home.drawerRequested() — 1 once after a swipe-up on Home; the script
+    // opens its drawer instead of Home simply reloading.
+    if (IS("home.drawerRequested")) {
+        if (!isException) return OSAVal(0.0);
+        bool wanted = home.drawerRequested;
+        home.drawerRequested = false;
+        return OSAVal(wanted ? 1.0 : 0.0);
+    }
+    if (IS("home.appIcon")) {
+        int i = iN(0);
+        if (i < 0 || i >= home.appCount) return OSAVal("");
+        return OSAVal(home.tiles[i].icon);
+    }
     if (IS("home.appIsFolder")) {
         int i = iN(0);
         if (i < 0 || i >= home.appCount) return OSAVal(0.0);
@@ -8706,7 +8899,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
         return OSAVal((double)home.tiles[i].childCount);
     }
     if (IS("home.folderAppName") || IS("home.folderAppColor") ||
-        IS("home.folderAppPath")) {
+        IS("home.folderAppPath") || IS("home.folderAppIcon")) {
         int i = iN(0), j = iN(1);
         bool wantsNum = (IS("home.folderAppColor"));
         if (i < 0 || i >= home.appCount || !home.tiles[i].isFolder)
@@ -8716,6 +8909,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
             return wantsNum ? OSAVal(0.0) : OSAVal("");
         if (IS("home.folderAppName"))  return OSAVal(f.children[j].name);
         if (IS("home.folderAppColor")) return OSAVal((double)f.children[j].color);
+        if (IS("home.folderAppIcon"))  return OSAVal(f.children[j].icon);
         return OSAVal(f.children[j].scriptPath);
     }
 
@@ -8815,6 +9009,7 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
 
     // ── theme.* — current theme palette as packed RGB565 ─────────────────────
     // Apps use these to stay consistent with system widgets across dark/light.
+    if (IS("theme.accent"))   return OSAVal((double)Theme::accent());
     if (IS("theme.bg"))       return OSAVal((double)Theme::bg());
     if (IS("theme.surface"))  return OSAVal((double)Theme::surface());
     if (IS("theme.header"))   return OSAVal((double)Theme::header());

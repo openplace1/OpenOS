@@ -27,6 +27,7 @@ public:
     void   clearPendingLaunch()  { runtime.pendingLaunch = ""; }
 
     bool   wantsOverlay() const  { return runtime.wantsOverlay; }
+    bool   exitedBySwipe() const { return runtime.exitedBySwipe; }
     void   clearWantsOverlay()   { runtime.wantsOverlay = false; }
     // True for system scripts, the only ones that can add or remove scripts
     // Home lists; the router rescans the card after one of them exits.

@@ -11,6 +11,7 @@
 struct HomeTile {
     String    name;
     String    scriptPath;   // empty for folders
+    String    icon;         // built-in icon name from #appIcon, may be empty
     uint16_t  color         = 0xFFFF;
     bool      isFolder      = false;
     HomeTile* children      = nullptr;
@@ -47,6 +48,8 @@ public:
     int      lastLaunchY     = 137;
     uint16_t lastLaunchColor = TFT_WHITE;
     bool     lastLaunchValid = false;
+    // A swipe-up on Home asks the next Home instance to open its drawer.
+    bool     drawerRequested = false;
 
     // Reorder: take the tile at `from` out and insert it at `to`, shifting
     // the ones between. Both indices within [0, appCount).
@@ -55,7 +58,8 @@ public:
     Home(TFT_eSPI* tftInstance, XPT2046_Touchscreen* tsInstance);
 
     // Build a leaf tile from a discovered .osa script + add to grid.
-    void addScript(const String& scriptPath, const String& displayName, uint16_t color);
+    void addScript(const String& scriptPath, const String& displayName, uint16_t color,
+                   const String& icon = String());
 
     // applyOrder() restores the user's last arrangement; saveOrder() is
     // called from the OSA-side home.* mutation builtins after every change.

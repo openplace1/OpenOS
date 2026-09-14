@@ -16,8 +16,16 @@ namespace Toast {
 static constexpr int HEIGHT = 22;
 static constexpr uint32_t DURATION_MS = 1500;
 
-void show(TFT_eSPI* tft, const String& text);
+void show(TFT_eSPI* tft, const String& text, uint32_t durationMs = DURATION_MS);
 void poll(TFT_eSPI* tft);
 bool active();
+
+// The last few notifications, newest first, so a banner that expired
+// unread can still be found (Control Center lists them).
+static constexpr int HISTORY = 8;
+int      historyCount();
+String   historyText(int index);
+uint32_t historyAgeMs(int index);
+void     clearHistory();
 
 } // namespace Toast

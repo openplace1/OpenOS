@@ -144,6 +144,7 @@ int startSwipeDownY = 0;
 bool isSdReady = false;
 bool sysWallpaperEnabled = true;
 int  sysTheme = 0; // 0 = light, 1 = dark
+uint16_t sysAccent = 0; // 0 = default blue, else RGB565 from Settings
 bool sysNtpSynced = false;
 time_t sysLastNtpSync = 0;
 
@@ -281,7 +282,8 @@ static void scanDirForScripts(const String& dirPath, int depth) {
                 int before = home.appCount;
                 home.addScript(full,
                                OSARuntime::readAppNameFromFile(full),
-                               OSARuntime::readIconColorFromFile(full, tft.color565(255, 149, 0)));
+                               OSARuntime::readIconColorFromFile(full, tft.color565(255, 149, 0)),
+                               OSARuntime::readAppIconFromFile(full));
                 if (home.appCount != before)
                     Serial.printf("[HOME] discovered '%s'\n", full.c_str());
             } else if (replaced) {
@@ -325,7 +327,8 @@ static void scanPackageRoot(const String& root, bool systemPackages) {
                     home.addScript(entry,
                                    OSARuntime::readAppNameFromFile(entry),
                                    OSARuntime::readIconColorFromFile(
-                                       entry, tft.color565(255, 149, 0)));
+                                       entry, tft.color565(255, 149, 0)),
+                                   OSARuntime::readAppIconFromFile(entry));
                 }
             }
         }
@@ -893,6 +896,7 @@ void setup() {
         Config::load();
         sysWallpaperEnabled = (Config::getInt("wallpaper", 1) != 0);
         sysTheme            = Config::getInt("theme", 0);
+        sysAccent           = (uint16_t)Config::getInt("accent", 0);
         sysWiFiEnabled      = (Config::getInt("wifi", 0) != 0);
     }
 
@@ -1022,6 +1026,9 @@ void loop() {
             String next = osaApp.pendingLaunch();
             osaApp.clearPendingLaunch();
             if (next.length() > 0) animateLaunchFromHome(next);
+            // Swipe-up on Home means "show me everything": the reloaded Home
+            // opens its drawer straight away.
+            if (next.length() == 0 && osaApp.exitedBySwipe()) home.drawerRequested = true;
             osaApp.recycle();
             if (next.length() > 0) {
                 if (osaApp.loadScript(next)) {

@@ -306,6 +306,8 @@ Optional, must be near the top of the file.
 | `#isApp true` | Show on the home screen as a tile |
 | `#isApp false` | Background / system script, no tile |
 | `#perm name,name,…` | Declare required permissions (see [Permissions](#permissions)) |
+| `#appIcon "name"` | A built-in icon (see `ui.icon`) drawn on the Home tile |
+| `#const NAME value` | Named constant, substituted where `NAME` appears as an identifier; a number or a `"string"` |
 
 ### Syntax
 
@@ -329,9 +331,9 @@ Optional, must be near the top of the file.
 | Logic | `and`, `or`, `not` (`!` also accepted) |
 | Arithmetic | `+ - * / %` (`/` is float, use `int(a/b)` for integer) |
 
-Runtime limits per script: 128 KB source, 768 lines, 4096 bytes per source line,
+Runtime limits per script: 128 KB source, 1024 lines, 4096 bytes per source line,
 96 variables, 24 user functions and 10 nested calls. Compiled bytecode is
-limited to 12288 bytes, 192 numeric constants, 384 string constants, 320 names and
+limited to 12288 bytes, 192 numeric constants, 384 string constants, 320 names, 24 `#const` entries and
 a 48-value operand stack. Exceeding a compiler pool is a hard compile error;
 it never falls through to an invalid `-1` bytecode index.
 The OpenStore publisher applies a stricter 768-byte line limit to packaged OSA
@@ -771,6 +773,7 @@ with `setcolor565` / `textcolor565` to stay theme-consistent.
 | Call | Use |
 |---|---|
 | `theme()` | Returns `0` (light) or `1` (dark) |
+| `theme.accent()` | The accent colour chosen in Settings > Display (default system blue); widgets and popups use it |
 | `theme.bg()` | Screen background |
 | `theme.surface()` | Card / row background |
 | `theme.header()` | Top bar |
@@ -832,7 +835,7 @@ theme; the accent is the system blue.
 Icons: `clock`, `share`, `folder`, `grid`/`apps`, `gear`/`settings`, `search`,
 `home`, `star`, `download`, `list`, `info`, `heart`, `wifi`, `bt`, `sun`,
 `moon`/`theme`, `sync`, `power`, `back`, `plus`, `check`, `close`, `more`,
-`play`, `music`, `cube`, `note`. Any other name draws its first character in a
+`play`, `music`, `cube`, `note`, `cloud`, `rain`, `snow`. Any other name draws its first character in a
 ring. The tab bar floats over the content, so leave the bottom 70 px of a
 scrolling list free — Control Center and OpenStore are built from these.
 
@@ -865,6 +868,11 @@ end
 | Call | Effect |
 |---|---|
 | `notify(msg)` | Non-blocking 22-px banner along the top edge for 1.5 s; stays visible over script drawing and restores the panel when it expires. Needs the `notify` permission |
+| `ui.toast(msg, [ms])` | The same banner for 0.3–15 s |
+
+The last eight banners are kept; Control Center lists them. System scripts
+read them with `notify.count()`, `notify.text(i)` (newest first),
+`notify.age(i)` (seconds) and `notify.clear()`.
 
 ### Buffers, sockets and pixels
 
@@ -903,11 +911,12 @@ device over plain TCP.
 | `millis()` | ms since boot |
 | `micros()` | µs counter since boot |
 | `elapsed(startMs)` | Wrap-safe milliseconds elapsed since `startMs` |
-| `sdk.version()` | Numeric SDK compatibility level (currently `6`) |
-| `sdk.has(feature)` | Capability check, including `d3`, `d3.scene`, `sprite`, `touch`, `perf`, `http`, `json`, `opk`, `ota`, `shapes`, `path`, `widgets`, `icons`, `tabbar`, `smooth`, `net`, `buffers`, `pixels`, `store.compatibility` and `store.updateAll` |
+| `sdk.version()` | Numeric SDK compatibility level (currently `7`) |
+| `sdk.has(feature)` | Capability check, including `d3`, `d3.scene`, `sprite`, `touch`, `perf`, `http`, `json`, `opk`, `ota`, `shapes`, `path`, `widgets`, `icons`, `tabbar`, `smooth`, `net`, `buffers`, `pixels`, `accent`, `appicon`, `const`, `notify.history`, `store.compatibility` and `store.updateAll` |
+| `sys.accent(c565)` | Privileged: set the accent colour (`0` restores the default) |
 | `sys.info(key)` | Hardware and build facts: `chip`, `cores`, `cpu` (MHz), `flash`, `sketch`, `slot`, `ram`, `psram`, `idf`, `mac`, `board`, `partition`, `display`, `touch`, `sdtotal`, `sdused`, `sdtype`, `reset`, `reserve` |
-| `openos.version()` | Display version (currently `1.6.1`) |
-| `openos.versionCode()` | Numeric OpenOS compatibility level (currently `25`) |
+| `openos.version()` | Display version (currently `1.7.0`) |
+| `openos.versionCode()` | Numeric OpenOS compatibility level (currently `26`) |
 
 ### Privileged — system
 
@@ -1078,6 +1087,8 @@ copies, not references.
 | `home.folderAppName(i, j)` / `folderAppColor(i, j)` / `folderAppPath(i, j)` | Child fields |
 | `home.swap(i, j)` | Swap two tiles |
 | `home.move(from, to)` | Reorder by insertion (used when a tile is carried to another page) |
+| `home.appIcon(i)` / `home.folderAppIcon(i, j)` | The tile's `#appIcon` name, or `""` |
+| `home.sortedCount(query)` / `home.sortedAt(query, k, want)` | Every app on every page and in every folder whose name contains `query` (`""` for all), alphabetically; `want` 0 name, 1 path, 2 colour, 3 icon |
 | `anim.openAt(x, y, color565)` | Where the tile being launched sits on screen; the router zooms from there and back into it when the app closes |
 | `home.makeFolder(i)` | Wrap tile in a new folder; returns `1` on success |
 | `home.deleteFolder(i)` | Restore all children and remove folder; returns `0` if Home has too few free slots |

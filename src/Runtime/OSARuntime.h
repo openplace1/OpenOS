@@ -4,7 +4,7 @@
 #include <XPT2046_Touchscreen.h>
 #include "OSA3D.h"
 
-#define OSA_MAX_LINES  768
+#define OSA_MAX_LINES  1024
 #define OSA_MAX_VARS   96
 #define OSA_MAX_FUNCS  24
 #define OSA_STACK_MAX  10
@@ -150,6 +150,9 @@ public:
     // Set by checkOverlayGesture (swipe-down from top). Host opens Control
     // Center instead of going home when this is true on exit.
     bool    wantsOverlay = false;
+    // Set when the universal swipe-up gesture ended the script (as opposed
+    // to exit() or an error). On Home the router turns that into the drawer.
+    bool    exitedBySwipe = false;
     bool    isPrivileged() const { return isException; }
 
     // Shared helpers used by Settings to keep perm-key derivation in sync.
@@ -161,6 +164,9 @@ public:
     // and can set a tile color with `#appColor "#FF9500"`.
     static bool     readIsAppFromFile(const String& path);
     static uint16_t readIconColorFromFile(const String& path, uint16_t fallback);
+    // `#appIcon "name"` — a built-in icon drawn on the Home tile; "" if none.
+    static String   readAppIconFromFile(const String& path);
+    int sourceLineCount() const { return lineCount; }
 
     // Allow OSAApp to inject an external sprite (pre-render before animation).
     // All drawing builtins (CV macro) redirect there when non-null.

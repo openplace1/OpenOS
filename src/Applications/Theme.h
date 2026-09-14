@@ -3,12 +3,17 @@
 #include <Arduino.h>
 
 extern int sysTheme;
+// RGB565 accent colour (0 = the default system blue). Settings persists it
+// under "accent"; widgets, popups and the system apps read it instead of a
+// hard-coded 0,122,255.
+extern uint16_t sysAccent;
 
 namespace Theme {
     static inline uint16_t c(uint8_t r, uint8_t g, uint8_t b) {
         return ((uint16_t)(r & 0xF8) << 8) | ((uint16_t)(g & 0xFC) << 3) | (b >> 3);
     }
     static inline bool dark()     { return sysTheme == 1; }
+    static inline uint16_t accent()  { return sysAccent ? sysAccent : c(0,122,255); }
     static inline uint16_t bg()      { return dark() ? c(18,18,20)    : c(240,240,245); }
     static inline uint16_t surface() { return dark() ? c(30,30,35)    : 0xFFFF; }
     static inline uint16_t header()  { return dark() ? c(28,28,32)    : c(248,248,248); }
