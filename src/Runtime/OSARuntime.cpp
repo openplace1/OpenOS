@@ -8862,6 +8862,14 @@ OSAVal OSARuntime::callBuiltin(const String& name, const String& argsStr) {
     }
     // home.drawerRequested() — 1 once after a swipe-up on Home; the script
     // opens its drawer instead of Home simply reloading.
+    // notify.requested() — 1 once after a second swipe-down inside Control
+    // Center; the script opens its notification list.
+    if (IS("notify.requested")) {
+        if (!isException) return OSAVal(0.0);
+        bool wanted = home.notificationsRequested;
+        home.notificationsRequested = false;
+        return OSAVal(wanted ? 1.0 : 0.0);
+    }
     if (IS("home.drawerRequested")) {
         if (!isException) return OSAVal(0.0);
         bool wanted = home.drawerRequested;

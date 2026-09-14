@@ -986,8 +986,20 @@ void loop() {
         if (osaOverlayApp->wantsExit) {
             osaOverlayApp->wantsExit = false;
             osaOverlayApp->clearPendingLaunch();   // ignore app.launch from CC
-            osaOverlayApp->clearWantsOverlay();    // CC can't open another CC
-            closeControlCenter();
+            if (osaOverlayApp->wantsOverlay()) {
+                // Swiped down from the top again: reload the same runtime
+                // straight into the notification list, no flash of the app
+                // underneath.
+                osaOverlayApp->clearWantsOverlay();
+                home.notificationsRequested = true;
+                osaOverlayApp->recycle();
+                String controlCenterPath = PackageManager::resolveSystemEntry(
+                    "openos.controlcenter", "/system/apps/controlcenter.osa");
+                if (osaOverlayApp->loadScript(controlCenterPath)) osaOverlayApp->show();
+                else closeControlCenter();
+            } else {
+                closeControlCenter();
+            }
         }
         return;
     }

@@ -8,18 +8,18 @@ static const char* INFO_JSON =
     "  \"channel\": \"stable\",\n"
     "  \"target\": \"denky32-wroom32\",\n"
     "  \"partitionScheme\": \"openos-dual-v1\",\n"
-    "  \"name\": \"OpenOS 1.7.0\",\n"
-    "  \"version\": \"1.7.0\",\n"
-    "  \"versionCode\": 26,\n"
+    "  \"name\": \"OpenOS 1.7.1\",\n"
+    "  \"version\": \"1.7.1\",\n"
+    "  \"versionCode\": 27,\n"
     "  \"minUpdaterVersionCode\": 1,\n"
-    "  \"releaseType\": \"minor\",\n"
-    "  \"description\": \"Apps can carry an icon on their Home tile (#appIcon), the accent colour is yours to pick in Settings > Display, and a swipe up from the bottom edge of Home opens an alphabetical app drawer with search. Control Center keeps the last eight notifications; the lock screen can show the weather for a place chosen under Time & Date. For app authors: #const header constants, ui.toast with a duration, theme.accent(), and scripts of up to 1024 lines. Update Home, Control Center, Settings and the lock screen from OpenStore after installing.\",\n"
+    "  \"releaseType\": \"patch\",\n"
+    "  \"description\": \"A swipe down inside Control Center now opens the notification list, like a notification shade, and the new Weather app (current conditions, next hours and five days for the place set under Time & Date) is an official system app. The lock screen weather widget shows just the reading and the place. Update Control Center and the lock screen from OpenStore after installing.\",\n"
     "  \"publishedAt\": \"2026-09-14\",\n"
-    "  \"firmware\": \"firmware-26.bin\",\n"
-    "  \"size\": 1297632,\n"
-    "  \"sha256\": \"40a7cce33f9727b0efd0e4535343bf6b87b6dd0141ad8c94e239edafcd2cb335\",\n"
+    "  \"firmware\": \"firmware-27.bin\",\n"
+    "  \"size\": 1297904,\n"
+    "  \"sha256\": \"a5631c6cd5cbefa4a897c936bbd6c56b3a31ca29f2bdd0b2602568227fb96fc4\",\n"
     "  \"keyId\": \"openos-release-2026-02\",\n"
-    "  \"signature\": \"MEUCIQDZwB9Q6b0l2ZC+kThFHO1AXnfTrTTpEdmMQtgGsJ+etwIgYAxfcVms6i0fjMzqQasI5lcPbrJhtMEo05QEI6UVlCU=\"\n"
+    "  \"signature\": \"MEUCIB9148zK6urUKrcZxyqnyGFLoNSiE+wip9gn+ojFv0HRAiEAgwt9q/DdeX5FpD7+gsCBPV2de8tJ3ciB23dD6s6y9nY=\"\n"
     "}\n";
 
 // canonical signature payload computed by the Python release tool rules
@@ -30,23 +30,23 @@ static const char* INFO_CANONICAL =
     "channel:6:stable\n"
     "target:15:denky32-wroom32\n"
     "partitionScheme:14:openos-dual-v1\n"
-    "name:12:OpenOS 1.7.0\n"
-    "version:5:1.7.0\n"
-    "versionCode:2:26\n"
+    "name:12:OpenOS 1.7.1\n"
+    "version:5:1.7.1\n"
+    "versionCode:2:27\n"
     "minUpdaterVersionCode:1:1\n"
-    "releaseType:5:minor\n"
-    "description:535:Apps can carry an icon on their Home tile (#appIcon), the accent colour is yours to pick in Settings > Display, and a swipe up from the bottom edge of Home opens an alphabetical app drawer with search. Control Center keeps the last eight notifications; the lock screen can show the weather for a place chosen under Time & Date. For app authors: #const header constants, ui.toast with a duration, theme.accent(), and scripts of up to 1024 lines. Update Home, Control Center, Settings and the lock screen from OpenStore after installing.\n"
+    "releaseType:5:patch\n"
+    "description:372:A swipe down inside Control Center now opens the notification list, like a notification shade, and the new Weather app (current conditions, next hours and five days for the place set under Time & Date) is an official system app. The lock screen weather widget shows just the reading and the place. Update Control Center and the lock screen from OpenStore after installing.\n"
     "publishedAt:10:2026-09-14\n"
-    "firmware:15:firmware-26.bin\n"
-    "size:7:1297632\n"
-    "sha256:64:40a7cce33f9727b0efd0e4535343bf6b87b6dd0141ad8c94e239edafcd2cb335\n"
+    "firmware:15:firmware-27.bin\n"
+    "size:7:1297904\n"
+    "sha256:64:a5631c6cd5cbefa4a897c936bbd6c56b3a31ca29f2bdd0b2602568227fb96fc4\n"
     "keyId:22:openos-release-2026-02\n";
 
 // values the parser must extract from INFO_JSON
-static const char* INFO_EXPECTED_NAME = "OpenOS 1.7.0";
-static const char* INFO_EXPECTED_FIRMWARE = "firmware-26.bin";
+static const char* INFO_EXPECTED_NAME = "OpenOS 1.7.1";
+static const char* INFO_EXPECTED_FIRMWARE = "firmware-27.bin";
 static const char* INFO_EXPECTED_KEY_ID = "openos-release-2026-02";
 static const char* INFO_EXPECTED_TARGET = "denky32-wroom32";
 static const char* INFO_EXPECTED_PARTITION = "openos-dual-v1";
-static const unsigned INFO_EXPECTED_VERSION_CODE = 26u;
-static const unsigned INFO_EXPECTED_SIZE = 1297632u;
+static const unsigned INFO_EXPECTED_VERSION_CODE = 27u;
+static const unsigned INFO_EXPECTED_SIZE = 1297904u;

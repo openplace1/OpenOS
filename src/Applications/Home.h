@@ -50,6 +50,9 @@ public:
     bool     lastLaunchValid = false;
     // A swipe-up on Home asks the next Home instance to open its drawer.
     bool     drawerRequested = false;
+    // A second swipe down from the top edge, inside Control Center, asks the
+    // reopened Control Center to show the notification list.
+    bool     notificationsRequested = false;
 
     // Reorder: take the tile at `from` out and insert it at `to`, shifting
     // the ones between. Both indices within [0, appCount).
