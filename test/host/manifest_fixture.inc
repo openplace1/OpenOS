@@ -8,18 +8,18 @@ static const char* INFO_JSON =
     "  \"channel\": \"stable\",\n"
     "  \"target\": \"denky32-wroom32\",\n"
     "  \"partitionScheme\": \"openos-dual-v1\",\n"
-    "  \"name\": \"OpenOS 1.6.1\",\n"
-    "  \"version\": \"1.6.1\",\n"
-    "  \"versionCode\": 25,\n"
+    "  \"name\": \"OpenOS 1.7.0\",\n"
+    "  \"version\": \"1.7.0\",\n"
+    "  \"versionCode\": 26,\n"
     "  \"minUpdaterVersionCode\": 1,\n"
-    "  \"releaseType\": \"patch\",\n"
-    "  \"description\": \"Larger script limits for the redesigned Settings: 384 string constants, 320 names and 192 numeric constants per script (were 224/224/96), with the bytecode cache format updated to match; cache entries from an older firmware are rebuilt quietly instead of failing the script. Adds fs.usage(path) for measuring folders (the Storage page uses it) and sys.info(\\\"reserve\\\"). Update Settings from OpenStore after installing.\",\n"
-    "  \"publishedAt\": \"2026-09-13\",\n"
-    "  \"firmware\": \"firmware-25.bin\",\n"
-    "  \"size\": 1293456,\n"
-    "  \"sha256\": \"9835d2a2c37eb1eaef352189e007abfc9711dd6acab8e016828b7ca51f81d4a5\",\n"
+    "  \"releaseType\": \"minor\",\n"
+    "  \"description\": \"Apps can carry an icon on their Home tile (#appIcon), the accent colour is yours to pick in Settings > Display, and a swipe up from the bottom edge of Home opens an alphabetical app drawer with search. Control Center keeps the last eight notifications; the lock screen can show the weather for a place chosen under Time & Date. For app authors: #const header constants, ui.toast with a duration, theme.accent(), and scripts of up to 1024 lines. Update Home, Control Center, Settings and the lock screen from OpenStore after installing.\",\n"
+    "  \"publishedAt\": \"2026-09-14\",\n"
+    "  \"firmware\": \"firmware-26.bin\",\n"
+    "  \"size\": 1297632,\n"
+    "  \"sha256\": \"40a7cce33f9727b0efd0e4535343bf6b87b6dd0141ad8c94e239edafcd2cb335\",\n"
     "  \"keyId\": \"openos-release-2026-02\",\n"
-    "  \"signature\": \"MEUCIB0evtn9YLLPkX/o1PBU7XxKaxwHJb310W9FQf+HyDICAiEAhX+UbjV58/UvhdVngCAtZ8n+4fkDNEomXzcZjD/K8RE=\"\n"
+    "  \"signature\": \"MEUCIQDZwB9Q6b0l2ZC+kThFHO1AXnfTrTTpEdmMQtgGsJ+etwIgYAxfcVms6i0fjMzqQasI5lcPbrJhtMEo05QEI6UVlCU=\"\n"
     "}\n";
 
 // canonical signature payload computed by the Python release tool rules
@@ -30,23 +30,23 @@ static const char* INFO_CANONICAL =
     "channel:6:stable\n"
     "target:15:denky32-wroom32\n"
     "partitionScheme:14:openos-dual-v1\n"
-    "name:12:OpenOS 1.6.1\n"
-    "version:5:1.6.1\n"
-    "versionCode:2:25\n"
+    "name:12:OpenOS 1.7.0\n"
+    "version:5:1.7.0\n"
+    "versionCode:2:26\n"
     "minUpdaterVersionCode:1:1\n"
-    "releaseType:5:patch\n"
-    "description:417:Larger script limits for the redesigned Settings: 384 string constants, 320 names and 192 numeric constants per script (were 224/224/96), with the bytecode cache format updated to match; cache entries from an older firmware are rebuilt quietly instead of failing the script. Adds fs.usage(path) for measuring folders (the Storage page uses it) and sys.info(\"reserve\"). Update Settings from OpenStore after installing.\n"
-    "publishedAt:10:2026-09-13\n"
-    "firmware:15:firmware-25.bin\n"
-    "size:7:1293456\n"
-    "sha256:64:9835d2a2c37eb1eaef352189e007abfc9711dd6acab8e016828b7ca51f81d4a5\n"
+    "releaseType:5:minor\n"
+    "description:535:Apps can carry an icon on their Home tile (#appIcon), the accent colour is yours to pick in Settings > Display, and a swipe up from the bottom edge of Home opens an alphabetical app drawer with search. Control Center keeps the last eight notifications; the lock screen can show the weather for a place chosen under Time & Date. For app authors: #const header constants, ui.toast with a duration, theme.accent(), and scripts of up to 1024 lines. Update Home, Control Center, Settings and the lock screen from OpenStore after installing.\n"
+    "publishedAt:10:2026-09-14\n"
+    "firmware:15:firmware-26.bin\n"
+    "size:7:1297632\n"
+    "sha256:64:40a7cce33f9727b0efd0e4535343bf6b87b6dd0141ad8c94e239edafcd2cb335\n"
     "keyId:22:openos-release-2026-02\n";
 
 // values the parser must extract from INFO_JSON
-static const char* INFO_EXPECTED_NAME = "OpenOS 1.6.1";
-static const char* INFO_EXPECTED_FIRMWARE = "firmware-25.bin";
+static const char* INFO_EXPECTED_NAME = "OpenOS 1.7.0";
+static const char* INFO_EXPECTED_FIRMWARE = "firmware-26.bin";
 static const char* INFO_EXPECTED_KEY_ID = "openos-release-2026-02";
 static const char* INFO_EXPECTED_TARGET = "denky32-wroom32";
 static const char* INFO_EXPECTED_PARTITION = "openos-dual-v1";
-static const unsigned INFO_EXPECTED_VERSION_CODE = 25u;
-static const unsigned INFO_EXPECTED_SIZE = 1293456u;
+static const unsigned INFO_EXPECTED_VERSION_CODE = 26u;
+static const unsigned INFO_EXPECTED_SIZE = 1297632u;
