@@ -1726,7 +1726,7 @@ bool isOfficialSystemId(const String& id) {
         "openos.home", "openos.lockscreen", "openos.controlcenter",
         "openos.settings", "openos.files", "openos.clock",
         "openos.calculator", "openos.notes", "openos.compiler",
-        "openos.openstore"
+        "openos.openstore", "openos.weather"
     };
     for (const char* candidate : allowed) if (id == candidate) return true;
     return false;

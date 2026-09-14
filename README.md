@@ -915,8 +915,8 @@ device over plain TCP.
 | `sdk.has(feature)` | Capability check, including `d3`, `d3.scene`, `sprite`, `touch`, `perf`, `http`, `json`, `opk`, `ota`, `shapes`, `path`, `widgets`, `icons`, `tabbar`, `smooth`, `net`, `buffers`, `pixels`, `accent`, `appicon`, `const`, `notify.history`, `store.compatibility` and `store.updateAll` |
 | `sys.accent(c565)` | Privileged: set the accent colour (`0` restores the default) |
 | `sys.info(key)` | Hardware and build facts: `chip`, `cores`, `cpu` (MHz), `flash`, `sketch`, `slot`, `ram`, `psram`, `idf`, `mac`, `board`, `partition`, `display`, `touch`, `sdtotal`, `sdused`, `sdtype`, `reset`, `reserve` |
-| `openos.version()` | Display version (currently `1.7.0`) |
-| `openos.versionCode()` | Numeric OpenOS compatibility level (currently `26`) |
+| `openos.version()` | Display version (currently `1.7.1`) |
+| `openos.versionCode()` | Numeric OpenOS compatibility level (currently `27`) |
 
 ### Privileged — system
 
